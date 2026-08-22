@@ -696,12 +696,11 @@ bool plotFilterTime120Plus = true;
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
 #define HOME_SENSOR_TILE_COUNT 6
-static lv_obj_t *homeCodePanel;
-
-// The on-screen keyboard covers the lower third, including where the group
-// code sits, so the panel is lifted while it is being edited.
-#define HOME_CODE_PANEL_Y 416
-#define HOME_CODE_PANEL_EDIT_Y 118
+// The group code is edited in a modal sheet rather than in place: the keyboard
+// covers the lower third of the screen, so an inline field would either sit
+// under the keyboard or have to displace the sensor grid.
+static lv_obj_t *homeCodeEditor;
+static lv_obj_t *labelHomeModumCode;
 
 static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
 static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
@@ -4542,11 +4541,6 @@ static void dashboard_textarea_event_cb(lv_event_t *e)
     lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
   }
 
-  if (homeCodePanel && lv_event_get_target(e) == homeIslModuleTa)
-  {
-    lv_obj_align(homeCodePanel, LV_ALIGN_TOP_LEFT, 28, HOME_CODE_PANEL_EDIT_Y);
-    lv_obj_move_foreground(homeCodePanel);
-  }
 }
 
 static void dashboard_keyboard_event_cb(lv_event_t *e)
@@ -4563,10 +4557,6 @@ static void dashboard_keyboard_event_cb(lv_event_t *e)
       lv_keyboard_set_textarea(keyboard, NULL);
     }
 
-    if (homeCodePanel)
-    {
-      lv_obj_align(homeCodePanel, LV_ALIGN_TOP_LEFT, 28, HOME_CODE_PANEL_Y);
-    }
   }
 }
 
@@ -7551,6 +7541,104 @@ static void settings_sd_list_event_cb(lv_event_t *e)
 
 
 
+// Show the saved group code on the home row, or say plainly that there is none.
+void refreshHomeModumCodeLabel()
+{
+  if (labelHomeModumCode == NULL) return;
+
+  if (strlen(islRuntimeSerialNumber) > 0)
+  {
+    lv_label_set_text(labelHomeModumCode, islRuntimeSerialNumber);
+    lv_obj_set_style_text_color(labelHomeModumCode, lv_color_hex(UI_TEXT), 0);
+  }
+  else
+  {
+    lv_label_set_text(labelHomeModumCode, "미입력");
+    lv_obj_set_style_text_color(labelHomeModumCode, lv_color_hex(UI_TEXT_3), 0);
+  }
+}
+
+void closeHomeCodeEditor()
+{
+  if (homeKeyboard)
+  {
+    lv_keyboard_set_textarea(homeKeyboard, NULL);
+    lv_obj_add_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  if (homeCodeEditor) lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void home_code_open_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (homeCodeEditor == NULL || homeIslModuleTa == NULL) return;
+
+  lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+
+  lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(homeCodeEditor);
+
+  if (homeKeyboard)
+  {
+    lv_keyboard_set_textarea(homeKeyboard, homeIslModuleTa);
+    lv_obj_clear_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(homeKeyboard);
+  }
+}
+
+static void home_code_cancel_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeHomeCodeEditor();
+}
+
+static void home_code_confirm_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  dashboard_isl_save_event_cb(e);
+  refreshHomeModumCodeLabel();
+  closeHomeCodeEditor();
+}
+
+// A sheet over the sensor grid, so the field being typed into is never the
+// thing the keyboard hides, and 저장/취소 always close it.
+void createHomeCodeEditor()
+{
+  homeCodeEditor = lv_obj_create(homeScreen);
+  lv_obj_set_size(homeCodeEditor, LCD_H_RES, LCD_V_RES - UI_STATUSBAR_H - 220);
+  lv_obj_align(homeCodeEditor, LV_ALIGN_TOP_LEFT, 0, UI_STATUSBAR_H);
+  lv_obj_set_style_bg_color(homeCodeEditor, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(homeCodeEditor, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(homeCodeEditor, 0, 0);
+  lv_obj_set_style_border_width(homeCodeEditor, 0, 0);
+  lv_obj_set_style_pad_all(homeCodeEditor, 0, 0);
+  lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *card = makePanel(homeCodeEditor, 162, 36, 700, 190);
+
+  makeHeading(card, "모둠코드", 28, 22, UI_TEXT);
+  makeSmallLabel(card, "지능형 과학실 ON에서 받은 코드를 입력하세요.", 28, 58, UI_TEXT_3);
+
+  homeIslModuleTa = lv_textarea_create(card);
+  lv_obj_set_size(homeIslModuleTa, 644, 48);
+  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 28, 86);
+  lv_textarea_set_one_line(homeIslModuleTa, true);
+  lv_textarea_set_password_mode(homeIslModuleTa, false);
+  lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
+  lv_obj_set_style_text_font(homeIslModuleTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(homeIslModuleTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(homeIslModuleTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(homeIslModuleTa, 0, 0);
+  lv_obj_set_style_radius(homeIslModuleTa, 10, 0);
+  lv_obj_set_style_text_color(homeIslModuleTa, lv_color_hex(UI_TEXT), 0);
+
+  makeQuietButton(card, "취소", 452, 144, 100, 40, home_code_cancel_event_cb);
+  makePrimaryButton(card, "저장", 562, 144, 110, 40, UI_ACCENT, home_code_confirm_event_cb);
+}
+
 void createHomeUi()
 {
   homeScreen = lv_obj_create(NULL);
@@ -7637,30 +7725,17 @@ void createHomeUi()
   // Group code: show the saved value, and only raise the keyboard on 변경.
   // The old screen kept an always-open text field plus a save button.
   // =====================================================
-  lv_obj_t *codePanel = makePanel(homeScreen, 28, HOME_CODE_PANEL_Y, 604, 72);
-  homeCodePanel = codePanel;
+  // Resting state: the saved code is read-only text. Editing happens in a
+  // modal sheet, opened by 변경.
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
 
   makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
 
-  homeIslModuleTa = lv_textarea_create(codePanel);
-  lv_obj_set_size(homeIslModuleTa, 448, 34);
-  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 14, 32);
-  lv_textarea_set_one_line(homeIslModuleTa, true);
-  lv_textarea_set_password_mode(homeIslModuleTa, false);
-  lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
-  lv_obj_set_style_text_font(homeIslModuleTa, FONT_KR, 0);
-  lv_obj_set_style_bg_opa(homeIslModuleTa, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(homeIslModuleTa, 0, 0);
-  lv_obj_set_style_pad_all(homeIslModuleTa, 4, 0);
-  lv_obj_set_style_text_color(homeIslModuleTa, lv_color_hex(UI_TEXT), 0);
-  lv_obj_add_event_cb(homeIslModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
+  labelHomeModumCode = makeLabel(codePanel, "미입력", 18, 34, UI_TEXT);
+  lv_obj_set_width(labelHomeModumCode, 448);
+  lv_label_set_long_mode(labelHomeModumCode, LV_LABEL_LONG_CLIP);
 
-  if (strlen(islRuntimeSerialNumber) > 0)
-  {
-    lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
-  }
-
-  makeQuietButton(codePanel, "저장", 486, 18, 100, 38, dashboard_isl_save_event_cb);
+  makeQuietButton(codePanel, "변경", 486, 18, 100, 38, home_code_open_event_cb);
 
   // The one primary action on this screen.
   makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
@@ -7669,6 +7744,8 @@ void createHomeUi()
   labelCloudMode = makeSmallLabel(homeScreen, "방식: 실시간", 28, 500, UI_TEXT_3);
   lv_obj_set_width(labelCloudMode, 968);
   lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
+
+  createHomeCodeEditor();
 
   homeKeyboard = lv_keyboard_create(homeScreen);
   lv_obj_set_size(homeKeyboard, LCD_H_RES, 220);
@@ -7683,6 +7760,7 @@ void createHomeUi()
   updateCloudModeLabel();
   updateHomeWifiLabels();
   refreshHomeSensorLabels();
+  refreshHomeModumCodeLabel();
 }
 
 // =====================================================
