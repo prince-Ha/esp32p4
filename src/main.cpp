@@ -92,6 +92,7 @@
 #include "pins_config.h"
 #include "lcd/jd9165_lcd.h"
 #include "touch/gt911_touch.h"
+#include "ble_sensor.h"
 
 // =====================================================
 // Korean font
@@ -588,6 +589,7 @@ static lv_obj_t *labelMeasureSensorName;
 static lv_obj_t *labelMeasurePrimaryUnit;
 static lv_obj_t *labelMeasureIslState;
 static lv_obj_t *labelMeasureModum;
+static lv_obj_t *labelMeasureBle;
 static lv_obj_t *btnMeasureStart;
 static lv_obj_t *btnMeasureStop;
 static lv_obj_t *labelStatus;
@@ -2897,6 +2899,16 @@ void refreshMeasureControls()
 
     lv_label_set_text(labelSd, text);
     lv_obj_set_style_text_color(labelSd, lv_color_hex(color), 0);
+  }
+
+  if (labelMeasureBle)
+  {
+    lv_label_set_text(labelMeasureBle, bleSensorStateText());
+    lv_obj_set_style_text_color(
+      labelMeasureBle,
+      lv_color_hex(bleSensorIsSubscribed() ? UI_OK : (bleSensorIsConnected() ? UI_TEXT_2 : UI_TEXT_3)),
+      0
+    );
   }
 
   if (labelMeasureModum)
@@ -7920,7 +7932,7 @@ void createMeasureUi()
   lv_label_set_long_mode(labelCount, LV_LABEL_LONG_CLIP);
 
   // Where the data has actually reached: the cloud, the card, the group.
-  lv_obj_t *sendCard = makePanel(measureScreen, railX, contentTop + 82, railW, 116);
+  lv_obj_t *sendCard = makePanel(measureScreen, railX, contentTop + 82, railW, 142);
   makeSmallLabel(sendCard, "전송 상태", 14, 10, UI_TEXT_3);
 
   makeSmallLabel(sendCard, "과학실 ON", 14, 40, UI_TEXT_2);
@@ -7941,9 +7953,15 @@ void createMeasureUi()
   lv_obj_set_style_text_align(labelMeasureModum, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelMeasureModum, LV_LABEL_LONG_CLIP);
 
+  makeSmallLabel(sendCard, "블루투스", 14, 118, UI_TEXT_2);
+  labelMeasureBle = makeSmallLabel(sendCard, "--", 140, 118, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureBle, 106);
+  lv_obj_set_style_text_align(labelMeasureBle, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureBle, LV_LABEL_LONG_CLIP);
+
   // Secondary actions, kept quiet so they do not compete with 시작/정지.
-  makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 210, 126, 44, dashboard_cloud_batch_upload_event_cb);
-  makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 210, 126, 44, clear_event_cb);
+  makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
+  makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
   // The primary control. Start is the accent; stop is the only red on screen,
   // because stopping is the only thing here that cannot be undone.
@@ -8710,26 +8728,38 @@ static void go_wifi_event_cb(lv_event_t *e)
 }
 
 #if HAS_IDF_WIFI
-bool ensureHostedWifiStarted()
+// The P4 has no radio of its own. Both WiFi and Bluetooth ride the ESP-Hosted
+// link to the companion ESP32-C6, so the transport is brought up once and
+// shared rather than owned by the WiFi path.
+bool ensureEspHostedTransport()
 {
 #if !HAS_ESP_HOSTED
   Serial.println("esp_hosted.h not found. ESP-Hosted host component include path is missing.");
   return false;
 #else
-  if (!espHostedStarted)
+  if (espHostedStarted) return true;
+
+  Serial.println("ESP-Hosted transport init start");
+  esp_hosted_init();
+  espHostedStarted = true;
+
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 1500)
   {
-    Serial.println("ESP-Hosted transport init start");
-    esp_hosted_init();
-    espHostedStarted = true;
-
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < 1500)
-    {
-      delay(10);
-    }
-
-    Serial.println("ESP-Hosted transport init done");
+    delay(10);
   }
+
+  Serial.println("ESP-Hosted transport init done");
+  return true;
+#endif
+}
+
+bool ensureHostedWifiStarted()
+{
+#if !HAS_ESP_HOSTED
+  return false;
+#else
+  if (!ensureEspHostedTransport()) return false;
 
   if (!idfWifiStarted)
   {
@@ -10635,10 +10665,28 @@ void wifiApiTask(void *parameter)
 
   unsigned long lastWifiAttempt = 0;
   unsigned long lastStatusPost = 0;
+  bool bleStartAttempted = false;
 
   while (true)
   {
     unsigned long now = millis();
+
+    // Bluetooth shares the ESP-Hosted link with WiFi, so it is brought up here
+    // rather than in setup(): the transport costs about 1.5 s and this task is
+    // already the one that waits on it.
+    if (!bleStartAttempted)
+    {
+      bleStartAttempted = true;
+
+      if (ensureEspHostedTransport())
+      {
+        char bleName[32];
+        const size_t codeLen = strlen(islRuntimeSerialNumber);
+        const char *tail = codeLen > 4 ? islRuntimeSerialNumber + codeLen - 4 : "";
+        snprintf(bleName, sizeof(bleName), "SciSensor%s%s", codeLen > 4 ? "-" : "", tail);
+        bleSensorBegin(bleName);
+      }
+    }
 
     if (wifiConnected && !wifiReadyForHttp())
     {
@@ -11468,6 +11516,7 @@ void loop()
 
         addSample(timeS, temperatureC, pressureHpa);
         appendCsv(timeS, temperatureC, pressureHpa);
+        bleSensorPublish(timeS, activeSensorName(), temperatureC, activePrimaryUnit());
         saveMeasurementBackupToNvs(false);
         if (activeSensorSupportsDirectIsl())
         {
