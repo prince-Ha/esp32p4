@@ -519,6 +519,7 @@ static sdmmc_card_t *sdcard = NULL;
 // =====================================================
 jd9165_lcd lcd = jd9165_lcd(LCD_RST);
 gt911_touch touch = gt911_touch(TP_I2C_SDA, TP_I2C_SCL, TP_RST, TP_INT);
+static bool touchReady = false;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1;
@@ -11255,25 +11256,14 @@ void setup()
   delay(120);
   Serial.println("[BOOT] after lcd.begin()");
 
-  // GT911 cold-boot stabilization:
-  // On a true POWERON reset, the LCD rail can be alive before the GT911 controller
-  // has finished its own power/reset settling. A software reboot works because
-  // the touch controller remains powered. Wait longer only on cold boot.
-  {
-    esp_reset_reason_t touchBootReason = esp_reset_reason();
-    const unsigned long gt911SettleMs =
-      (touchBootReason == ESP_RST_POWERON) ? 1200UL : 250UL;
-
-    Serial.print("[GT911] pre-init settle ");
-    Serial.print(gt911SettleMs);
-    Serial.println(" ms");
-    delay(gt911SettleMs);
-  }
+  // Let the touch rail settle after the LCD comes up. The controller does its
+  // own reset sequence in begin(), so this only has to cover the supply.
+  delay(200);
 
 #if ENABLE_GT911_TOUCH
   Serial.println("[BOOT] before GT911 touch.begin()");
-  touch.begin();
-  Serial.println("[BOOT] after GT911 touch.begin()");
+  touchReady = touch.begin();
+  Serial.println(touchReady ? "[BOOT] GT911 touch ready" : "[WARN] GT911 touch unavailable");
 #else
   Serial.println("[WARN] GT911 touch disabled by ENABLE_GT911_TOUCH=0");
 #endif

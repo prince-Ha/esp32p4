@@ -7,11 +7,15 @@ class gt911_touch
 public:
     gt911_touch(int8_t sda_pin, int8_t scl_pin, int8_t rst_pin = -1, int8_t int_pin = -1);
 
-    void begin();
+    // Returns false if the controller could not be brought up. The caller is
+    // expected to carry on without touch rather than abort.
+    bool begin();
     bool getTouch(uint16_t *x, uint16_t *y);
     void set_rotation(uint8_t r);
 
 private:
+    void selectI2cAddress();
+
     int8_t _sda, _scl, _rst, _int;
 };
 
