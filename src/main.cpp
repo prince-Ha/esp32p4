@@ -9680,8 +9680,13 @@ bool httpPostJson(const char *url, const String &payload, String *response)
 
   if (err == ESP_ERR_HTTP_CONNECT)
   {
-    // Distinguish "cannot resolve the name" from "server refused us".
-    setIslStatusText("전송 실패: 서버 주소를 찾지 못함 (DNS/인터넷 확인)");
+    // Could not reach the server at all. On this network that is the resolver
+    // going quiet rather than the API being down — it answered at connect time
+    // and stopped minutes later — and it comes back on a public resolver. So
+    // re-check here, while a retry still follows, instead of reporting a dead
+    // end that a single check at connect time cannot prevent.
+    setIslStatusText("전송 실패: 서버 주소 확인 중");
+    verifyDnsOrFallback();
   }
   Serial.print("HTTP status: ");
   Serial.println(statusCode);
