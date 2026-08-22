@@ -101,6 +101,10 @@ LV_FONT_DECLARE(korean_24);
 LV_FONT_DECLARE(korean_16);
 LV_FONT_DECLARE(korean_14);
 
+// Digits only, for the measurement readout. A full Hangul face at this size
+// would cost megabytes; the value itself never needs one.
+LV_FONT_DECLARE(digits_64);
+
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
 #define FONT_GRAPH_SMALL &korean_16
@@ -109,6 +113,7 @@ LV_FONT_DECLARE(korean_14);
 // carries every screen title and the sensor tile names.
 #define FONT_KR_HEAD &korean_24
 #define FONT_KR_SMALL &korean_14
+#define FONT_VALUE &digits_64
 
 #define FONT_KR_TITLE FONT_KR
 #define FONT_KR_NORMAL FONT_KR
@@ -573,6 +578,15 @@ static lv_obj_t *labelHomePassword;
 static lv_obj_t *labelTempBig;
 static lv_obj_t *labelPressureBig;
 static lv_obj_t *labelHumidityBig;
+
+// Measure screen: the value is split across three labels so the digits can use
+// a digits-only face while the name and unit stay in the Hangul face.
+static lv_obj_t *labelMeasureSensorName;
+static lv_obj_t *labelMeasurePrimaryUnit;
+static lv_obj_t *labelMeasureIslState;
+static lv_obj_t *labelMeasureModum;
+static lv_obj_t *btnMeasureStart;
+static lv_obj_t *btnMeasureStop;
 static lv_obj_t *labelStatus;
 static lv_obj_t *labelTime;
 static lv_obj_t *labelSd;
@@ -2707,6 +2721,19 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
   }
 }
 
+// Digits only, matching the precision each sensor reports. The big readout
+// uses a digits-only face, so its text must never contain a name or a unit.
+static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
+{
+  if (out == NULL || outSize == 0) return;
+
+  if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "----");
+  else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "----.-");
+  else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "--.---");
+  else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "----");
+  else snprintf(out, outSize, "--.--");
+}
+
 static void formatPrimaryPlaceholderText(char *out, size_t outSize)
 {
   if (out == NULL || outSize == 0) return;
@@ -2723,10 +2750,19 @@ void updateActiveSensorUiLabels()
 {
   char text[96];
 
+  if (labelMeasureSensorName)
+  {
+    lv_label_set_text(labelMeasureSensorName, activeMeasurementTitle());
+  }
+
+  if (labelMeasurePrimaryUnit)
+  {
+    lv_label_set_text(labelMeasurePrimaryUnit, activePrimaryUnit());
+  }
+
   if (labelTempBig)
   {
-    lv_obj_set_width(labelTempBig, 120);
-    formatPrimaryPlaceholderText(text, sizeof(text));
+    formatPrimaryPlaceholderNumber(text, sizeof(text));
     lv_label_set_text(labelTempBig, text);
   }
 
@@ -2801,6 +2837,71 @@ void updateActiveSensorUiLabels()
   }
 }
 
+// Show exactly one of 시작 / 정지, and keep the send-status rail truthful about
+// where the data has actually reached.
+void refreshMeasureControls()
+{
+  if (btnMeasureStart && btnMeasureStop)
+  {
+    if (measuring)
+    {
+      lv_obj_add_flag(btnMeasureStart, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+      lv_obj_clear_flag(btnMeasureStart, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (labelMeasureIslState)
+  {
+    const bool configured = cloudModumConfigured();
+    const char *text = "미설정";
+    uint32_t color = UI_TEXT_3;
+
+    if (configured && wifiConnected && measuring) { text = "전송 중"; color = UI_OK; }
+    else if (configured && wifiConnected) { text = "준비"; color = UI_TEXT_2; }
+    else if (configured) { text = "WiFi 없음"; color = UI_DANGER; }
+
+    lv_label_set_text(labelMeasureIslState, text);
+    lv_obj_set_style_text_color(labelMeasureIslState, lv_color_hex(color), 0);
+  }
+
+  if (labelSd)
+  {
+    const char *text = "안 씀";
+    uint32_t color = UI_TEXT_3;
+
+    if (sdReady && csvLoggingEnabled) { text = "저장 중"; color = UI_OK; }
+    else if (sdReady) { text = "대기"; color = UI_TEXT_2; }
+
+    lv_label_set_text(labelSd, text);
+    lv_obj_set_style_text_color(labelSd, lv_color_hex(color), 0);
+  }
+
+  if (labelMeasureModum)
+  {
+    if (strlen(islRuntimeSerialNumber) > 0)
+    {
+      // Only the tail is identifying, and the full code does not fit.
+      const size_t len = strlen(islRuntimeSerialNumber);
+      const char *tail = len > 6 ? islRuntimeSerialNumber + len - 6 : islRuntimeSerialNumber;
+
+      char buf[16];
+      snprintf(buf, sizeof(buf), "…%s", tail);
+      lv_label_set_text(labelMeasureModum, buf);
+      lv_obj_set_style_text_color(labelMeasureModum, lv_color_hex(UI_TEXT_2), 0);
+    }
+    else
+    {
+      lv_label_set_text(labelMeasureModum, "미입력");
+      lv_obj_set_style_text_color(labelMeasureModum, lv_color_hex(UI_TEXT_3), 0);
+    }
+  }
+}
+
 static void refreshLatestMeasurementLabels()
 {
   if (labelTempBig == NULL) return;
@@ -2808,7 +2909,7 @@ static void refreshLatestMeasurementLabels()
 
   if (sampleCount <= 0)
   {
-    formatPrimaryPlaceholderText(text, sizeof(text));
+    formatPrimaryPlaceholderNumber(text, sizeof(text));
     lv_label_set_text(labelTempBig, text);
 
     if (labelPressureBig)
@@ -2847,7 +2948,7 @@ static void refreshLatestMeasurementLabels()
   }
 
   const int idx = sampleCount - 1;
-  formatPrimaryValueText(text, sizeof(text), tempHistory[idx], true);
+  formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
   lv_label_set_text(labelTempBig, text);
 
   if (labelPressureBig)
@@ -4514,6 +4615,10 @@ void resetTable()
 {
   tablePageOffset = 0;
 
+  // The table lives on whichever screen chooses to build it; the measurement
+  // screen no longer does.
+  if (tableData == NULL) return;
+
   char header[32];
 
   lv_table_set_cell_value(tableData, 0, 0, "No");
@@ -4547,6 +4652,8 @@ void resetTable()
 
 void updateTable()
 {
+  if (tableData == NULL) return;
+
   char text[32];
 
   int maxOffset = 0;
@@ -5743,7 +5850,7 @@ uint32_t screenBgColor(lv_obj_t *screen)
   // sees. Screens still on the old dark theme keep 0x0B1020 until they are
   // converted.
   if (screen == homeScreen) return UI_BG;
-  if (screen == measureScreen) return UI_LIGHT_BG;
+  if (screen == measureScreen) return UI_BG;
   if (screen == plotScreen) return UI_LIGHT_BG;
   if (screen == csvScreen) return UI_LIGHT_BG;
   if (screen == settingsScreen) return UI_LIGHT_BG;
@@ -7555,7 +7662,7 @@ void createMeasureUi()
   measureScreen = lv_obj_create(NULL);
   lv_obj_set_size(measureScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(measureScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(measureScreen, lv_color_hex(UI_LIGHT_BG), 0);
+  lv_obj_set_style_bg_color(measureScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(measureScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(measureScreen, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(measureScreen, LV_SCROLLBAR_MODE_OFF);
@@ -7568,172 +7675,163 @@ void createMeasureUi()
     &labelBarMeasureSd
   );
 
-  // 상단 검은색 바 안에 측정 상태 표시
+  // =====================================================
+  // Two columns: the reading and its history on the left, the session facts
+  // and the one destructive control on the right. The value is the largest
+  // thing on the screen because it is the only thing a student is watching.
+  // =====================================================
+  const int colLeftX = 24;
+  const int colLeftW = 700;
+  const int railX = 740;
+  const int railW = 260;
+  const int contentTop = 58;
+
+  // ---- sensor name and live state ----
+  labelMeasureSensorName = makeHeading(measureScreen, "온도 · 기압", colLeftX, contentTop, UI_TEXT);
+
   labelStatus = lv_label_create(measureScreen);
   lv_label_set_text(labelStatus, "준비");
-  lv_obj_set_style_text_color(labelStatus, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_text_font(labelStatus, FONT_KR, 0);
-  lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, 18, 11);
-  lv_obj_set_width(labelStatus, 160);
+  lv_obj_set_style_text_color(labelStatus, lv_color_hex(UI_OK), 0);
+  lv_obj_set_style_text_font(labelStatus, FONT_KR_SMALL, 0);
+  lv_obj_set_width(labelStatus, 300);
+  lv_obj_set_style_text_align(labelStatus, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelStatus, LV_LABEL_LONG_CLIP);
+  lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, colLeftX + colLeftW - 300, contentTop + 8);
 
-  // =====================================================
-  // 상단 제어행: 1024px 기준 겹침 방지 재배치
-  // =====================================================
-  labelRuntime = makeLabel(measureScreen, "시간 00:00:00", 20, 58, 0x111827);
-  lv_obj_set_width(labelRuntime, 105);
-  lv_label_set_long_mode(labelRuntime, LV_LABEL_LONG_CLIP);
+  // ---- the reading ----
+  labelTempBig = lv_label_create(measureScreen);
+  lv_label_set_text(labelTempBig, "--.-");
+  lv_obj_set_style_text_color(labelTempBig, lv_color_hex(UI_TEXT), 0);
+  lv_obj_set_style_text_font(labelTempBig, FONT_VALUE, 0);
+  lv_obj_align(labelTempBig, LV_ALIGN_TOP_LEFT, colLeftX, contentTop + 34);
 
-  labelCount = makeLabel(measureScreen, "0", 130, 58, 0x111827);
-  lv_obj_set_width(labelCount, 38);
-  lv_label_set_long_mode(labelCount, LV_LABEL_LONG_CLIP);
+  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", colLeftX + 232, contentTop + 74, UI_TEXT_3);
 
-  labelTempBig = makeLabel(measureScreen, "온도: --.--℃", 175, 58, 0x0EA5E9);
-  lv_obj_set_width(labelTempBig, 120);
-  lv_label_set_long_mode(labelTempBig, LV_LABEL_LONG_CLIP);
-
-  labelPressureBig = makeLabel(measureScreen, "압력: ----.-hPa", 300, 58, 0xF97316);
-  lv_obj_set_width(labelPressureBig, 120);
+  // Secondary quantity, when the active sensor reports one.
+  labelPressureBig = makeLabel(measureScreen, "기압 ----.-- hPa", colLeftX, contentTop + 122, UI_TEXT_2);
+  lv_obj_set_width(labelPressureBig, 340);
   lv_label_set_long_mode(labelPressureBig, LV_LABEL_LONG_CLIP);
 
-  labelHumidityBig = makeLabel(measureScreen, "", 425, 58, 0x16A34A);
-  lv_obj_set_width(labelHumidityBig, 120);
+  labelHumidityBig = makeLabel(measureScreen, "", colLeftX + 356, contentTop + 122, UI_TEXT_2);
+  lv_obj_set_width(labelHumidityBig, 340);
   lv_label_set_long_mode(labelHumidityBig, LV_LABEL_LONG_CLIP);
   lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
 
-  makeButton(measureScreen, "시작", 550, 50, 52, 36, start_event_cb);
-  makeButton(measureScreen, "정지", 605, 50, 52, 36, stop_event_cb);
-  makeButton(measureScreen, "일괄전송", 660, 50, 88, 36, dashboard_cloud_batch_upload_event_cb);
-  makeButton(measureScreen, "초기화", 751, 50, 65, 36, clear_event_cb);
-  makeButton(measureScreen, "홈", 819, 50, 70, 36, go_home_event_cb);
-  makeButton(measureScreen, "설정", 892, 50, 100, 36, go_settings_event_cb);
+  // =====================================================
+  // Chart
+  // =====================================================
+  const int chartCardY = contentTop + 152;
+  const int chartCardH = 530 - chartCardY;
 
-  // =====================================================
-  // 그래프 영역: 테이블과 겹치지 않도록 좌우 폭 재조정
-  // =====================================================
-  lv_obj_t *graphCard = makeCard(measureScreen, 12, 96, 748, 488, 0xFFFFFF);
-  lv_obj_set_style_pad_all(graphCard, 0, 0);
-  lv_obj_clear_flag(graphCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(graphCard, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_t *chartCard = makePanel(measureScreen, colLeftX, chartCardY, colLeftW, chartCardH);
 
   const int gChartX = 62;
-  const int gChartY = 54;
-  const int gChartW = 600;
-  const int gChartH = 350;
+  const int gChartY = 34;
+  const int gChartW = 556;
+  const int gChartH = chartCardH - 82;
 
-  labelMeasureTempAxisTitle = makeSmallLabel(graphCard, "온도(℃)", 6, 24, 0x0EA5E9);
-  labelMeasurePressureAxisTitle = makeSmallLabel(graphCard, "기압", 674, 24, 0xF97316);
+  labelMeasureTempAxisTitle = makeSmallLabel(chartCard, "온도(℃)", 14, 10, UI_ACCENT);
+  labelMeasurePressureAxisTitle = makeSmallLabel(chartCard, "기압", gChartX + gChartW + 8, 10, 0xB7791F);
 
-  chart = lv_chart_create(graphCard);
+  chart = lv_chart_create(chartCard);
   lv_obj_set_size(chart, gChartW, gChartH);
   lv_obj_align(chart, LV_ALIGN_TOP_LEFT, gChartX, gChartY);
   lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(chart, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chart, 0, 0);
+  lv_obj_set_style_pad_all(chart, 0, 0);
+  lv_obj_set_style_line_color(chart, lv_color_hex(0xEDF1F6), LV_PART_MAIN);
+  lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
 
   lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(chart, CHART_POINTS);
   lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
-  lv_chart_set_div_line_count(chart, 6, 6);
+  lv_chart_set_div_line_count(chart, 5, 0);
 
-  // LVGL 기본 tick label은 끄고, 외부 label로 직접 표시
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_X, 0, 0, 0, 0, false, 0);
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 0, 0, 0, false, 0);
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_SECONDARY_Y, 0, 0, 0, 0, false, 0);
 
-  seriesTemp = lv_chart_add_series(
-    chart,
-    lv_palette_main(LV_PALETTE_BLUE),
-    LV_CHART_AXIS_PRIMARY_Y
-  );
-
-  seriesPressure = lv_chart_add_series(
-    chart,
-    lv_palette_main(LV_PALETTE_ORANGE),
-    LV_CHART_AXIS_SECONDARY_Y
-  );
+  seriesTemp = lv_chart_add_series(chart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+  seriesPressure = lv_chart_add_series(chart, lv_color_hex(0xB7791F), LV_CHART_AXIS_SECONDARY_Y);
 
   for (int i = 0; i < 6; i++)
   {
-    int tickX = gChartX + (gChartW * i) / 5;
-    int tickY = gChartY + gChartH - (gChartH * i) / 5;
+    const int tickX = gChartX + (gChartW * i) / 5;
+    const int tickY = gChartY + gChartH - (gChartH * i) / 5;
 
-    // x축 tick mark
-    makePlotRect(graphCard, tickX, gChartY + gChartH - 5, 1, 10, 0x64748B);
-
-    // 왼쪽 y축 tick mark
-    makePlotRect(graphCard, gChartX - 5, tickY, 10, 1, 0x64748B);
-
-    // 오른쪽 y축 tick mark
-    makePlotRect(graphCard, gChartX + gChartW - 5, tickY, 10, 1, 0x64748B);
-
-    labelMeasureTimeTicks[i] = makeSmallLabel(graphCard, "--", tickX - 40, gChartY + gChartH + 8, 0x374151);
+    labelMeasureTimeTicks[i] = makeSmallLabel(chartCard, "--", tickX - 40, gChartY + gChartH + 8, UI_TEXT_3);
     lv_obj_set_width(labelMeasureTimeTicks[i], 80);
     lv_obj_set_style_text_align(labelMeasureTimeTicks[i], LV_TEXT_ALIGN_CENTER, 0);
 
-    labelMeasureTempTicks[i] = makeSmallLabel(graphCard, "--", 2, tickY - 10, 0x0EA5E9);
-    lv_obj_set_width(labelMeasureTempTicks[i], 58);
+    labelMeasureTempTicks[i] = makeSmallLabel(chartCard, "--", 6, tickY - 9, UI_TEXT_3);
+    lv_obj_set_width(labelMeasureTempTicks[i], 50);
     lv_obj_set_style_text_align(labelMeasureTempTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
 
-    labelMeasurePressureTicks[i] = makeSmallLabel(graphCard, "--", 672, tickY - 10, 0xF97316);
-    lv_obj_set_width(labelMeasurePressureTicks[i], 72);
+    labelMeasurePressureTicks[i] = makeSmallLabel(chartCard, "--", gChartX + gChartW + 6, tickY - 9, UI_TEXT_3);
+    lv_obj_set_width(labelMeasurePressureTicks[i], 70);
     lv_obj_set_style_text_align(labelMeasurePressureTicks[i], LV_TEXT_ALIGN_LEFT, 0);
   }
 
-  labelGraphStart = makeSmallLabel(graphCard, "시간(s)", 312, 452, 0x374151);
+  labelGraphStart = makeSmallLabel(chartCard, "시간(s)", gChartX + gChartW / 2 - 50, chartCardH - 24, UI_TEXT_3);
   lv_obj_set_width(labelGraphStart, 100);
   lv_obj_set_style_text_align(labelGraphStart, LV_TEXT_ALIGN_CENTER, 0);
 
-  labelGraphEnd = makeSmallLabel(graphCard, "", 0, 0, 0x374151);
+  labelGraphEnd = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_3);
   lv_obj_add_flag(labelGraphEnd, LV_OBJ_FLAG_HIDDEN);
 
   // =====================================================
-  // 테이블 영역: 16px 폰트 기준 카드 내부에서 버튼과 겹치지 않게 표시.
+  // Session rail
   // =====================================================
-  lv_obj_t *tableCard = makeCard(measureScreen, 770, 96, 242, 488, 0xFFFFFF);
-  lv_obj_set_style_pad_all(tableCard, 4, 0);
-  lv_obj_clear_flag(tableCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(tableCard, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_t *elapsedCard = makePanel(measureScreen, railX, contentTop, 126, 70);
+  makeSmallLabel(elapsedCard, "경과 시간", 12, 10, UI_TEXT_3);
+  labelRuntime = makeLabel(elapsedCard, "00:00", 12, 32, UI_TEXT);
+  lv_obj_set_width(labelRuntime, 102);
+  lv_label_set_long_mode(labelRuntime, LV_LABEL_LONG_CLIP);
 
-  tableData = lv_table_create(tableCard);
-  lv_obj_set_size(tableData, 232, 420);
-  lv_obj_align(tableData, LV_ALIGN_TOP_MID, 0, 4);
+  lv_obj_t *countCard = makePanel(measureScreen, railX + 134, contentTop, 126, 70);
+  makeSmallLabel(countCard, "모은 값", 12, 10, UI_TEXT_3);
+  labelCount = makeLabel(countCard, "0", 12, 32, UI_TEXT);
+  lv_obj_set_width(labelCount, 102);
+  lv_label_set_long_mode(labelCount, LV_LABEL_LONG_CLIP);
 
-  lv_obj_set_style_text_font(tableData, &korean_16, LV_PART_MAIN);
-  lv_obj_set_style_text_font(tableData, &korean_16, LV_PART_ITEMS);
+  // Where the data has actually reached: the cloud, the card, the group.
+  lv_obj_t *sendCard = makePanel(measureScreen, railX, contentTop + 82, railW, 116);
+  makeSmallLabel(sendCard, "전송 상태", 14, 10, UI_TEXT_3);
 
-  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_ITEMS);
+  makeSmallLabel(sendCard, "과학실 ON", 14, 40, UI_TEXT_2);
+  labelMeasureIslState = makeSmallLabel(sendCard, "대기", 140, 40, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureIslState, 106);
+  lv_obj_set_style_text_align(labelMeasureIslState, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureIslState, LV_LABEL_LONG_CLIP);
 
-  lv_obj_set_style_pad_top(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_bottom(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_left(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_right(tableData, 0, LV_PART_ITEMS);
+  makeSmallLabel(sendCard, "SD 카드", 14, 66, UI_TEXT_2);
+  labelSd = makeSmallLabel(sendCard, "--", 140, 66, UI_TEXT_3);
+  lv_obj_set_width(labelSd, 106);
+  lv_obj_set_style_text_align(labelSd, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelSd, LV_LABEL_LONG_CLIP);
 
-  lv_obj_clear_flag(tableData, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(tableData, LV_SCROLLBAR_MODE_OFF);
+  makeSmallLabel(sendCard, "모둠", 14, 92, UI_TEXT_2);
+  labelMeasureModum = makeSmallLabel(sendCard, "--", 140, 92, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureModum, 106);
+  lv_obj_set_style_text_align(labelMeasureModum, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureModum, LV_LABEL_LONG_CLIP);
 
-  lv_table_set_col_cnt(tableData, 4);
-  lv_table_set_row_cnt(tableData, TABLE_VISIBLE_ROWS + 1);
+  // Secondary actions, kept quiet so they do not compete with 시작/정지.
+  makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 210, 126, 44, dashboard_cloud_batch_upload_event_cb);
+  makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 210, 126, 44, clear_event_cb);
 
-  lv_table_set_col_width(tableData, 0, 30);  // No
-  lv_table_set_col_width(tableData, 1, 60);  // 시간(s)
-  lv_table_set_col_width(tableData, 2, 70);  // 온도(℃)
-  lv_table_set_col_width(tableData, 3, 72);  // 기압(hPa)
+  // The primary control. Start is the accent; stop is the only red on screen,
+  // because stopping is the only thing here that cannot be undone.
+  btnMeasureStart = makePrimaryButton(measureScreen, "측정 시작", railX, 466, railW, 64, UI_ACCENT, start_event_cb);
+  btnMeasureStop = makePrimaryButton(measureScreen, "측정 정지", railX, 466, railW, 64, UI_DANGER, stop_event_cb);
+  lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
 
-  // 하단 화살표 버튼 박스
-  lv_obj_t *tableNav = lv_obj_create(tableCard);
-  lv_obj_set_size(tableNav, 232, 40);
-  lv_obj_align(tableNav, LV_ALIGN_BOTTOM_MID, 0, -4);
-  lv_obj_set_style_bg_color(tableNav, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_bg_opa(tableNav, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(tableNav, 0, 0);
-  lv_obj_set_style_radius(tableNav, 0, 0);
-  lv_obj_set_style_pad_all(tableNav, 0, 0);
-  lv_obj_clear_flag(tableNav, LV_OBJ_FLAG_SCROLLABLE);
+  createTabBar(measureScreen, 1);
 
-  makeArrowButton(tableNav, "<", 8, 5, 100, 30, table_older_event_cb);
-  makeArrowButton(tableNav, ">", 124, 5, 100, 30, table_newer_event_cb);
-
+  // Aliases kept for the older update paths.
   labelNow = labelDateTime;
   labelSample = labelCount;
   labelElapsed = labelRuntime;
@@ -7743,6 +7841,7 @@ void createMeasureUi()
   resetTable();
   clearChart();
   updateActiveSensorUiLabels();
+  refreshMeasureControls();
 }
 
 
@@ -11205,6 +11304,7 @@ void loop()
     lastUiClockMs = now;
     updateClockLabels();
     updateWifiRuntimeLabels();
+    refreshMeasureControls();
   }
 
   // WiFi 검색/자동 연결/API 전송은 백그라운드 task에서 처리한다.
