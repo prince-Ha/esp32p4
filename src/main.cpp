@@ -3853,7 +3853,9 @@ lv_obj_t *makePrimaryButton(lv_obj_t *parent, const char *text, int x, int y,
   lv_obj_t *label = lv_label_create(btn);
   lv_label_set_text(label, text);
   lv_obj_set_style_text_color(label, lv_color_hex(UI_SURFACE), 0);
-  lv_obj_set_style_text_font(label, FONT_KR_HEAD, 0);
+  // Display weight only on the tall, screen-level actions; a compact button
+  // wearing 24 px bold reads as shouting.
+  lv_obj_set_style_text_font(label, h >= 56 ? FONT_KR_HEAD : FONT_KR, 0);
   lv_obj_center(label);
   return btn;
 }
@@ -4161,20 +4163,32 @@ void createStatusBar(
   lv_obj_set_style_text_font(*timeLabel, FONT_KR, 0);
   lv_obj_align(*timeLabel, LV_ALIGN_CENTER, 0, 0);
 
-  *sdLabel = makeChip(bar, "SD --", 0, 0, 128, UI_CHIP_BG, UI_TEXT_2);
-  lv_obj_align(lv_obj_get_parent(*sdLabel), LV_ALIGN_RIGHT_MID, -20, 0);
+  // Connection state reads as two glyphs that go green when live. The text
+  // never changes after this point; updateStatusBars() only recolours them.
+  *sdLabel = lv_label_create(bar);
+  lv_label_set_text(*sdLabel, LV_SYMBOL_SD_CARD);
+  lv_obj_set_style_text_font(*sdLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(*sdLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_align(*sdLabel, LV_ALIGN_RIGHT_MID, -24, 0);
 
-  *wifiLabel = makeChip(bar, "WiFi --", 0, 0, 168, UI_CHIP_BG, UI_TEXT_2);
-  lv_obj_align(lv_obj_get_parent(*wifiLabel), LV_ALIGN_RIGHT_MID, -156, 0);
+  *wifiLabel = lv_label_create(bar);
+  lv_label_set_text(*wifiLabel, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_font(*wifiLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -64, 0);
+}
+
+// Green when the thing is actually working, muted grey otherwise.
+static void setStatusIconState(lv_obj_t *icon, bool active)
+{
+  if (icon == NULL) return;
+  lv_obj_set_style_text_color(icon, lv_color_hex(active ? UI_OK : UI_TEXT_3), 0);
 }
 
 void updateStatusBars()
 {
   String nowText = getCurrentDateTimeText();
   String shortTime = nowText.substring(0, 16);
-
-  const char *wifiText = wifiConnected ? "WiFi 연결" : "WiFi 검색";
-  const char *sdText = sdReady ? "SD ON" : "SD OFF";
 
   if (labelBarHomeTime) lv_label_set_text(labelBarHomeTime, shortTime.c_str());
   if (labelBarMeasureTime) lv_label_set_text(labelBarMeasureTime, shortTime.c_str());
@@ -4184,21 +4198,22 @@ void updateStatusBars()
   if (labelBarFileViewerTime) lv_label_set_text(labelBarFileViewerTime, shortTime.c_str());
   if (labelBarPlotTime) lv_label_set_text(labelBarPlotTime, shortTime.c_str());
 
-  if (labelBarHomeWifi) lv_label_set_text(labelBarHomeWifi, wifiText);
-  if (labelBarMeasureWifi) lv_label_set_text(labelBarMeasureWifi, wifiText);
-  if (labelBarSettingsWifi) lv_label_set_text(labelBarSettingsWifi, wifiText);
-  if (labelBarIslWifi) lv_label_set_text(labelBarIslWifi, wifiText);
-  if (labelBarCsvWifi) lv_label_set_text(labelBarCsvWifi, wifiText);
-  if (labelBarFileViewerWifi) lv_label_set_text(labelBarFileViewerWifi, wifiText);
-  if (labelBarPlotWifi) lv_label_set_text(labelBarPlotWifi, wifiText);
+  setStatusIconState(labelBarHomeWifi, wifiConnected);
+  setStatusIconState(labelBarMeasureWifi, wifiConnected);
+  setStatusIconState(labelBarSettingsWifi, wifiConnected);
+  setStatusIconState(labelBarIslWifi, wifiConnected);
+  setStatusIconState(labelBarCsvWifi, wifiConnected);
+  setStatusIconState(labelBarFileViewerWifi, wifiConnected);
+  setStatusIconState(labelBarPlotWifi, wifiConnected);
 
-  if (labelBarHomeSd) lv_label_set_text(labelBarHomeSd, sdText);
-  if (labelBarMeasureSd) lv_label_set_text(labelBarMeasureSd, sdText);
-  if (labelBarSettingsSd) lv_label_set_text(labelBarSettingsSd, sdText);
-  if (labelBarIslSd) lv_label_set_text(labelBarIslSd, sdText);
-  if (labelBarCsvSd) lv_label_set_text(labelBarCsvSd, sdText);
-  if (labelBarFileViewerSd) lv_label_set_text(labelBarFileViewerSd, sdText);
-  if (labelBarPlotSd) lv_label_set_text(labelBarPlotSd, sdText);
+  const bool sdActive = sdReady && csvLoggingEnabled;
+  setStatusIconState(labelBarHomeSd, sdActive);
+  setStatusIconState(labelBarMeasureSd, sdActive);
+  setStatusIconState(labelBarSettingsSd, sdActive);
+  setStatusIconState(labelBarIslSd, sdActive);
+  setStatusIconState(labelBarCsvSd, sdActive);
+  setStatusIconState(labelBarFileViewerSd, sdActive);
+  setStatusIconState(labelBarPlotSd, sdActive);
 }
 
 lv_obj_t *makeInfoLabel(lv_obj_t *parent, const char *text, int w)
@@ -7662,7 +7677,6 @@ void createHomeUi()
   // in Settings, so a student meets six choices instead of fifteen controls.
   // =====================================================
   makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
-  makeSmallLabel(homeScreen, "센서를 고르면 측정 화면으로 넘어갑니다.", 28, 94, UI_TEXT_3);
 
   // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
   const int tileW = 316;
@@ -7711,10 +7725,8 @@ void createHomeUi()
     );
   }
 
-  // Sensor state, kept as one quiet line under the grid rather than a card.
-  labelHomeSensorMode = makeSmallLabel(homeScreen, "선택: --", 28, 388, UI_TEXT_2);
-  lv_obj_set_width(labelHomeSensorMode, 560);
-  lv_label_set_long_mode(labelHomeSensorMode, LV_LABEL_LONG_CLIP);
+  // The selected tile already carries 선택됨, so no "선택: ..." line here.
+  labelHomeSensorMode = NULL;
 
   labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 388, UI_TEXT_2);
   lv_obj_set_width(labelHomeSensorStatus, 392);
@@ -7740,10 +7752,8 @@ void createHomeUi()
   // The one primary action on this screen.
   makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
 
-  // Upload mode is a teacher-side setting; keep only its current value here.
-  labelCloudMode = makeSmallLabel(homeScreen, "방식: 실시간", 28, 500, UI_TEXT_3);
-  lv_obj_set_width(labelCloudMode, 968);
-  lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
+  // Upload mode and queue counts belong in Settings, not on the home screen.
+  labelCloudMode = NULL;
 
   createHomeCodeEditor();
 
