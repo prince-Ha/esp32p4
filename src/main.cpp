@@ -568,6 +568,7 @@ static lv_obj_t *plotScreen;
 static lv_obj_t *csvScreen;
 static lv_obj_t *fileViewerScreen;
 static lv_obj_t *islScreen;
+static lv_obj_t *bleScreen;
 
 static lv_obj_t *labelHomeTime;
 static lv_obj_t *labelHomeSd;
@@ -633,6 +634,12 @@ static lv_obj_t *plotSelectList;
 static lv_obj_t *labelBarPlotTime;
 static lv_obj_t *labelBarPlotWifi;
 static lv_obj_t *labelBarPlotSd;
+static lv_obj_t *bleList;
+static lv_obj_t *labelBleState;
+static lv_obj_t *labelBarBleTime;
+static lv_obj_t *labelBarBleWifi;
+static lv_obj_t *labelBarBleSd;
+static volatile bool pendingBleScan = false;
 static lv_obj_t *labelBarIslTime;
 static lv_obj_t *labelBarIslWifi;
 static lv_obj_t *labelBarIslSd;
@@ -856,6 +863,8 @@ void createPlotUi();
 void createCsvUi();
 void createFileViewerUi();
 void createIslUi();
+void createBleUi();
+void refreshBleScreen();
 void updatePlotChart();
 void updatePlotSelectionList();
 void resetTable();
@@ -5890,6 +5899,7 @@ static lv_obj_t *csvScreenBase = NULL;
 static lv_obj_t *settingsScreenBase = NULL;
 static lv_obj_t *fileViewerScreenBase = NULL;
 static lv_obj_t *islScreenBase = NULL;
+static lv_obj_t *bleScreenBase = NULL;
 
 uint32_t screenBgColor(lv_obj_t *screen)
 {
@@ -5904,6 +5914,7 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == settingsScreen) return UI_LIGHT_BG;
   if (screen == fileViewerScreen) return 0x0B1020;
   if (screen == islScreen) return 0x0B1020;
+  if (screen == bleScreen) return UI_BG;
   return 0x0B1020;
 }
 
@@ -5916,6 +5927,7 @@ lv_obj_t **screenBaseSlot(lv_obj_t *screen)
   if (screen == settingsScreen) return &settingsScreenBase;
   if (screen == fileViewerScreen) return &fileViewerScreenBase;
   if (screen == islScreen) return &islScreenBase;
+  if (screen == bleScreen) return &bleScreenBase;
   return NULL;
 }
 
@@ -8322,6 +8334,192 @@ static void go_settings_event_cb(lv_event_t *e)
   requestScreenSwitch(settingsScreen);
 }
 
+// =====================================================
+// Bluetooth screen
+// Lists what the board can see. Until a sensor's advertised service UUID is
+// known there is nothing to connect to, so finding and naming devices comes
+// before pairing with them.
+// =====================================================
+static void ble_scan_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (bleScanIsRunning()) return;
+
+  pendingBleScan = true;
+}
+
+static void go_ble_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  requestScreenSwitch(bleScreen);
+}
+
+void refreshBleScreen()
+{
+  if (bleList == NULL) return;
+
+  if (labelBleState)
+  {
+    if (bleScanIsRunning())
+    {
+      lv_label_set_text(labelBleState, "검색 중...");
+    }
+    else
+    {
+      char text[96];
+      const int candidates = bleScanCandidateCount();
+      snprintf(
+        text,
+        sizeof(text),
+        "센서 후보 %d개 · 이름 없는 기기 %d개 · 내 이름 %s",
+        candidates,
+        bleScanResultCount() - candidates,
+        bleAdvertisedName()
+      );
+      lv_label_set_text(labelBleState, text);
+    }
+  }
+
+  // Rebuild only when the count changed, so the list does not flicker while a
+  // scan is filling in.
+  static int lastShownCount = -1;
+  static bool lastScanning = false;
+  const int count = bleScanResultCount();
+  const bool scanning = bleScanIsRunning();
+
+  if (count == lastShownCount && scanning == lastScanning) return;
+  lastShownCount = count;
+  lastScanning = scanning;
+
+  lv_obj_clean(bleList);
+
+  if (count == 0)
+  {
+    lv_obj_t *empty = lv_label_create(bleList);
+    lv_label_set_text(empty, scanning ? "검색 중입니다." : "찾은 기기가 없습니다. 센서 전원을 켜고 다시 검색하세요.");
+    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_3), 0);
+    return;
+  }
+
+  // Anonymous devices are collapsed into one line: thirteen rows of random
+  // addresses hide the one row that matters.
+  int anonymous = 0;
+
+  for (int i = 0; i < count; i++)
+  {
+    BleScanResult r;
+    if (!bleScanResultAt(i, &r)) continue;
+
+    if (!bleScanResultIsCandidate(&r)) { anonymous++; continue; }
+
+    lv_obj_t *row = lv_obj_create(bleList);
+    lv_obj_set_size(row, 908, 52);
+    lv_obj_set_style_bg_color(row, lv_color_hex(UI_SURFACE), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(row, 10, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_shadow_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *name = lv_label_create(row);
+    lv_label_set_text(name, r.name[0] ? r.name : "(이름 없음)");
+    lv_obj_set_style_text_font(name, FONT_KR, 0);
+    lv_obj_set_style_text_color(name, lv_color_hex(r.name[0] ? UI_TEXT : UI_TEXT_3), 0);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 14, 6);
+
+    // The service UUID is the field that identifies an unknown sensor, so it
+    // is shown rather than hidden behind a detail view.
+    lv_obj_t *detail = lv_label_create(row);
+    char text[96];
+    snprintf(text, sizeof(text), "%s  ·  %s", r.address,
+             r.services[0] ? r.services : "서비스 광고 없음");
+    lv_label_set_text(detail, text);
+    lv_obj_set_style_text_font(detail, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(UI_TEXT_3), 0);
+    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 14, 28);
+
+    lv_obj_t *rssi = lv_label_create(row);
+    snprintf(text, sizeof(text), "%d dBm", r.rssi);
+    lv_label_set_text(rssi, text);
+    lv_obj_set_style_text_font(rssi, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(rssi, lv_color_hex(UI_TEXT_2), 0);
+    lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -14, 0);
+  }
+
+  if (anonymous > 0)
+  {
+    lv_obj_t *note = lv_label_create(bleList);
+    char text[96];
+    snprintf(
+      text,
+      sizeof(text),
+      "이름도 서비스도 알리지 않는 기기 %d개는 숨겼습니다. 주변 휴대폰·노트북입니다.",
+      anonymous
+    );
+    lv_label_set_text(note, text);
+    lv_obj_set_style_text_font(note, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(note, lv_color_hex(UI_TEXT_3), 0);
+  }
+
+  if (count > 0 && anonymous == count)
+  {
+    lv_obj_t *empty = lv_label_create(bleList);
+    lv_label_set_text(empty, "연결할 수 있는 센서를 찾지 못했습니다. 센서 전원을 켜고 가까이에서 다시 검색하세요.");
+    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_2), 0);
+  }
+}
+
+void createBleUi()
+{
+  bleScreen = lv_obj_create(NULL);
+  lv_obj_set_size(bleScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(bleScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(bleScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(bleScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(bleScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  createStatusBar(
+    bleScreen,
+    "",
+    &labelBarBleTime,
+    &labelBarBleWifi,
+    &labelBarBleSd
+  );
+
+  makeHeading(bleScreen, "블루투스 센서", 28, 58, UI_TEXT);
+
+  labelBleState = makeSmallLabel(bleScreen, "검색 전", 28, 94, UI_TEXT_3);
+  lv_obj_set_width(labelBleState, 600);
+  lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_CLIP);
+
+  makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
+
+  bleList = lv_obj_create(bleScreen);
+  lv_obj_set_size(bleList, 968, 366);
+  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 124);
+  lv_obj_set_style_bg_color(bleList, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(bleList, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(bleList, 0, 0);
+  lv_obj_set_style_radius(bleList, 0, 0);
+  lv_obj_set_style_pad_all(bleList, 0, 0);
+  lv_obj_set_style_pad_row(bleList, 8, 0);
+  lv_obj_set_flex_flow(bleList, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_scrollbar_mode(bleList, LV_SCROLLBAR_MODE_AUTO);
+
+  makeSmallLabel(
+    bleScreen,
+    "센서를 연결하려면 그 센서가 광고하는 서비스 UUID를 알아야 합니다. 위 목록의 UUID를 확인하세요.",
+    28,
+    500,
+    UI_TEXT_3
+  );
+
+  createTabBar(bleScreen, 3);
+}
+
 void createSettingsUi()
 {
   settingsScreen = lv_obj_create(NULL);
@@ -8340,6 +8538,7 @@ void createSettingsUi()
 
   makeButton(settingsScreen, "홈", 900, 50, 90, 38, go_home_event_cb);
   makeButton(settingsScreen, "측정", 760, 50, 120, 38, go_measure_event_cb);
+  makeButton(settingsScreen, "블루투스", 600, 50, 150, 38, go_ble_event_cb);
 
   // WiFi 설정 화면에는 WiFi 관련 항목만 배치한다.
   lv_obj_t *wifiCard = makeCard(settingsScreen, 25, 95, 470, 420, 0xFFFFFF);
@@ -10685,7 +10884,15 @@ void wifiApiTask(void *parameter)
         const size_t codeLen = strlen(islRuntimeSerialNumber);
         const char *tail = codeLen > 4 ? islRuntimeSerialNumber + codeLen - 4 : "";
         snprintf(bleName, sizeof(bleName), "SciSensor%s%s", codeLen > 4 ? "-" : "", tail);
-        bleSensorBegin(bleName);
+
+        if (bleSensorBegin(bleName))
+        {
+          // Let the host settle, then look around once. The scan report names
+          // every service UUID nearby, which is what identifies a sensor whose
+          // protocol is not documented here.
+          vTaskDelay(pdMS_TO_TICKS(2000));
+          bleScanStart(6000);
+        }
       }
     }
 
@@ -11340,6 +11547,7 @@ void setup()
   createHomeUi();
   createMeasureUi();
   createSettingsUi();
+  createBleUi();
   // Plot/CSV/FileViewer are intentionally not created in the stability build.
   createIslUi();
 
@@ -11465,6 +11673,13 @@ void loop()
     updateClockLabels();
     updateWifiRuntimeLabels();
     refreshMeasureControls();
+    refreshBleScreen();
+
+    if (pendingBleScan)
+    {
+      pendingBleScan = false;
+      bleScanStart(6000);
+    }
   }
 
   // WiFi 검색/자동 연결/API 전송은 백그라운드 task에서 처리한다.

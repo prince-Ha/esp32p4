@@ -283,12 +283,238 @@ void bleSensorPublish(uint32_t timeS, const char *sensorName, float value, const
   ble_gattc_notify_custom(bleConnHandle, bleMeasurementHandle, om);
 }
 
+const char *bleAdvertisedName()
+{
+  return bleDeviceName;
+}
+
 const char *bleSensorStateText()
 {
   if (!bleStarted) return "꺼짐";
   if (bleSubscribed) return "전송 중";
   if (bleConnected) return "연결됨";
   return "대기 중";
+}
+
+
+// =====================================================
+// Central role: scanning
+// =====================================================
+
+void bleScanSortResults();
+
+static BleScanResult bleScanResults[BLE_SCAN_MAX_RESULTS];
+static int bleScanCount = 0;
+static bool bleScanning = false;
+
+static void bleFormatAddr(const ble_addr_t *addr, char *out, size_t outLen)
+{
+  const uint8_t *v = addr->val;   // NimBLE stores the address little-endian
+  snprintf(out, outLen, "%02x:%02x:%02x:%02x:%02x:%02x",
+           v[5], v[4], v[3], v[2], v[1], v[0]);
+}
+
+// Collects every advertised service UUID into one comma-separated string. This
+// is the field that identifies an unknown sensor: a commercial probe exposing
+// 0x181A is speaking standard Environmental Sensing, while a custom 128-bit
+// UUID means its protocol has to come from the vendor.
+static void bleFormatServices(const struct ble_hs_adv_fields *fields, char *out, size_t outLen)
+{
+  out[0] = '\0';
+  size_t used = 0;
+
+  for (int i = 0; i < fields->num_uuids16; i++)
+  {
+    const int n = snprintf(out + used, outLen - used, "%s0x%04x",
+                           used ? "," : "", ble_uuid_u16(&fields->uuids16[i].u));
+    if (n < 0 || (size_t)n >= outLen - used) return;
+    used += n;
+  }
+
+  for (int i = 0; i < fields->num_uuids32; i++)
+  {
+    const int n = snprintf(out + used, outLen - used, "%s0x%08lx",
+                           used ? "," : "", (unsigned long)fields->uuids32[i].value);
+    if (n < 0 || (size_t)n >= outLen - used) return;
+    used += n;
+  }
+
+  for (int i = 0; i < fields->num_uuids128; i++)
+  {
+    // Only the distinguishing half is worth showing at this width.
+    const uint8_t *v = fields->uuids128[i].value;
+    const int n = snprintf(out + used, outLen - used, "%s%02x%02x%02x%02x-…",
+                           used ? "," : "", v[15], v[14], v[13], v[12]);
+    if (n < 0 || (size_t)n >= outLen - used) return;
+    used += n;
+  }
+}
+
+static void bleRecordScanResult(const struct ble_gap_disc_desc *disc)
+{
+  struct ble_hs_adv_fields fields;
+  if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) return;
+
+  char address[18];
+  bleFormatAddr(&disc->addr, address, sizeof(address));
+
+  // A device advertises repeatedly; keep one entry and refresh it, since a
+  // later packet often carries the name when the first did not.
+  int slot = -1;
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strcmp(bleScanResults[i].address, address) == 0) { slot = i; break; }
+  }
+
+  if (slot < 0)
+  {
+    if (bleScanCount >= BLE_SCAN_MAX_RESULTS) return;
+    slot = bleScanCount++;
+    memset(&bleScanResults[slot], 0, sizeof(BleScanResult));
+    snprintf(bleScanResults[slot].address, sizeof(bleScanResults[slot].address), "%s", address);
+  }
+
+  BleScanResult *r = &bleScanResults[slot];
+  r->rssi = disc->rssi;
+
+  if (fields.name != NULL && fields.name_len > 0)
+  {
+    const size_t len = fields.name_len < sizeof(r->name) - 1 ? fields.name_len : sizeof(r->name) - 1;
+    memcpy(r->name, fields.name, len);
+    r->name[len] = '\0';
+  }
+
+  if (fields.num_uuids16 || fields.num_uuids32 || fields.num_uuids128)
+  {
+    bleFormatServices(&fields, r->services, sizeof(r->services));
+  }
+}
+
+static int bleScanEvent(struct ble_gap_event *event, void *arg)
+{
+  (void)arg;
+
+  switch (event->type)
+  {
+    case BLE_GAP_EVENT_DISC:
+      bleRecordScanResult(&event->disc);
+      return 0;
+
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+      bleScanning = false;
+      bleScanSortResults();
+      blePrintf("scan complete, %d device(s), %d candidate(s)", bleScanCount, bleScanCandidateCount());
+      bleScanDumpResults();
+      return 0;
+
+    default:
+      return 0;
+  }
+}
+
+bool bleScanStart(uint32_t durationMs)
+{
+  if (!bleStarted)
+  {
+    blePrintf("scan requested before the host was up");
+    return false;
+  }
+
+  if (bleScanning) return true;
+
+  bleScanCount = 0;
+
+  struct ble_gap_disc_params params;
+  memset(&params, 0, sizeof(params));
+  params.passive = 0;      // active: ask for the scan response, which carries names
+  params.filter_duplicates = 0;
+
+  const int rc = ble_gap_disc(bleAddrType, durationMs, &params, bleScanEvent, NULL);
+  if (rc != 0)
+  {
+    blePrintf("ble_gap_disc failed: %d", rc);
+    return false;
+  }
+
+  bleScanning = true;
+  blePrintf("scanning for %lu ms", (unsigned long)durationMs);
+  return true;
+}
+
+bool bleScanIsRunning()
+{
+  return bleScanning;
+}
+
+int bleScanResultCount()
+{
+  return bleScanCount;
+}
+
+bool bleScanResultAt(int index, BleScanResult *out)
+{
+  if (out == NULL || index < 0 || index >= bleScanCount) return false;
+  memcpy(out, &bleScanResults[index], sizeof(BleScanResult));
+  return true;
+}
+
+bool bleScanResultIsCandidate(const BleScanResult *r)
+{
+  if (r == NULL) return false;
+  return r->name[0] != ' ' || r->services[0] != ' ';
+}
+
+int bleScanCandidateCount()
+{
+  int n = 0;
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (bleScanResultIsCandidate(&bleScanResults[i])) n++;
+  }
+  return n;
+}
+
+// Named or service-bearing devices first, then by signal strength.
+void bleScanSortResults()
+{
+  for (int i = 1; i < bleScanCount; i++)
+  {
+    BleScanResult key = bleScanResults[i];
+    const bool keyCand = bleScanResultIsCandidate(&key);
+    int j = i - 1;
+
+    while (j >= 0)
+    {
+      const bool cand = bleScanResultIsCandidate(&bleScanResults[j]);
+      const bool worse = (cand == keyCand) ? (bleScanResults[j].rssi < key.rssi) : (!cand && keyCand);
+      if (!worse) break;
+
+      bleScanResults[j + 1] = bleScanResults[j];
+      j--;
+    }
+
+    bleScanResults[j + 1] = key;
+  }
+}
+
+void bleScanDumpResults()
+{
+  Serial.println("[BLE] --- scan results ---");
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    const BleScanResult *r = &bleScanResults[i];
+    Serial.printf(
+      "[BLE] %2d  %-20s  %s  %4d dBm  services: %s\n",
+      i,
+      r->name[0] ? r->name : "(unnamed)",
+      r->address,
+      r->rssi,
+      r->services[0] ? r->services : "(none advertised)"
+    );
+  }
+
+  Serial.println("[BLE] --- end ---");
 }
 
 #else  // BLE_SENSOR_SUPPORTED
@@ -300,6 +526,14 @@ void bleSensorPublish(uint32_t timeS, const char *sensorName, float value, const
 {
   (void)timeS; (void)sensorName; (void)value; (void)unit;
 }
+const char *bleAdvertisedName() { return "-"; }
 const char *bleSensorStateText() { return "지원 안 함"; }
+bool bleScanStart(uint32_t durationMs) { (void)durationMs; return false; }
+bool bleScanIsRunning() { return false; }
+int bleScanResultCount() { return 0; }
+bool bleScanResultAt(int index, BleScanResult *out) { (void)index; (void)out; return false; }
+void bleScanDumpResults() {}
+bool bleScanResultIsCandidate(const BleScanResult *r) { (void)r; return false; }
+int bleScanCandidateCount() { return 0; }
 
 #endif  // BLE_SENSOR_SUPPORTED

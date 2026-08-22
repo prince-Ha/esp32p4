@@ -18,6 +18,7 @@ rebuild:
     python tools/make_heading_font.py && pio run
 """
 
+import hashlib
 import re
 import subprocess
 import sys
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src" / "main.cpp"
 OUTPUT = ROOT / "src" / "korean_24_bold.c"
 DIGITS_OUTPUT = ROOT / "src" / "digits_64.c"
+STAMP = ROOT / "src" / ".heading_font_stamp"
 TTF = Path("C:/Windows/Fonts/malgunbd.ttf")
 
 # Hangul syllables, plus compatibility Jamo for standalone consonants/vowels.
@@ -57,6 +59,18 @@ def main() -> int:
         print("error: no Hangul found in main.cpp", file=sys.stderr)
         return 1
 
+    # Regenerating takes about a minute, so skip it when the set of characters
+    # has not moved. The stamp is what makes the pre-build hook cheap enough to
+    # run on every build — and running on every build is what stops a newly
+    # added heading from rendering as tofu.
+    stamp = hashlib.sha256(hangul.encode("utf-8")).hexdigest()
+    force = "--force" in sys.argv
+
+    if not force and STAMP.exists() and STAMP.read_text().strip() == stamp \
+            and OUTPUT.exists() and DIGITS_OUTPUT.exists():
+        print(f"heading font up to date ({len(hangul)} syllables)")
+        return 0
+
     print(f"{len(hangul)} distinct Hangul syllables found in {SOURCE.name}")
 
     rc = run_conv([
@@ -84,6 +98,8 @@ def main() -> int:
     if rc != 0:
         print("error: lv_font_conv failed for digits_64", file=sys.stderr)
         return rc
+
+    STAMP.write_text(stamp)
 
     for path in (OUTPUT, DIGITS_OUTPUT):
         print(f"wrote {path.relative_to(ROOT)} ({path.stat().st_size / 1024:.0f} kB of C source)")

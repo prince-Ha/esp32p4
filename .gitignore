@@ -6,3 +6,4 @@
 
 # Vendored copy of the lvgl library; already fetched via platformio.ini lib_deps
 lib/lvgl
+src/.heading_font_stamp
