@@ -886,6 +886,7 @@ void serviceLightweightBatchUi();
 void resetDirectIslSessionCache(const char *reason);
 bool ensureWifiReadyForHttp(const char *context, int waitMs);
 bool wifiReadyForHttp();
+void httpCloseConnection(const char *reason);
 bool directIslConfigured();
 bool loadWifiCredentials();
 bool c6WifiConnectBackground(const char *ssid, const char *password);
@@ -9406,6 +9407,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
 void c6WifiDisconnect()
 {
   Serial.println("C6 WiFi disconnect request");
+  httpCloseConnection("WiFi disconnect");
 
 #if HAS_IDF_WIFI
   esp_wifi_disconnect();
@@ -9648,18 +9650,64 @@ int extractJsonIntValue(const String &json, const char *key, int fallback)
 }
 
 #if HAS_ESP_HTTP_CLIENT
+// Where the body of the request in flight is collected. Set immediately
+// before each perform(); the handle is reused, so user_data cannot carry it.
+static String *httpResponseTarget = NULL;
+
 static esp_err_t cloudHttpEventHandler(esp_http_client_event_t *evt)
 {
   if (evt == NULL) return ESP_FAIL;
 
-  if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data != NULL && evt->data_len > 0 && evt->user_data != NULL)
+  if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data != NULL && evt->data_len > 0 &&
+      httpResponseTarget != NULL)
   {
-    String *body = (String *)evt->user_data;
-    body->concat((const char *)evt->data, evt->data_len);
+    httpResponseTarget->concat((const char *)evt->data, evt->data_len);
   }
 
   return ESP_OK;
 }
+
+// One HTTPS connection, kept open between requests.
+//
+// Every POST used to build a client, hand it "Connection: close", and destroy
+// it — a full TLS handshake per sample. At 1 Hz that is a handshake a second,
+// each one needing a contiguous DMA buffer for the AES accelerator, and each
+// one a chance to fail and lose that sample. Holding the connection open
+// drops that to one handshake per session.
+static esp_http_client_handle_t httpClient = NULL;
+static char httpClientHost[96] = "";
+
+static void httpUrlHost(const char *url, char *out, size_t outSize)
+{
+  out[0] = '\0';
+  if (url == NULL) return;
+
+  const char *start = strstr(url, "://");
+  start = start ? start + 3 : url;
+
+  const char *end = strchr(start, '/');
+  size_t len = end ? (size_t)(end - start) : strlen(start);
+  if (len >= outSize) len = outSize - 1;
+
+  memcpy(out, start, len);
+  out[len] = '\0';
+}
+
+void httpCloseConnection(const char *reason)
+{
+  if (httpClient == NULL) return;
+
+  Serial.print("[HTTP] closing connection: ");
+  Serial.println(reason ? reason : "");
+
+  esp_http_client_cleanup(httpClient);
+  httpClient = NULL;
+  httpClientHost[0] = '\0';
+}
+#endif
+
+#if !HAS_ESP_HTTP_CLIENT
+void httpCloseConnection(const char *reason) { (void)reason; }
 #endif
 
 void logHeapState(const char *context)
@@ -9738,39 +9786,66 @@ bool httpPostJson(const char *url, const String &payload, String *response)
   Serial.println(payload.length());
   Serial.println("HTTP backend: ESP-IDF esp_http_client");
 
-  esp_http_client_config_t config = {};
-  config.url = url;
-  config.event_handler = cloudHttpEventHandler;
-  config.user_data = &body;
-  config.timeout_ms = CLOUD_HTTP_TIMEOUT_MS;
-  config.buffer_size = 2048;
-  config.buffer_size_tx = 2048;
+  // A cached connection only helps while the host matches; ISL and the cloud
+  // function are different servers.
+  char host[96];
+  httpUrlHost(url, host, sizeof(host));
+
+  if (httpClient != NULL && strcmp(host, httpClientHost) != 0)
+  {
+    httpCloseConnection("different host");
+  }
+
+  if (httpClient == NULL)
+  {
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.event_handler = cloudHttpEventHandler;
+    config.timeout_ms = CLOUD_HTTP_TIMEOUT_MS;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    config.keep_alive_enable = true;
 
 #if HAS_ESP_CRT_BUNDLE
-  // run.app은 Google 인증서를 사용하므로 ESP-IDF 인증서 번들을 붙여 HTTPS 검증을 처리합니다.
-  config.crt_bundle_attach = esp_crt_bundle_attach;
-  Serial.println("TLS: ESP CRT bundle enabled");
+    // run.app은 Google 인증서를 사용하므로 ESP-IDF 인증서 번들을 붙여 HTTPS 검증을 처리합니다.
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    Serial.println("TLS: ESP CRT bundle enabled");
 #else
-  // 인증서 번들이 없는 빌드에서는 HTTPS 검증이 실패할 수 있습니다.
-  config.skip_cert_common_name_check = true;
-  Serial.println("TLS: CRT bundle not available; HTTPS may fail");
+    // 인증서 번들이 없는 빌드에서는 HTTPS 검증이 실패할 수 있습니다.
+    config.skip_cert_common_name_check = true;
+    Serial.println("TLS: CRT bundle not available; HTTPS may fail");
 #endif
 
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (client == NULL)
-  {
-    Serial.println("esp_http_client_init failed");
-    Serial.println("----- HTTP POST END -----");
-    return false;
+    httpClient = esp_http_client_init(&config);
+    if (httpClient == NULL)
+    {
+      Serial.println("esp_http_client_init failed");
+      Serial.println("----- HTTP POST END -----");
+      return false;
+    }
+
+    snprintf(httpClientHost, sizeof(httpClientHost), "%s", host);
+    Serial.print("[HTTP] new connection to ");
+    Serial.println(host);
   }
+  else
+  {
+    Serial.println("[HTTP] reusing connection");
+    esp_http_client_set_url(httpClient, url);
+  }
+
+  esp_http_client_handle_t client = httpClient;
 
   esp_http_client_set_method(client, HTTP_METHOD_POST);
   esp_http_client_set_header(client, "Content-Type", "application/json");
   esp_http_client_set_header(client, "Accept", "text/plain");
-  esp_http_client_set_header(client, "Connection", "close");
+  esp_http_client_set_header(client, "Connection", "keep-alive");
   esp_http_client_set_post_field(client, payload.c_str(), payload.length());
 
+  httpResponseTarget = &body;
   esp_err_t err = esp_http_client_perform(client);
+  httpResponseTarget = NULL;
+
   int statusCode = esp_http_client_get_status_code(client);
   int contentLength = esp_http_client_get_content_length(client);
 
@@ -9788,7 +9863,14 @@ bool httpPostJson(const char *url, const String &payload, String *response)
     *response = body;
   }
 
-  esp_http_client_cleanup(client);
+  // Keep the connection for the next request, but never keep a broken one:
+  // a failed perform can leave the socket half-open, and reusing it turns one
+  // failure into every subsequent request failing.
+  if (err != ESP_OK)
+  {
+    httpCloseConnection(esp_err_to_name(err));
+  }
+
   Serial.println("----- HTTP POST END -----");
 
   return err == ESP_OK && statusCode >= 200 && statusCode < 300;
@@ -11307,6 +11389,8 @@ void wifiApiTask(void *parameter)
         setIslStatusText("WiFi: 연결 끊김/DHCP 손실 - 재연결 대기");
         resetDirectIslSessionCache("WiFi lost in task");
       }
+
+      httpCloseConnection("WiFi lost");
       wifiConnected = false;
       lastWifiAttempt = 0;
     }
