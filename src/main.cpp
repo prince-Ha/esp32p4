@@ -9004,16 +9004,17 @@ bool ensureHostedWifiStarted()
 // Public resolvers to fall back through when the network's own cannot answer.
 static const char *kFallbackDnsServers[] = { "8.8.8.8", "1.1.1.1" };
 
-static void setDnsServer(const char *address)
+static void setDnsServer(const char *address, esp_netif_dns_type_t slot)
 {
 #if HAS_IDF_WIFI
   esp_netif_dns_info_t dns;
   memset(&dns, 0, sizeof(dns));
   dns.ip.type = ESP_IPADDR_TYPE_V4;
   dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(address);
-  esp_netif_set_dns_info(wifiStaNetif, ESP_NETIF_DNS_MAIN, &dns);
+  esp_netif_set_dns_info(wifiStaNetif, slot, &dns);
 #else
   (void)address;
+  (void)slot;
 #endif
 }
 
@@ -9064,10 +9065,20 @@ void ensureDnsServer()
   if (addr != 0)
   {
     Serial.printf("[DNS] server " IPSTR "\n", IP2STR(&dns.ip.u_addr.ip4));
-    return;
+  }
+  else
+  {
+    Serial.println("[DNS] none from DHCP");
+    setDnsServer(kFallbackDnsServers[0], ESP_NETIF_DNS_MAIN);
   }
 
-  Serial.println("[DNS] none from DHCP");
+  // Always keep a public resolver in the backup slot. lwIP falls through to
+  // it on its own when the primary does not answer, which is what this
+  // network does intermittently: the router resolves the API host at connect
+  // time and goes quiet minutes later. A backup server covers that without
+  // the upload path having to notice or recover.
+  setDnsServer(kFallbackDnsServers[1], ESP_NETIF_DNS_BACKUP);
+  Serial.printf("[DNS] backup %s\n", kFallbackDnsServers[1]);
 #endif
 }
 
@@ -9090,7 +9101,7 @@ void verifyDnsOrFallback()
   for (size_t i = 0; i < sizeof(kFallbackDnsServers) / sizeof(kFallbackDnsServers[0]); i++)
   {
     Serial.printf("[DNS] trying %s\n", kFallbackDnsServers[i]);
-    setDnsServer(kFallbackDnsServers[i]);
+    setDnsServer(kFallbackDnsServers[i], ESP_NETIF_DNS_MAIN);
 
     if (resolvesApiHost())
     {
