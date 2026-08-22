@@ -621,6 +621,7 @@ static lv_chart_series_t *seriesPressure;
 
 static lv_obj_t *tableData;
 static lv_obj_t *labelCsvRowRange;
+static char sdLastError[64] = "";
 
 // =====================================================
 // Plot screen objects
@@ -3467,6 +3468,7 @@ bool initSdCard()
   {
     Serial.print("SDMMC mount failed: ");
     Serial.println(esp_err_to_name(ret));
+    snprintf(sdLastError, sizeof(sdLastError), "마운트 실패: %s", esp_err_to_name(ret));
     sdcard = NULL;
     sdReady = false;
     return false;
@@ -3474,6 +3476,7 @@ bool initSdCard()
 
   Serial.println("SDMMC mount OK");
   sdmmc_card_print_info(stdout, sdcard);
+  sdLastError[0] = '\0';
   sdReady = true;
 
   struct stat st;
@@ -3485,6 +3488,7 @@ bool initSdCard()
     if (file == NULL)
     {
       Serial.println("CSV create failed");
+      snprintf(sdLastError, sizeof(sdLastError), "파일 생성 실패: %s", csvPath);
       sdReady = false;
       return false;
     }
@@ -3640,7 +3644,23 @@ void updateSdStatusLabels()
   if (labelHomeSd) lv_label_set_text(labelHomeSd, sdText);
   if (labelSettingsSd) lv_label_set_text(labelSettingsSd, sdText);
   if (labelSettingsCsv) lv_label_set_text(labelSettingsCsv, csvText);
-  if (labelHomeCsv) lv_label_set_text(labelHomeCsv, csvText);
+  if (labelHomeCsv)
+  {
+    char line[96];
+
+    if (sdReady && csvLoggingEnabled) snprintf(line, sizeof(line), "SD: 자동 저장 중");
+    else if (sdReady) snprintf(line, sizeof(line), "SD: 마운트됨 · 자동 저장 꺼짐");
+    else if (sdLastError[0]) snprintf(line, sizeof(line), "SD: %s", sdLastError);
+    else snprintf(line, sizeof(line), "SD: 마운트 안 됨");
+
+    lv_label_set_text(labelHomeCsv, line);
+    lv_obj_set_style_text_color(
+      labelHomeCsv,
+      lv_color_hex(sdReady ? UI_OK : (sdLastError[0] ? UI_DANGER : UI_TEXT_3)),
+      0
+    );
+  }
+
   updateDashboardCsvLabels();
 }
 
@@ -8368,11 +8388,23 @@ void createCsvUi()
   // =====================================================
   lv_obj_t *fileCard = makePanel(csvScreen, 668, 104, 328, 412);
 
-  makeSmallLabel(fileCard, "저장 파일", 16, 14, UI_TEXT_3);
+  // SD is not mounted at boot: SDMMC can collide with the C6 SDIO link that
+  // WiFi and Bluetooth ride on, so it is brought up on demand. The redesign
+  // dropped this control, which left no way to mount the card at all.
+  makeSmallLabel(fileCard, "SD 카드", 16, 14, UI_TEXT_3);
+
+  labelHomeCsv = makeSmallLabel(fileCard, "SD: 마운트 안 됨", 16, 36, UI_TEXT_2);
+  lv_obj_set_width(labelHomeCsv, 296);
+  lv_label_set_long_mode(labelHomeCsv, LV_LABEL_LONG_CLIP);
+
+  makeQuietButton(fileCard, "마운트", 16, 62, 142, 40, dashboard_csv_mount_event_cb);
+  makeQuietButton(fileCard, "자동 저장", 170, 62, 142, 40, dashboard_csv_toggle_event_cb);
+
+  makeSmallLabel(fileCard, "저장 파일", 16, 118, UI_TEXT_3);
 
   homeCsvFileTa = lv_textarea_create(fileCard);
   lv_obj_set_size(homeCsvFileTa, 296, 44);
-  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 16, 36);
+  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 16, 140);
   lv_textarea_set_one_line(homeCsvFileTa, true);
   lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
   lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
@@ -8384,26 +8416,18 @@ void createCsvUi()
   lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
   lv_textarea_set_text(homeCsvFileTa, csvFileName);
 
-  makePrimaryButton(fileCard, "측정값 저장", 16, 92, 296, 44, UI_ACCENT, csv_save_measurement_data_event_cb);
+  makePrimaryButton(fileCard, "측정값 저장", 16, 192, 296, 44, UI_ACCENT, csv_save_measurement_data_event_cb);
 
-  makeQuietButton(fileCard, "미리보기", 16, 146, 142, 40, dashboard_csv_preview_event_cb);
-  makeQuietButton(fileCard, "파일 목록", 170, 146, 142, 40, settings_sd_list_event_cb);
+  makeQuietButton(fileCard, "미리보기", 16, 244, 142, 40, dashboard_csv_preview_event_cb);
+  makeQuietButton(fileCard, "파일 목록", 170, 244, 142, 40, settings_sd_list_event_cb);
 
-  labelHomeCsv = makeSmallLabel(fileCard, "CSV: 수동 저장 모드", 16, 198, UI_TEXT_2);
-  lv_obj_set_width(labelHomeCsv, 296);
-  lv_label_set_long_mode(labelHomeCsv, LV_LABEL_LONG_CLIP);
-
-  labelHomeCsvPath = makeSmallLabel(fileCard, "파일: --", 16, 222, UI_TEXT_3);
-  lv_obj_set_width(labelHomeCsvPath, 296);
-  lv_label_set_long_mode(labelHomeCsvPath, LV_LABEL_LONG_CLIP);
-
-  labelSelectedSdFile = makeSmallLabel(fileCard, "선택: 없음", 16, 246, UI_TEXT_3);
+  labelSelectedSdFile = makeSmallLabel(fileCard, "선택: 없음", 16, 292, UI_TEXT_3);
   lv_obj_set_width(labelSelectedSdFile, 296);
   lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_CLIP);
 
   sdFileList = lv_list_create(fileCard);
-  lv_obj_set_size(sdFileList, 296, 128);
-  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 16, 274);
+  lv_obj_set_size(sdFileList, 296, 88);
+  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 16, 316);
   lv_obj_set_style_text_font(sdFileList, FONT_KR_SMALL, 0);
   lv_obj_set_style_bg_opa(sdFileList, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(sdFileList, 0, 0);

@@ -461,7 +461,7 @@ bool bleScanResultAt(int index, BleScanResult *out)
 bool bleScanResultIsCandidate(const BleScanResult *r)
 {
   if (r == NULL) return false;
-  return r->name[0] != ' ' || r->services[0] != ' ';
+  return r->name[0] != '\0' || r->services[0] != '\0';
 }
 
 int bleScanCandidateCount()

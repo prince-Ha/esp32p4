@@ -34,10 +34,42 @@ TTF = Path("C:/Windows/Fonts/malgunbd.ttf")
 # Hangul syllables, plus compatibility Jamo for standalone consonants/vowels.
 HANGUL = re.compile(r"[가-힣㄰-㆏]")
 
+# Ranges the fonts always carry: Latin, Latin-1, general punctuation, arrows,
+# geometric shapes.
+RANGES = [
+    (0x0020, 0x007E),
+    (0x00A0, 0x00FF),
+    (0x2000, 0x206F),
+    (0x2190, 0x21FF),
+    (0x25A0, 0x25FF),
+]
+
 
 def collect_hangul(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     return "".join(sorted(set(HANGUL.findall(text))))
+
+
+def collect_extras(path: Path) -> str:
+    """Any other non-ASCII character the firmware displays.
+
+    ℃ (U+2103) sits in none of the ranges above, and cutting the fonts by
+    range alone silently dropped it — the degree sign rendered as an empty box
+    on the measurement screen. Collecting leftovers the same way the Hangul is
+    collected means a newly used symbol cannot go missing either.
+    """
+    text = path.read_text(encoding="utf-8")
+    extras = set()
+
+    for ch in text:
+        code = ord(ch)
+        if code < 0x00A0 or HANGUL.match(ch):
+            continue
+        if any(lo <= code <= hi for lo, hi in RANGES):
+            continue
+        extras.add(ch)
+
+    return "".join(sorted(extras))
 
 
 def run_conv(args: list) -> int:
@@ -59,11 +91,15 @@ def main() -> int:
         print("error: no Hangul found in main.cpp", file=sys.stderr)
         return 1
 
+    extras = collect_extras(SOURCE)
+    if extras:
+        print(f"extra symbols: {extras}")
+
     # Regenerating takes about a minute, so skip it when the set of characters
     # has not moved. The stamp is what makes the pre-build hook cheap enough to
     # run on every build — and running on every build is what stops a newly
     # added heading from rendering as tofu.
-    stamp = hashlib.sha256(hangul.encode("utf-8")).hexdigest()
+    stamp = hashlib.sha256((hangul + extras).encode("utf-8")).hexdigest()
     force = "--force" in sys.argv
 
     if not force and STAMP.exists() and STAMP.read_text().strip() == stamp \
@@ -81,7 +117,7 @@ def main() -> int:
         "--range", "0x2000-0x206F",
         "--range", "0x2190-0x21FF",
         "--range", "0x25A0-0x25FF",
-        "--symbols", hangul,
+        "--symbols", hangul + extras,
         "--lv-font-name", "korean_24_bold",
         "-o", str(OUTPUT),
     ])
