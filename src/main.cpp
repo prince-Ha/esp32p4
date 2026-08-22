@@ -8366,8 +8366,16 @@ void refreshBleScreen()
     }
     else
     {
-      char text[64];
-      snprintf(text, sizeof(text), "%d개 찾음 · 내 이름 %s", bleScanResultCount(), bleAdvertisedName());
+      char text[96];
+      const int candidates = bleScanCandidateCount();
+      snprintf(
+        text,
+        sizeof(text),
+        "센서 후보 %d개 · 이름 없는 기기 %d개 · 내 이름 %s",
+        candidates,
+        bleScanResultCount() - candidates,
+        bleAdvertisedName()
+      );
       lv_label_set_text(labelBleState, text);
     }
   }
@@ -8394,10 +8402,16 @@ void refreshBleScreen()
     return;
   }
 
+  // Anonymous devices are collapsed into one line: thirteen rows of random
+  // addresses hide the one row that matters.
+  int anonymous = 0;
+
   for (int i = 0; i < count; i++)
   {
     BleScanResult r;
     if (!bleScanResultAt(i, &r)) continue;
+
+    if (!bleScanResultIsCandidate(&r)) { anonymous++; continue; }
 
     lv_obj_t *row = lv_obj_create(bleList);
     lv_obj_set_size(row, 908, 52);
@@ -8432,6 +8446,29 @@ void refreshBleScreen()
     lv_obj_set_style_text_font(rssi, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(rssi, lv_color_hex(UI_TEXT_2), 0);
     lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -14, 0);
+  }
+
+  if (anonymous > 0)
+  {
+    lv_obj_t *note = lv_label_create(bleList);
+    char text[96];
+    snprintf(
+      text,
+      sizeof(text),
+      "이름도 서비스도 알리지 않는 기기 %d개는 숨겼습니다. 주변 휴대폰·노트북입니다.",
+      anonymous
+    );
+    lv_label_set_text(note, text);
+    lv_obj_set_style_text_font(note, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(note, lv_color_hex(UI_TEXT_3), 0);
+  }
+
+  if (count > 0 && anonymous == count)
+  {
+    lv_obj_t *empty = lv_label_create(bleList);
+    lv_label_set_text(empty, "연결할 수 있는 센서를 찾지 못했습니다. 센서 전원을 켜고 가까이에서 다시 검색하세요.");
+    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_2), 0);
   }
 }
 

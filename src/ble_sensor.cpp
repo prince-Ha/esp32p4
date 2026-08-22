@@ -301,6 +301,8 @@ const char *bleSensorStateText()
 // Central role: scanning
 // =====================================================
 
+void bleScanSortResults();
+
 static BleScanResult bleScanResults[BLE_SCAN_MAX_RESULTS];
 static int bleScanCount = 0;
 static bool bleScanning = false;
@@ -400,7 +402,8 @@ static int bleScanEvent(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
       bleScanning = false;
-      blePrintf("scan complete, %d device(s)", bleScanCount);
+      bleScanSortResults();
+      blePrintf("scan complete, %d device(s), %d candidate(s)", bleScanCount, bleScanCandidateCount());
       bleScanDumpResults();
       return 0;
 
@@ -455,6 +458,45 @@ bool bleScanResultAt(int index, BleScanResult *out)
   return true;
 }
 
+bool bleScanResultIsCandidate(const BleScanResult *r)
+{
+  if (r == NULL) return false;
+  return r->name[0] != ' ' || r->services[0] != ' ';
+}
+
+int bleScanCandidateCount()
+{
+  int n = 0;
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (bleScanResultIsCandidate(&bleScanResults[i])) n++;
+  }
+  return n;
+}
+
+// Named or service-bearing devices first, then by signal strength.
+void bleScanSortResults()
+{
+  for (int i = 1; i < bleScanCount; i++)
+  {
+    BleScanResult key = bleScanResults[i];
+    const bool keyCand = bleScanResultIsCandidate(&key);
+    int j = i - 1;
+
+    while (j >= 0)
+    {
+      const bool cand = bleScanResultIsCandidate(&bleScanResults[j]);
+      const bool worse = (cand == keyCand) ? (bleScanResults[j].rssi < key.rssi) : (!cand && keyCand);
+      if (!worse) break;
+
+      bleScanResults[j + 1] = bleScanResults[j];
+      j--;
+    }
+
+    bleScanResults[j + 1] = key;
+  }
+}
+
 void bleScanDumpResults()
 {
   Serial.println("[BLE] --- scan results ---");
@@ -491,5 +533,7 @@ bool bleScanIsRunning() { return false; }
 int bleScanResultCount() { return 0; }
 bool bleScanResultAt(int index, BleScanResult *out) { (void)index; (void)out; return false; }
 void bleScanDumpResults() {}
+bool bleScanResultIsCandidate(const BleScanResult *r) { (void)r; return false; }
+int bleScanCandidateCount() { return 0; }
 
 #endif  // BLE_SENSOR_SUPPORTED

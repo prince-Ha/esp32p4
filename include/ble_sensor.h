@@ -67,6 +67,11 @@ int bleScanResultCount();
 // Copies one result out. Returns false when `index` is out of range.
 bool bleScanResultAt(int index, BleScanResult *out);
 
+// A device worth showing: it advertises a name or a service UUID. Anything
+// else is a phone or laptop advertising anonymously and cannot be identified.
+bool bleScanResultIsCandidate(const BleScanResult *r);
+int bleScanCandidateCount();
+
 // Prints the current results over Serial, one device per line.
 void bleScanDumpResults();
 
