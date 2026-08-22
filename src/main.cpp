@@ -92,18 +92,32 @@
 #include "pins_config.h"
 #include "lcd/jd9165_lcd.h"
 #include "touch/gt911_touch.h"
+#include "ble_sensor.h"
 
 // =====================================================
 // Korean font
 // src/korean_16.c 안의 실제 폰트 이름도 korean_16 이어야 합니다.
 // =====================================================
+// Display weights, cut from Malgun Gothic Bold by tools/make_heading_font.py.
+// Noto Sans KR ships here in Regular only, so a real bold needs another file.
+LV_FONT_DECLARE(korean_24_bold);
+
 LV_FONT_DECLARE(korean_16);
 LV_FONT_DECLARE(korean_14);
-LV_FONT_DECLARE(korean_12);
+
+// Digits only, for the measurement readout. A full Hangul face at this size
+// would cost megabytes; the value itself never needs one.
+LV_FONT_DECLARE(digits_64);
 
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
 #define FONT_GRAPH_SMALL &korean_16
+
+// Headings. 24 px is the largest Hangul face built into the firmware, so it
+// carries every screen title and the sensor tile names.
+#define FONT_KR_HEAD &korean_24_bold
+#define FONT_KR_SMALL &korean_14
+#define FONT_VALUE &digits_64
 
 #define FONT_KR_TITLE FONT_KR
 #define FONT_KR_NORMAL FONT_KR
@@ -288,19 +302,46 @@ static bool tmp117LastReadWasWaiting = false;
 // LVGL handler throttling. 5 ms is usually enough for touch/UI responsiveness.
 #define LVGL_HANDLER_PERIOD_MS 8
 
+// Stack for the background WiFi/API task. It performs TLS handshakes, so it
+// needs far more than the FreeRTOS default; 12 kB was overflowing.
+#define WIFI_API_TASK_STACK_BYTES 24576
+
 // Main loop idle time. Prevents 100% CPU busy-loop.
 #define MAIN_LOOP_IDLE_MS 2
 
 // UI/touch stability
 #define UI_LIGHT_BG 0xEEF2F7
+
+// =====================================================
+// Light UI palette
+// One accent carries every interactive affordance; semantic colours are kept
+// separate from it so "connected" never reads as "tappable". Every state that
+// uses colour also carries a word, so it survives colour-blind viewing and the
+// glare of a classroom projector.
+// =====================================================
+#define UI_BG          0xF4F6F8
+#define UI_SURFACE     0xFFFFFF
+#define UI_LINE        0xE2E7EE
+#define UI_TEXT        0x14181F
+#define UI_TEXT_2      0x4A5566
+#define UI_TEXT_3      0x79849A
+#define UI_ACCENT      0x0B6BCB
+#define UI_ACCENT_DARK 0x0A5BAD
+#define UI_ACCENT_SOFT 0xF2F7FE
+#define UI_ACCENT_TINT 0xE9F1FC
+#define UI_OK          0x1B7A44
+#define UI_OK_SOFT     0xE3F3E9
+#define UI_DANGER      0xC0392B
+#define UI_CHIP_BG     0xEDF1F6
+
+#define UI_STATUSBAR_H 44
+#define UI_TABBAR_H    54
 #define TOUCH_PRESS_DEBOUNCE_MS 12UL
 #define TOUCH_RELEASE_DEBOUNCE_MS 45UL
 #define TOUCH_REARM_MS 55UL
 
-// Hardware clear disabled. Direct LCD clear caused persistent dark strips on this panel.
-// Page cleanup is handled by opaque LVGL backgrounds plus targeted invalidation.
-#define FAST_CLEAR_ROWS 24
-#define ENABLE_HOME_FAST_CLEAR 0
+// Direct LCD clears left persistent dark strips on this panel, so page cleanup
+// is handled by opaque LVGL backgrounds plus targeted invalidation instead.
 
 #define REG_PRS_B2    0x00
 #define REG_TMP_B2    0x03
@@ -331,6 +372,11 @@ const int I2C_DELAY_US = 5;
 static char csvFileName[64] = CSV_DEFAULT_FILE;
 static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
+// Rows buffered before the CSV handle is flushed to the card. At the 1 Hz
+// sample rate this caps data loss on a power cut at CSV_FLUSH_EVERY_ROWS
+// seconds without paying for an fsync every sample.
+#define CSV_FLUSH_EVERY_ROWS 10
+
 // WiFi detection 테스트 시에는 SDMMC가 C6 SDIO 통신과 충돌할 수 있습니다.
 // SD는 부팅 자동 마운트 대신 설정 화면에서 수동으로 켜는 구조가 안전합니다.
 #define ENABLE_SD_CSV 0  // stability build: CSV/SD logging disabled
@@ -355,21 +401,7 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 지능형 과학실 ON API 설정
 // 실제 발급값으로 교체해야 전송이 시작됩니다.
 // =====================================================
-#define ISL_API_ENABLED 0  // 직접 지능형과학실 ON 전송 비활성화: ESP32-P4는 Cloud Run으로만 전송
 #define ISL_SERVICE_KEY "PUT_YOUR_SERVICE_KEY"
-#define ISL_SERIAL_NUMBER "ESP32P4_DPS310_001"
-
-#define ISL_START_URL "https://api-scion.kofac.re.kr/sensorapi/explortProcessStart"
-#define ISL_DATA_URL  "https://api-scion.kofac.re.kr/sensorapi/explortDataCollection"
-#define ISL_STOP_URL  "https://api-scion.kofac.re.kr/sensorapi/explortProcessStop"
-#define ISL_STATUS_URL "https://api-scion.kofac.re.kr/sensorapi/explortProcessStatus"
-
-#define ISL_SENSOR_TYPE_TEMP "TPR"
-#define ISL_SENSOR_TYPE_PRESSURE "PRS"
-#define ISL_CHANNEL_TEMP "01"
-#define ISL_CHANNEL_PRESSURE "02"
-#define ISL_UNIT_TEMP "C"
-#define ISL_UNIT_PRESSURE "hPa"
 
 // 2026-07-21 지능형 과학실 ON 오픈API 설계서 기준
 // 조도(Illuminance): 실제 sendSensorType API 호출 예제(page 27)는 sensorType=ILM 사용
@@ -383,8 +415,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define ISL_SENSOR_TYPE_CO2 "CTRT"
 #define ISL_CHANNEL_CO2 "01"
 #define ISL_UNIT_CO2 "ppm"
-
-#define ISL_QUEUE_DEPTH 16  // ISL direct API disabled; reduce reserved RAM
 
 
 #define CLOUD_FUNCTION_URL "https://sensor-data-582760051065.asia-northeast3.run.app"
@@ -419,15 +449,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 지능형 과학실 ON API 런타임 상태
 // HTTP/WiFi 작업은 별도 task에서 처리하고, 측정 loop는 큐에 넣기만 합니다.
 // =====================================================
-struct IslSamplePacket
-{
-  int no;
-  uint32_t timeS;
-  float tempC;
-  float pressureHpa;
-  char collectDate[32];
-};
-
 // Google Cloud Run 전송용 패킷입니다.
 // 지능형 과학실 ON API 설정 여부와 무관하게 Cloud Run으로 원시 측정값을 보냅니다.
 struct CloudSamplePacket
@@ -469,20 +490,14 @@ static char directIslLightSensorType[8] = "ILM";
 
 static unsigned long lastWifiLostNoticeMs = 0;
 
-static QueueHandle_t islQueue = NULL;
 static TaskHandle_t wifiApiTaskHandle = NULL;
 
 static volatile bool islApiConfigured = false;
-static volatile bool islSessionActive = false;
-static volatile bool islStartRequested = false;
-static volatile bool islStopRequested = false;
 
-static char islSensorId[128] = "";
 static char islStatusText[128] = "전송: 대기";
 static char islServiceKey[128] = ISL_SERVICE_KEY;
 static char islRuntimeSerialNumber[64] = "";   // 지능형 과학실 모듈/모둠 코드 → API serialNumber로 사용
 static int islCollectPeriod = 1;
-static uint32_t islQueuedDropped = 0;
 
 
 #ifndef SDMMC_FREQ_PROBING
@@ -504,6 +519,7 @@ static sdmmc_card_t *sdcard = NULL;
 // =====================================================
 jd9165_lcd lcd = jd9165_lcd(LCD_RST);
 gt911_touch touch = gt911_touch(TP_I2C_SDA, TP_I2C_SCL, TP_RST, TP_INT);
+static bool touchReady = false;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t *buf1;
@@ -567,6 +583,16 @@ static lv_obj_t *labelHomePassword;
 static lv_obj_t *labelTempBig;
 static lv_obj_t *labelPressureBig;
 static lv_obj_t *labelHumidityBig;
+
+// Measure screen: the value is split across three labels so the digits can use
+// a digits-only face while the name and unit stay in the Hangul face.
+static lv_obj_t *labelMeasureSensorName;
+static lv_obj_t *labelMeasurePrimaryUnit;
+static lv_obj_t *labelMeasureIslState;
+static lv_obj_t *labelMeasureModum;
+static lv_obj_t *labelMeasureBle;
+static lv_obj_t *btnMeasureStart;
+static lv_obj_t *btnMeasureStop;
 static lv_obj_t *labelStatus;
 static lv_obj_t *labelTime;
 static lv_obj_t *labelSd;
@@ -671,7 +697,18 @@ bool plotFilterTime60_120 = true;
 bool plotFilterTime120Plus = true;
 
 
-static lv_obj_t *wifiScreen;
+// Home sensor grid, kept so the selected tile can follow the active sensor.
+#define HOME_SENSOR_TILE_COUNT 6
+// The group code is edited in a modal sheet rather than in place: the keyboard
+// covers the lower third of the screen, so an inline field would either sit
+// under the keyboard or have to displace the sensor grid.
+static lv_obj_t *homeCodeEditor;
+static lv_obj_t *labelHomeModumCode;
+
+static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
+static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
+
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
 static lv_obj_t *wifiKeyboard;
@@ -793,7 +830,6 @@ void updateHomeWifiLabels();
 void updateWifiRuntimeLabels();
 void updateIslStatusLabels();
 void updateIslModuleCodeFromUi();
-bool isIslApiConfigured();
 void setIslStatusText(const char *text);
 void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa);
 void queueCloudAction(const char *action);
@@ -827,6 +863,9 @@ void updateTable();
 
 static void go_plot_event_cb(lv_event_t *e);
 static void go_csv_event_cb(lv_event_t *e);
+static void go_home_event_cb(lv_event_t *e);
+static void go_measure_event_cb(lv_event_t *e);
+static void go_settings_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -847,9 +886,31 @@ bool saveMeasurementBackupToNvs(bool force);
 void updateChartAutoScale();
 void clearChart();
 
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
+
+// Move the "선택됨" state onto the tile for `mode`.
+void refreshHomeSensorTilesFor(int mode)
+{
+  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+  {
+    styleSensorTile(
+      homeSensorTiles[i],
+      homeSensorTileMarks[i],
+      homeSensorTileModes[i] == mode
+    );
+  }
+}
+
+void refreshHomeSensorTiles()
+{
+  refreshHomeSensorTilesFor(activeSensorMode);
+}
+
 void refreshHomeSensorLabels()
 {
   char buf[96];
+
+  refreshHomeSensorTiles();
 
   if (labelHomeSensorMode)
   {
@@ -940,6 +1001,13 @@ void servicePendingSensorMode()
 
   uiInputLocked = true;
   ignoreTouchUntilMs = millis() + 200;
+
+  // Move the selection and paint it before switching sensors. Bringing a
+  // sensor up probes I2C and can block for a second or more, and doing that
+  // first made the tap feel unacknowledged.
+  refreshHomeSensorTilesFor(mode);
+  lv_refr_now(NULL);
+
   setActiveSensorMode(mode);
   uiInputLocked = false;
   ignoreTouchUntilMs = millis() + 200;
@@ -1038,6 +1106,7 @@ void applyRestoredMeasurementToUi();
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
 lv_obj_t *makeTableNavButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 
 #if HAS_IDF_WIFI
 static bool idfWifiStarted = false;
@@ -1139,6 +1208,21 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   );
 
   lv_disp_flush_ready(disp);
+}
+
+// LVGL is not re-entrant. Several blocking waits (WiFi connect, NTP sync)
+// pump the UI so the screen keeps updating, and those waits can themselves be
+// reached from an LVGL callback. Route every call through this guard so a
+// nested pump becomes a no-op instead of corrupting LVGL's internal state.
+static bool lvglHandlerBusy = false;
+
+static void uiTimerHandler()
+{
+  if (lvglHandlerBusy) return;
+
+  lvglHandlerBusy = true;
+  lv_timer_handler();
+  lvglHandlerBusy = false;
 }
 
 // =====================================================
@@ -1663,7 +1747,7 @@ bool dps310Begin()
       }
     }
 
-    lv_timer_handler();
+    uiTimerHandler();
     delay(10);
   }
 
@@ -1710,7 +1794,7 @@ bool readDps310(float *temperatureC, float *pressureHpa)
       }
     }
 
-    lv_timer_handler();
+    uiTimerHandler();
     delay(5);
   }
 
@@ -2649,6 +2733,19 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
   }
 }
 
+// Digits only, matching the precision each sensor reports. The big readout
+// uses a digits-only face, so its text must never contain a name or a unit.
+static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
+{
+  if (out == NULL || outSize == 0) return;
+
+  if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "----");
+  else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "----.-");
+  else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "--.---");
+  else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "----");
+  else snprintf(out, outSize, "--.--");
+}
+
 static void formatPrimaryPlaceholderText(char *out, size_t outSize)
 {
   if (out == NULL || outSize == 0) return;
@@ -2661,15 +2758,33 @@ static void formatPrimaryPlaceholderText(char *out, size_t outSize)
   else snprintf(out, outSize, "온도: --.--℃");
 }
 
+// The value label is width-to-content, so the unit has to be re-pinned every
+// time the number changes width.
+static void realignPrimaryUnit()
+{
+  if (labelTempBig == NULL || labelMeasurePrimaryUnit == NULL) return;
+  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+}
+
 void updateActiveSensorUiLabels()
 {
   char text[96];
 
+  if (labelMeasureSensorName)
+  {
+    lv_label_set_text(labelMeasureSensorName, activeMeasurementTitle());
+  }
+
+  if (labelMeasurePrimaryUnit)
+  {
+    lv_label_set_text(labelMeasurePrimaryUnit, activePrimaryUnit());
+  }
+
   if (labelTempBig)
   {
-    lv_obj_set_width(labelTempBig, 120);
-    formatPrimaryPlaceholderText(text, sizeof(text));
+    formatPrimaryPlaceholderNumber(text, sizeof(text));
     lv_label_set_text(labelTempBig, text);
+    realignPrimaryUnit();
   }
 
   if (labelPressureBig)
@@ -2743,6 +2858,81 @@ void updateActiveSensorUiLabels()
   }
 }
 
+// Show exactly one of 시작 / 정지, and keep the send-status rail truthful about
+// where the data has actually reached.
+void refreshMeasureControls()
+{
+  if (btnMeasureStart && btnMeasureStop)
+  {
+    if (measuring)
+    {
+      lv_obj_add_flag(btnMeasureStart, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+      lv_obj_clear_flag(btnMeasureStart, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (labelMeasureIslState)
+  {
+    const bool configured = cloudModumConfigured();
+    const char *text = "미설정";
+    uint32_t color = UI_TEXT_3;
+
+    if (configured && wifiConnected && measuring) { text = "전송 중"; color = UI_OK; }
+    else if (configured && wifiConnected) { text = "준비"; color = UI_TEXT_2; }
+    else if (configured) { text = "WiFi 없음"; color = UI_DANGER; }
+
+    lv_label_set_text(labelMeasureIslState, text);
+    lv_obj_set_style_text_color(labelMeasureIslState, lv_color_hex(color), 0);
+  }
+
+  if (labelSd)
+  {
+    const char *text = "안 씀";
+    uint32_t color = UI_TEXT_3;
+
+    if (sdReady && csvLoggingEnabled) { text = "저장 중"; color = UI_OK; }
+    else if (sdReady) { text = "대기"; color = UI_TEXT_2; }
+
+    lv_label_set_text(labelSd, text);
+    lv_obj_set_style_text_color(labelSd, lv_color_hex(color), 0);
+  }
+
+  if (labelMeasureBle)
+  {
+    lv_label_set_text(labelMeasureBle, bleSensorStateText());
+    lv_obj_set_style_text_color(
+      labelMeasureBle,
+      lv_color_hex(bleSensorIsSubscribed() ? UI_OK : (bleSensorIsConnected() ? UI_TEXT_2 : UI_TEXT_3)),
+      0
+    );
+  }
+
+  if (labelMeasureModum)
+  {
+    if (strlen(islRuntimeSerialNumber) > 0)
+    {
+      // Only the tail is identifying, and the full code does not fit.
+      const size_t len = strlen(islRuntimeSerialNumber);
+      const char *tail = len > 6 ? islRuntimeSerialNumber + len - 6 : islRuntimeSerialNumber;
+
+      char buf[16];
+      snprintf(buf, sizeof(buf), "…%s", tail);
+      lv_label_set_text(labelMeasureModum, buf);
+      lv_obj_set_style_text_color(labelMeasureModum, lv_color_hex(UI_TEXT_2), 0);
+    }
+    else
+    {
+      lv_label_set_text(labelMeasureModum, "미입력");
+      lv_obj_set_style_text_color(labelMeasureModum, lv_color_hex(UI_TEXT_3), 0);
+    }
+  }
+}
+
 static void refreshLatestMeasurementLabels()
 {
   if (labelTempBig == NULL) return;
@@ -2750,7 +2940,7 @@ static void refreshLatestMeasurementLabels()
 
   if (sampleCount <= 0)
   {
-    formatPrimaryPlaceholderText(text, sizeof(text));
+    formatPrimaryPlaceholderNumber(text, sizeof(text));
     lv_label_set_text(labelTempBig, text);
 
     if (labelPressureBig)
@@ -2789,8 +2979,9 @@ static void refreshLatestMeasurementLabels()
   }
 
   const int idx = sampleCount - 1;
-  formatPrimaryValueText(text, sizeof(text), tempHistory[idx], true);
+  formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
   lv_label_set_text(labelTempBig, text);
+  realignPrimaryUnit();
 
   if (labelPressureBig)
   {
@@ -3301,8 +3492,27 @@ bool initSdCard()
   return true;
 }
 
+// The logging file stays open across samples. Re-opening and closing it once
+// per second is what made per-sample CSV logging heavy enough to be ripped out
+// before; holding the handle and flushing in batches keeps the loop cheap
+// while still bounding how much data a power cut can lose.
+static FILE *csvFile = NULL;
+static int csvRowsSinceFlush = 0;
+
+void closeCsvFile()
+{
+  if (csvFile == NULL) return;
+
+  fflush(csvFile);
+  fclose(csvFile);
+  csvFile = NULL;
+  csvRowsSinceFlush = 0;
+}
+
 void unmountSdCard()
 {
+  closeCsvFile();
+
   if (sdcard != NULL)
   {
     esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sdcard);
@@ -3312,31 +3522,44 @@ void unmountSdCard()
   sdReady = false;
 }
 
+static void reportCsvWriteFailure()
+{
+  Serial.println("CSV append failed");
+  closeCsvFile();
+  sdReady = false;
+
+  if (labelSd)
+  {
+    lv_label_set_text(labelSd, "SD: 저장 실패");
+  }
+
+  updateSdStatusLabels();
+}
+
 void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
 {
   if (!csvLoggingEnabled) return;
   if (!sdReady) return;
 
-  FILE *file = fopen(csvPath, "a");
-
-  if (file == NULL)
+  if (csvFile == NULL)
   {
-    Serial.println("CSV append failed");
-    sdReady = false;
+    csvFile = fopen(csvPath, "a");
 
-    if (labelSd)
+    if (csvFile == NULL)
     {
-      lv_label_set_text(labelSd, "SD: 저장 실패");
+      reportCsvWriteFailure();
+      return;
     }
 
-    updateSdStatusLabels();
-    return;
+    csvRowsSinceFlush = 0;
   }
+
+  int written;
 
   if (activeSensorHasPressure() && pressureValueValid(secondaryValue))
   {
-    fprintf(
-      file,
+    written = fprintf(
+      csvFile,
       "%d,%lu,%s,%.4f,%s,%.4f,%s,%ld,%ld\n",
       measurementCount,
       (unsigned long)timeS,
@@ -3351,8 +3574,8 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
   }
   else
   {
-    fprintf(
-      file,
+    written = fprintf(
+      csvFile,
       "%d,%lu,%s,%.4f,%s,,,%ld,%ld\n",
       measurementCount,
       (unsigned long)timeS,
@@ -3364,8 +3587,23 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
     );
   }
 
-  fclose(file);
-  updateDashboardCsvPreview();
+  if (written < 0)
+  {
+    reportCsvWriteFailure();
+    return;
+  }
+
+  csvRowsSinceFlush++;
+
+  if (csvRowsSinceFlush >= CSV_FLUSH_EVERY_ROWS)
+  {
+    csvRowsSinceFlush = 0;
+
+    if (fflush(csvFile) != 0)
+    {
+      reportCsvWriteFailure();
+    }
+  }
 }
 
 void updateSdStatusLabels()
@@ -3390,7 +3628,6 @@ void updateSdStatusLabels()
   }
 
   if (labelHomeSd) lv_label_set_text(labelHomeSd, sdText);
-  if (labelSd) lv_label_set_text(labelSd, sdText);
   if (labelSettingsSd) lv_label_set_text(labelSettingsSd, sdText);
   if (labelSettingsCsv) lv_label_set_text(labelSettingsCsv, csvText);
   if (labelHomeCsv) lv_label_set_text(labelHomeCsv, csvText);
@@ -3552,6 +3789,241 @@ lv_obj_t *makeSmallLabel(lv_obj_t *parent, const char *text, int x, int y, uint3
   return label;
 }
 
+// =====================================================
+// Light UI components
+// =====================================================
+
+// A plain surface. White on the grey ground carries the grouping on its own,
+// the way iOS grouped lists do, so there is no border and no shadow to add
+// visual noise.
+lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
+{
+  lv_obj_t *panel = lv_obj_create(parent);
+  lv_obj_set_size(panel, w, h);
+  lv_obj_align(panel, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(panel, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(panel, 16, 0);
+  lv_obj_set_style_border_width(panel, 0, 0);
+  lv_obj_set_style_outline_width(panel, 0, 0);
+  lv_obj_set_style_shadow_width(panel, 0, 0);
+  lv_obj_set_style_pad_all(panel, 0, 0);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_OFF);
+  return panel;
+}
+
+lv_obj_t *makeHeading(lv_obj_t *parent, const char *text, int x, int y, uint32_t color)
+{
+  lv_obj_t *label = lv_label_create(parent);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+  lv_obj_set_style_text_font(label, FONT_KR_HEAD, 0);
+  lv_obj_align(label, LV_ALIGN_TOP_LEFT, x, y);
+  return label;
+}
+
+// Status pill. The caller owns the returned label so the text can change; the
+// pill always carries a word, never colour alone.
+lv_obj_t *makeChip(lv_obj_t *parent, const char *text, int x, int y, int w,
+                   uint32_t bgColor, uint32_t textColor)
+{
+  lv_obj_t *chip = lv_obj_create(parent);
+  lv_obj_set_size(chip, w, 26);
+  lv_obj_align(chip, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(chip, lv_color_hex(bgColor), 0);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(chip, 13, 0);
+  lv_obj_set_style_border_width(chip, 0, 0);
+  lv_obj_set_style_shadow_width(chip, 0, 0);
+  lv_obj_set_style_pad_all(chip, 0, 0);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *label = lv_label_create(chip);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(textColor), 0);
+  lv_obj_set_style_text_font(label, FONT_KR_SMALL, 0);
+  lv_obj_center(label);
+  return label;
+}
+
+// Filled accent button for the one primary action on a screen.
+lv_obj_t *makePrimaryButton(lv_obj_t *parent, const char *text, int x, int y,
+                            int w, int h, uint32_t color, lv_event_cb_t cb)
+{
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn, 12, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_pad_all(btn, 0, 0);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(UI_SURFACE), 0);
+  // Display weight only on the tall, screen-level actions; a compact button
+  // wearing 24 px bold reads as shouting.
+  lv_obj_set_style_text_font(label, h >= 56 ? FONT_KR_HEAD : FONT_KR, 0);
+  lv_obj_center(label);
+  return btn;
+}
+
+// Quiet button: accent text on a tinted ground, for secondary actions.
+lv_obj_t *makeQuietButton(lv_obj_t *parent, const char *text, int x, int y,
+                          int w, int h, lv_event_cb_t cb)
+{
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(UI_ACCENT_TINT), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn, 10, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_pad_all(btn, 0, 0);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_set_style_text_font(label, FONT_KR, 0);
+  lv_obj_center(label);
+  return btn;
+}
+
+// Selection styling lives here so it can be re-applied when the active sensor
+// changes, rather than being baked in when the tile is built.
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
+{
+  if (tile == NULL) return;
+
+  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
+  lv_obj_set_style_border_width(tile, selected ? 2 : 0, 0);
+  lv_obj_set_style_border_color(tile, lv_color_hex(UI_ACCENT), 0);
+
+  if (mark == NULL) return;
+
+  if (selected) lv_obj_clear_flag(mark, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Sensor tile. Named by the quantity it measures, not the part number, and
+// large enough that a fingertip cannot reach two of them at once. The caller
+// keeps `markOut` so the selected state can be moved later.
+lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
+                         int x, int y, int w, int h, bool selected,
+                         lv_event_cb_t cb, lv_obj_t **markOut)
+{
+  lv_obj_t *tile = lv_btn_create(parent);
+  lv_obj_set_size(tile, w, h);
+  lv_obj_align(tile, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(tile, 16, 0);
+  lv_obj_set_style_outline_width(tile, 0, 0);
+  lv_obj_set_style_shadow_width(tile, 0, 0);
+  lv_obj_set_style_pad_all(tile, 0, 0);
+  lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(tile, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *nameLabel = lv_label_create(tile);
+  lv_label_set_text(nameLabel, name);
+  lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
+  lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
+  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 18, 16);
+
+  lv_obj_t *unitLabel = lv_label_create(tile);
+  lv_label_set_text(unitLabel, unit);
+  lv_obj_set_style_text_color(unitLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_set_style_text_font(unitLabel, FONT_KR_SMALL, 0);
+  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 18, -14);
+
+  lv_obj_t *mark = lv_label_create(tile);
+  lv_label_set_text(mark, "선택됨");
+  lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
+  lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
+
+  styleSensorTile(tile, mark, selected);
+
+  if (markOut != NULL) *markOut = mark;
+  return tile;
+}
+
+// Bottom tab bar, identical on every screen so "back" is always in one place.
+// Icons come from the Montserrat symbol range; the Korean caption sits below
+// them in the Hangul face, so each tab reads without relying on the glyph.
+void createTabBar(lv_obj_t *parent, int activeIndex)
+{
+  static const char *tabIcons[4] = {
+    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
+  };
+  static const char *tabNames[4] = { "홈", "측정", "기록", "설정" };
+
+  lv_event_cb_t tabCallbacks[4] = {
+    go_home_event_cb, go_measure_event_cb, go_csv_event_cb, go_settings_event_cb
+  };
+
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_set_size(bar, LCD_H_RES, UI_TABBAR_H);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(bar, 0, 0);
+  lv_obj_set_style_border_width(bar, 0, 0);
+  lv_obj_set_style_pad_all(bar, 0, 0);
+  lv_obj_set_style_shadow_width(bar, 0, 0);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Hairline along the top edge only.
+  lv_obj_t *hairline = lv_obj_create(bar);
+  lv_obj_set_size(hairline, LCD_H_RES, 1);
+  lv_obj_align(hairline, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(hairline, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_bg_opa(hairline, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hairline, 0, 0);
+  lv_obj_set_style_radius(hairline, 0, 0);
+  lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
+
+  const int tabWidth = LCD_H_RES / 4;
+
+  for (int i = 0; i < 4; i++)
+  {
+    const bool active = (i == activeIndex);
+    const uint32_t tint = active ? UI_ACCENT : UI_TEXT_3;
+
+    lv_obj_t *tab = lv_btn_create(bar);
+    lv_obj_set_size(tab, tabWidth, UI_TABBAR_H - 1);
+    lv_obj_align(tab, LV_ALIGN_TOP_LEFT, i * tabWidth, 1);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tab, 0, 0);
+    lv_obj_set_style_shadow_width(tab, 0, 0);
+    lv_obj_set_style_radius(tab, 0, 0);
+    lv_obj_set_style_pad_all(tab, 0, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    // The active tab is already here; tapping it would reload the screen.
+    if (!active) lv_obj_add_event_cb(tab, tabCallbacks[i], LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *icon = lv_label_create(tab);
+    lv_label_set_text(icon, tabIcons[i]);
+    lv_obj_set_style_text_color(icon, lv_color_hex(tint), 0);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *caption = lv_label_create(tab);
+    lv_label_set_text(caption, tabNames[i]);
+    lv_obj_set_style_text_color(caption, lv_color_hex(tint), 0);
+    lv_obj_set_style_text_font(caption, FONT_KR_SMALL, 0);
+    lv_obj_align(caption, LV_ALIGN_BOTTOM_MID, 0, -7);
+  }
+}
+
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb)
 {
@@ -3671,46 +4143,65 @@ void createStatusBar(
 )
 {
   lv_obj_t *bar = lv_obj_create(parent);
-  lv_obj_set_size(bar, 1024, 40);
+  lv_obj_set_size(bar, LCD_H_RES, UI_STATUSBAR_H);
   lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
-  lv_obj_set_style_bg_color(bar, lv_color_hex(0x111827), 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(UI_SURFACE), 0);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bar, 0, 0);
   lv_obj_set_style_radius(bar, 0, 0);
+  lv_obj_set_style_shadow_width(bar, 0, 0);
+  lv_obj_set_style_pad_all(bar, 0, 0);
   lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Hairline along the bottom edge separates the bar from the page.
+  lv_obj_t *hairline = lv_obj_create(bar);
+  lv_obj_set_size(hairline, LCD_H_RES, 1);
+  lv_obj_align(hairline, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(hairline, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_bg_opa(hairline, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hairline, 0, 0);
+  lv_obj_set_style_radius(hairline, 0, 0);
+  lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
 
   lv_obj_t *titleLabel = lv_label_create(bar);
   lv_label_set_text(titleLabel, title);
-  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_color(titleLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(titleLabel, FONT_KR, 0);
-  lv_obj_align(titleLabel, LV_ALIGN_LEFT_MID, 18, 0);
+  lv_obj_align(titleLabel, LV_ALIGN_LEFT_MID, 24, 0);
 
+  // Clock centred; connection state pinned to the right edge.
   *timeLabel = lv_label_create(bar);
-  lv_label_set_text(*timeLabel, "----.--.-- --:--");
-  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(0xFFFFFF), 0);
+  lv_label_set_text(*timeLabel, "--:--");
+  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(*timeLabel, FONT_KR, 0);
-  lv_obj_align(*timeLabel, LV_ALIGN_CENTER, -40, 0);
+  lv_obj_align(*timeLabel, LV_ALIGN_CENTER, 0, 0);
+
+  // Connection state reads as two glyphs that go green when live. The text
+  // never changes after this point; updateStatusBars() only recolours them.
+  *sdLabel = lv_label_create(bar);
+  lv_label_set_text(*sdLabel, LV_SYMBOL_SD_CARD);
+  lv_obj_set_style_text_font(*sdLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(*sdLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_align(*sdLabel, LV_ALIGN_RIGHT_MID, -24, 0);
 
   *wifiLabel = lv_label_create(bar);
-  lv_label_set_text(*wifiLabel, "WiFi --");
-  lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(0xD1D5DB), 0);
-  lv_obj_set_style_text_font(*wifiLabel, FONT_KR, 0);
-  lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -125, 0);
+  lv_label_set_text(*wifiLabel, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_font(*wifiLabel, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -64, 0);
+}
 
-  *sdLabel = lv_label_create(bar);
-  lv_label_set_text(*sdLabel, "SD --");
-  lv_obj_set_style_text_color(*sdLabel, lv_color_hex(0xD1D5DB), 0);
-  lv_obj_set_style_text_font(*sdLabel, FONT_KR, 0);
-  lv_obj_align(*sdLabel, LV_ALIGN_RIGHT_MID, -18, 0);
+// Green when the thing is actually working, muted grey otherwise.
+static void setStatusIconState(lv_obj_t *icon, bool active)
+{
+  if (icon == NULL) return;
+  lv_obj_set_style_text_color(icon, lv_color_hex(active ? UI_OK : UI_TEXT_3), 0);
 }
 
 void updateStatusBars()
 {
   String nowText = getCurrentDateTimeText();
   String shortTime = nowText.substring(0, 16);
-
-  const char *wifiText = wifiConnected ? "WiFi 연결" : "WiFi 검색";
-  const char *sdText = sdReady ? "SD ON" : "SD OFF";
 
   if (labelBarHomeTime) lv_label_set_text(labelBarHomeTime, shortTime.c_str());
   if (labelBarMeasureTime) lv_label_set_text(labelBarMeasureTime, shortTime.c_str());
@@ -3720,21 +4211,22 @@ void updateStatusBars()
   if (labelBarFileViewerTime) lv_label_set_text(labelBarFileViewerTime, shortTime.c_str());
   if (labelBarPlotTime) lv_label_set_text(labelBarPlotTime, shortTime.c_str());
 
-  if (labelBarHomeWifi) lv_label_set_text(labelBarHomeWifi, wifiText);
-  if (labelBarMeasureWifi) lv_label_set_text(labelBarMeasureWifi, wifiText);
-  if (labelBarSettingsWifi) lv_label_set_text(labelBarSettingsWifi, wifiText);
-  if (labelBarIslWifi) lv_label_set_text(labelBarIslWifi, wifiText);
-  if (labelBarCsvWifi) lv_label_set_text(labelBarCsvWifi, wifiText);
-  if (labelBarFileViewerWifi) lv_label_set_text(labelBarFileViewerWifi, wifiText);
-  if (labelBarPlotWifi) lv_label_set_text(labelBarPlotWifi, wifiText);
+  setStatusIconState(labelBarHomeWifi, wifiConnected);
+  setStatusIconState(labelBarMeasureWifi, wifiConnected);
+  setStatusIconState(labelBarSettingsWifi, wifiConnected);
+  setStatusIconState(labelBarIslWifi, wifiConnected);
+  setStatusIconState(labelBarCsvWifi, wifiConnected);
+  setStatusIconState(labelBarFileViewerWifi, wifiConnected);
+  setStatusIconState(labelBarPlotWifi, wifiConnected);
 
-  if (labelBarHomeSd) lv_label_set_text(labelBarHomeSd, sdText);
-  if (labelBarMeasureSd) lv_label_set_text(labelBarMeasureSd, sdText);
-  if (labelBarSettingsSd) lv_label_set_text(labelBarSettingsSd, sdText);
-  if (labelBarIslSd) lv_label_set_text(labelBarIslSd, sdText);
-  if (labelBarCsvSd) lv_label_set_text(labelBarCsvSd, sdText);
-  if (labelBarFileViewerSd) lv_label_set_text(labelBarFileViewerSd, sdText);
-  if (labelBarPlotSd) lv_label_set_text(labelBarPlotSd, sdText);
+  const bool sdActive = sdReady && csvLoggingEnabled;
+  setStatusIconState(labelBarHomeSd, sdActive);
+  setStatusIconState(labelBarMeasureSd, sdActive);
+  setStatusIconState(labelBarSettingsSd, sdActive);
+  setStatusIconState(labelBarIslSd, sdActive);
+  setStatusIconState(labelBarCsvSd, sdActive);
+  setStatusIconState(labelBarFileViewerSd, sdActive);
+  setStatusIconState(labelBarPlotSd, sdActive);
 }
 
 lv_obj_t *makeInfoLabel(lv_obj_t *parent, const char *text, int w)
@@ -3794,6 +4286,9 @@ void sanitizeCsvFileName(const char *input, char *out, size_t outSize)
 
 void updateCsvPath()
 {
+  // Drop any handle still pointing at the previous file, otherwise logging
+  // would keep appending to the old name after the user renames the file.
+  closeCsvFile();
   snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
 }
 
@@ -4073,6 +4568,7 @@ static void dashboard_textarea_event_cb(lv_event_t *e)
     lv_keyboard_set_textarea(keyboard, lv_event_get_target(e));
     lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
   }
+
 }
 
 static void dashboard_keyboard_event_cb(lv_event_t *e)
@@ -4088,6 +4584,7 @@ static void dashboard_keyboard_event_cb(lv_event_t *e)
       lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
       lv_keyboard_set_textarea(keyboard, NULL);
     }
+
   }
 }
 
@@ -4166,6 +4663,10 @@ void resetTable()
 {
   tablePageOffset = 0;
 
+  // The table lives on whichever screen chooses to build it; the measurement
+  // screen no longer does.
+  if (tableData == NULL) return;
+
   char header[32];
 
   lv_table_set_cell_value(tableData, 0, 0, "No");
@@ -4199,6 +4700,8 @@ void resetTable()
 
 void updateTable()
 {
+  if (tableData == NULL) return;
+
   char text[32];
 
   int maxOffset = 0;
@@ -5376,7 +5879,6 @@ void prepareScreenNoScroll(lv_obj_t *screen)
 }
 
 static lv_obj_t *currentLoadedScreen = NULL;
-static lv_color_t *fastClearBuf = NULL;
 
 // v13: each screen gets an opaque full-screen base object.
 // This prevents old pixels/black lines from remaining in empty areas
@@ -5388,18 +5890,20 @@ static lv_obj_t *csvScreenBase = NULL;
 static lv_obj_t *settingsScreenBase = NULL;
 static lv_obj_t *fileViewerScreenBase = NULL;
 static lv_obj_t *islScreenBase = NULL;
-static lv_obj_t *wifiScreenBase = NULL;
 
 uint32_t screenBgColor(lv_obj_t *screen)
 {
-  if (screen == homeScreen) return 0x0B1020;
-  if (screen == measureScreen) return UI_LIGHT_BG;
+  // ensureOpaqueScreenBase() paints a full-screen object in this colour behind
+  // every widget, so it — not the screen's own bg_color — is what the user
+  // sees. Screens still on the old dark theme keep 0x0B1020 until they are
+  // converted.
+  if (screen == homeScreen) return UI_BG;
+  if (screen == measureScreen) return UI_BG;
   if (screen == plotScreen) return UI_LIGHT_BG;
   if (screen == csvScreen) return UI_LIGHT_BG;
   if (screen == settingsScreen) return UI_LIGHT_BG;
   if (screen == fileViewerScreen) return 0x0B1020;
   if (screen == islScreen) return 0x0B1020;
-  if (screen == wifiScreen) return UI_LIGHT_BG;
   return 0x0B1020;
 }
 
@@ -5412,7 +5916,6 @@ lv_obj_t **screenBaseSlot(lv_obj_t *screen)
   if (screen == settingsScreen) return &settingsScreenBase;
   if (screen == fileViewerScreen) return &fileViewerScreenBase;
   if (screen == islScreen) return &islScreenBase;
-  if (screen == wifiScreen) return &wifiScreenBase;
   return NULL;
 }
 
@@ -5443,40 +5946,6 @@ void ensureOpaqueScreenBase(lv_obj_t *screen)
   lv_obj_set_style_bg_opa(*slot, LV_OPA_COVER, 0);
   lv_obj_move_background(*slot);
   lv_obj_invalidate(*slot);
-}
-
-void fastLcdClear(uint32_t colorHex)
-{
-#if ENABLE_HOME_FAST_CLEAR
-  if (fastClearBuf == NULL)
-  {
-    fastClearBuf = (lv_color_t *)heap_caps_malloc(
-      LCD_H_RES * FAST_CLEAR_ROWS * sizeof(lv_color_t),
-      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
-    );
-
-    if (fastClearBuf == NULL)
-    {
-      Serial.println("[WARN] fast clear buffer allocation failed");
-      return;
-    }
-  }
-
-  lv_color_t color = lv_color_hex(colorHex);
-  const int pixels = LCD_H_RES * FAST_CLEAR_ROWS;
-
-  for (int i = 0; i < pixels; i++)
-  {
-    fastClearBuf[i] = color;
-  }
-
-  for (int y = 0; y < LCD_V_RES; y += FAST_CLEAR_ROWS)
-  {
-    int h = FAST_CLEAR_ROWS;
-    if (y + h > LCD_V_RES) h = LCD_V_RES - y;
-    lcd.lcd_draw_bitmap(0, y, LCD_H_RES, y + h, &fastClearBuf[0].full);
-  }
-#endif
 }
 
 void forceScreenFlush(lv_obj_t *screen)
@@ -6076,6 +6545,7 @@ static void settings_csv_toggle_event_cb(lv_event_t *e)
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
   csvLoggingEnabled = !csvLoggingEnabled;
+  if (!csvLoggingEnabled) closeCsvFile();
 
   if (csvLoggingEnabled && !sdReady)
   {
@@ -6503,6 +6973,7 @@ static void dashboard_csv_toggle_event_cb(lv_event_t *e)
 
   updateCsvFileNameFromDashboard();
   csvLoggingEnabled = !csvLoggingEnabled;
+  if (!csvLoggingEnabled) closeCsvFile();
 
   if (csvLoggingEnabled && !sdReady)
   {
@@ -6608,6 +7079,7 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e)
   // 이 버튼은 현재까지 누적된 측정 데이터를 한 번에 저장한다.
   // 측정 루프의 자동 append 방식은 사용하지 않는다.
   csvLoggingEnabled = false;
+  closeCsvFile();
 
   if (labelSelectedSdFile)
   {
@@ -6672,6 +7144,7 @@ static void csv_stop_save_event_cb(lv_event_t *e)
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
   csvLoggingEnabled = false;
+  closeCsvFile();
   updateSdStatusLabels();
   updateDashboardCsvLabels();
   updateDashboardCsvPreview();
@@ -7096,12 +7569,110 @@ static void settings_sd_list_event_cb(lv_event_t *e)
 
 
 
+// Show the saved group code on the home row, or say plainly that there is none.
+void refreshHomeModumCodeLabel()
+{
+  if (labelHomeModumCode == NULL) return;
+
+  if (strlen(islRuntimeSerialNumber) > 0)
+  {
+    lv_label_set_text(labelHomeModumCode, islRuntimeSerialNumber);
+    lv_obj_set_style_text_color(labelHomeModumCode, lv_color_hex(UI_TEXT), 0);
+  }
+  else
+  {
+    lv_label_set_text(labelHomeModumCode, "미입력");
+    lv_obj_set_style_text_color(labelHomeModumCode, lv_color_hex(UI_TEXT_3), 0);
+  }
+}
+
+void closeHomeCodeEditor()
+{
+  if (homeKeyboard)
+  {
+    lv_keyboard_set_textarea(homeKeyboard, NULL);
+    lv_obj_add_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  if (homeCodeEditor) lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void home_code_open_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (homeCodeEditor == NULL || homeIslModuleTa == NULL) return;
+
+  lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+
+  lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(homeCodeEditor);
+
+  if (homeKeyboard)
+  {
+    lv_keyboard_set_textarea(homeKeyboard, homeIslModuleTa);
+    lv_obj_clear_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(homeKeyboard);
+  }
+}
+
+static void home_code_cancel_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeHomeCodeEditor();
+}
+
+static void home_code_confirm_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  dashboard_isl_save_event_cb(e);
+  refreshHomeModumCodeLabel();
+  closeHomeCodeEditor();
+}
+
+// A sheet over the sensor grid, so the field being typed into is never the
+// thing the keyboard hides, and 저장/취소 always close it.
+void createHomeCodeEditor()
+{
+  homeCodeEditor = lv_obj_create(homeScreen);
+  lv_obj_set_size(homeCodeEditor, LCD_H_RES, LCD_V_RES - UI_STATUSBAR_H - 220);
+  lv_obj_align(homeCodeEditor, LV_ALIGN_TOP_LEFT, 0, UI_STATUSBAR_H);
+  lv_obj_set_style_bg_color(homeCodeEditor, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(homeCodeEditor, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(homeCodeEditor, 0, 0);
+  lv_obj_set_style_border_width(homeCodeEditor, 0, 0);
+  lv_obj_set_style_pad_all(homeCodeEditor, 0, 0);
+  lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *card = makePanel(homeCodeEditor, 162, 36, 700, 190);
+
+  makeHeading(card, "모둠코드", 28, 22, UI_TEXT);
+  makeSmallLabel(card, "지능형 과학실 ON에서 받은 코드를 입력하세요.", 28, 58, UI_TEXT_3);
+
+  homeIslModuleTa = lv_textarea_create(card);
+  lv_obj_set_size(homeIslModuleTa, 644, 48);
+  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 28, 86);
+  lv_textarea_set_one_line(homeIslModuleTa, true);
+  lv_textarea_set_password_mode(homeIslModuleTa, false);
+  lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
+  lv_obj_set_style_text_font(homeIslModuleTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(homeIslModuleTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(homeIslModuleTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(homeIslModuleTa, 0, 0);
+  lv_obj_set_style_radius(homeIslModuleTa, 10, 0);
+  lv_obj_set_style_text_color(homeIslModuleTa, lv_color_hex(UI_TEXT), 0);
+
+  makeQuietButton(card, "취소", 452, 144, 100, 40, home_code_cancel_event_cb);
+  makePrimaryButton(card, "저장", 562, 144, 110, 40, UI_ACCENT, home_code_confirm_event_cb);
+}
+
 void createHomeUi()
 {
   homeScreen = lv_obj_create(NULL);
   lv_obj_set_size(homeScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(homeScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(homeScreen, lv_color_hex(0x0B1020), 0);
+  lv_obj_set_style_bg_color(homeScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(homeScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(homeScreen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -7113,113 +7684,106 @@ void createHomeUi()
     &labelBarHomeSd
   );
 
-  // ZWO ASIAIR 스타일에 맞춘 단순 카드형 대시보드
-  lv_obj_t *wifiCard = makeCard(homeScreen, 22, 62, 310, 205, 0x111827);
-  lv_obj_set_style_border_color(wifiCard, lv_color_hex(0x1F2937), 0);
-  makeLabel(wifiCard, "WiFi", 14, 10, 0xFFFFFF);
-
-  labelHomeWifi = makeLabel(wifiCard, "연결 안 됨", 14, 52, 0x60A5FA);
-  lv_obj_set_width(labelHomeWifi, 270);
-  lv_label_set_long_mode(labelHomeWifi, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeWifi);
-
-  labelHomeIp = makeLabel(wifiCard, "IP: --", 14, 88, 0xD1D5DB);
-  lv_obj_set_width(labelHomeIp, 270);
-  lv_label_set_long_mode(labelHomeIp, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeIp);
-
-  labelHomeSignal = makeLabel(wifiCard, "신호: --", 14, 124, 0xD1D5DB);
-  lv_obj_set_width(labelHomeSignal, 165);
-  lv_label_set_long_mode(labelHomeSignal, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeSignal);
-
-  makeButton(wifiCard, "설정", 190, 132, 88, 38, go_settings_event_cb);
-
-  // 측정 센서 카드는 넓게 사용하고, 모델명이 아니라 측정 물리량으로 선택한다.
-  lv_obj_t *measureCard = makeCard(homeScreen, 357, 62, 645, 205, 0x111827);
-  lv_obj_set_style_border_color(measureCard, lv_color_hex(0x1F2937), 0);
-  makeLabel(measureCard, "SENSOR", 16, 10, 0xFFFFFF);
-
-  labelHomeSensorMode = makeLabel(measureCard, "선택: 온도 · 기압", 16, 48, 0x60A5FA);
-  lv_obj_set_width(labelHomeSensorMode, 600);
-  lv_label_set_long_mode(labelHomeSensorMode, LV_LABEL_LONG_CLIP);
-
-  labelHomeSensorStatus = makeLabel(measureCard, "상태: 준비", 16, 82, 0xD1D5DB);
-  lv_obj_set_width(labelHomeSensorStatus, 600);
-  lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
-
-  makeButton(measureCard, "온도·기압", 14, 128, 98, 48, home_sensor_dps_event_cb);
-  makeButton(measureCard, "수온",      118, 128, 62, 48, home_sensor_water_event_cb);
-  makeButton(measureCard, "CO2",       186, 128, 58, 48, home_sensor_co2_event_cb);
-  makeButton(measureCard, "조도",      250, 128, 62, 48, home_sensor_light_event_cb);
-  makeButton(measureCard, "정밀온도",  318, 128, 90, 48, home_sensor_tmp117_event_cb);
-  makeButton(measureCard, "거리",      414, 128, 62, 48, home_sensor_vl53_event_cb);
-  makeButton(measureCard, "측정 화면", 482, 128, 142, 48, go_measure_event_cb);
-
-  // 복구/재시작 상세 문구는 숨기고, 기능 버튼은 아래 지능형과학실 카드에 배치한다.
-  labelHomeResetReason = NULL;
-  labelHomeRecovery = NULL;
-
-
   // =====================================================
-  // 지능형과학실 모둠코드 입력 카드
-  // - Cloud Run으로 modumId를 넘기는 실제 운영 입력칸입니다.
-  // - 서비스키는 Cloud Run 환경변수에 두고, ESP32에는 모둠코드만 입력합니다.
+  // The home screen asks one question: which sensor?
+  // Everything else — WiFi detail, upload mode, restart — lives one tap away
+  // in Settings, so a student meets six choices instead of fifteen controls.
   // =====================================================
-  lv_obj_t *cloudCard = makeCard(homeScreen, 22, 292, 980, 188, 0x111827);
-  lv_obj_set_style_border_color(cloudCard, lv_color_hex(0x1F2937), 0);
+  makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
 
-  makeLabel(cloudCard, "지능형 과학실 모둠코드", 14, 8, 0xFFFFFF);
-  homeIslModuleTa = lv_textarea_create(cloudCard);
-  lv_obj_set_size(homeIslModuleTa, 360, 44);
-  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 14, 50);
-  lv_textarea_set_one_line(homeIslModuleTa, true);
-  lv_textarea_set_password_mode(homeIslModuleTa, false);
-  lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
-  lv_obj_set_style_text_font(homeIslModuleTa, &lv_font_montserrat_16, 0);
-  lv_obj_add_event_cb(homeIslModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
+  // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
+  const int tileW = 316;
+  const int tileH = 112;
+  const int tileGapX = 14;
+  const int tileGapY = 14;
+  const int tileLeft = 28;
+  const int tileTop = 128;
 
-  if (strlen(islRuntimeSerialNumber) > 0)
+  struct SensorTileSpec
   {
-    lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+    const char *name;
+    const char *unit;
+    int mode;
+    lv_event_cb_t cb;
+  };
+
+  // Named by the quantity measured, not the part number: a student reads
+  // "이산화탄소", not "SCD41".
+  const SensorTileSpec tiles[6] = {
+    { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
+    { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
+    { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
+    { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
+    { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
+    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb }
+  };
+
+  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+  {
+    const int col = i % 3;
+    const int row = i / 3;
+
+    homeSensorTileModes[i] = tiles[i].mode;
+    homeSensorTiles[i] = makeSensorTile(
+      homeScreen,
+      tiles[i].name,
+      tiles[i].unit,
+      tileLeft + col * (tileW + tileGapX),
+      tileTop + row * (tileH + tileGapY),
+      tileW,
+      tileH,
+      activeSensorMode == tiles[i].mode,
+      tiles[i].cb,
+      &homeSensorTileMarks[i]
+    );
   }
 
-  // 모둠코드 카드에서는 코드 저장과 전송 방식 선택만 합니다.
-  // 시작/정지 제어는 측정 화면의 시작/정지 버튼으로 처리합니다.
-  makeButton(cloudCard, "저장", 395, 50, 80, 44, dashboard_isl_save_event_cb);
-  makeButton(cloudCard, "전송설정", 490, 50, 110, 44, go_isl_event_cb);
-  // Plot/CSV removed in stability build.
-  makeButton(cloudCard, "재시작", 620, 50, 170, 44, board_restart_event_cb);
+  // The selected tile already carries 선택됨, so no "선택: ..." line here.
+  labelHomeSensorMode = NULL;
 
-  makeSmallLabel(cloudCard, "전송방식", 14, 106, 0xCBD5E1);
-  makeButton(cloudCard, "실시간", 110, 100, 90, 38, dashboard_cloud_realtime_event_cb);
-  makeButton(cloudCard, "일괄전송", 215, 100, 115, 38, dashboard_cloud_batch_event_cb);
+  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 388, UI_TEXT_2);
+  lv_obj_set_width(labelHomeSensorStatus, 392);
+  lv_obj_set_style_text_align(labelHomeSensorStatus, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
 
-  labelCloudMode = makeSmallLabel(cloudCard, "방식: 실시간", 345, 110, 0x60A5FA);
-  lv_obj_set_width(labelCloudMode, 480);
-  lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
+  // =====================================================
+  // Group code: show the saved value, and only raise the keyboard on 변경.
+  // The old screen kept an always-open text field plus a save button.
+  // =====================================================
+  // Resting state: the saved code is read-only text. Editing happens in a
+  // modal sheet, opened by 변경.
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
 
-  lv_obj_t *cloudNote = makeSmallLabel(
-    cloudCard,
-    "실시간=측정 중 계속 전송 / 일괄전송=측정 화면 [일괄전송] 버튼으로 누적 데이터 업로드",
-    14,
-    152,
-    0xCBD5E1
-  );
-  lv_obj_set_width(cloudNote, 930);
-  lv_label_set_long_mode(cloudNote, LV_LABEL_LONG_CLIP);
-  updateCloudModeLabel();
+  makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
+
+  labelHomeModumCode = makeLabel(codePanel, "미입력", 18, 34, UI_TEXT);
+  lv_obj_set_width(labelHomeModumCode, 448);
+  lv_label_set_long_mode(labelHomeModumCode, LV_LABEL_LONG_CLIP);
+
+  makeQuietButton(codePanel, "변경", 486, 18, 100, 38, home_code_open_event_cb);
+
+  // The one primary action on this screen.
+  makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
+
+  // Upload mode and queue counts belong in Settings, not on the home screen.
+  labelCloudMode = NULL;
+
+  createHomeCodeEditor();
 
   homeKeyboard = lv_keyboard_create(homeScreen);
-  lv_obj_set_size(homeKeyboard, 1024, 150);
+  lv_obj_set_size(homeKeyboard, LCD_H_RES, 220);
   lv_obj_align(homeKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(homeKeyboard, dashboard_keyboard_event_cb, LV_EVENT_ALL, NULL);
   lv_obj_set_style_text_font(homeKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(homeKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
+  createTabBar(homeScreen, 0);
+
+  updateCloudModeLabel();
   updateHomeWifiLabels();
   refreshHomeSensorLabels();
+  refreshHomeModumCodeLabel();
 }
 
 // =====================================================
@@ -7230,7 +7794,7 @@ void createMeasureUi()
   measureScreen = lv_obj_create(NULL);
   lv_obj_set_size(measureScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(measureScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(measureScreen, lv_color_hex(UI_LIGHT_BG), 0);
+  lv_obj_set_style_bg_color(measureScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(measureScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(measureScreen, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(measureScreen, LV_SCROLLBAR_MODE_OFF);
@@ -7243,172 +7807,172 @@ void createMeasureUi()
     &labelBarMeasureSd
   );
 
-  // 상단 검은색 바 안에 측정 상태 표시
+  // =====================================================
+  // Two columns: the reading and its history on the left, the session facts
+  // and the one destructive control on the right. The value is the largest
+  // thing on the screen because it is the only thing a student is watching.
+  // =====================================================
+  const int colLeftX = 24;
+  const int colLeftW = 700;
+  const int railX = 740;
+  const int railW = 260;
+  const int contentTop = 58;
+
+  // ---- sensor name and live state ----
+  labelMeasureSensorName = makeHeading(measureScreen, "온도 · 기압", colLeftX, contentTop, UI_TEXT);
+
   labelStatus = lv_label_create(measureScreen);
   lv_label_set_text(labelStatus, "준비");
-  lv_obj_set_style_text_color(labelStatus, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_text_font(labelStatus, FONT_KR, 0);
-  lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, 18, 11);
-  lv_obj_set_width(labelStatus, 160);
+  lv_obj_set_style_text_color(labelStatus, lv_color_hex(UI_OK), 0);
+  lv_obj_set_style_text_font(labelStatus, FONT_KR_SMALL, 0);
+  lv_obj_set_width(labelStatus, 300);
+  lv_obj_set_style_text_align(labelStatus, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelStatus, LV_LABEL_LONG_CLIP);
+  lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, colLeftX + colLeftW - 300, contentTop + 8);
 
-  // =====================================================
-  // 상단 제어행: 1024px 기준 겹침 방지 재배치
-  // =====================================================
-  labelRuntime = makeLabel(measureScreen, "시간 00:00:00", 20, 58, 0x111827);
-  lv_obj_set_width(labelRuntime, 105);
-  lv_label_set_long_mode(labelRuntime, LV_LABEL_LONG_CLIP);
+  // ---- the reading ----
+  labelTempBig = lv_label_create(measureScreen);
+  lv_label_set_text(labelTempBig, "--.-");
+  lv_obj_set_style_text_color(labelTempBig, lv_color_hex(UI_TEXT), 0);
+  lv_obj_set_style_text_font(labelTempBig, FONT_VALUE, 0);
+  lv_obj_align(labelTempBig, LV_ALIGN_TOP_LEFT, colLeftX, contentTop + 34);
 
-  labelCount = makeLabel(measureScreen, "0", 130, 58, 0x111827);
-  lv_obj_set_width(labelCount, 38);
-  lv_label_set_long_mode(labelCount, LV_LABEL_LONG_CLIP);
+  // Pinned to the value's own right edge rather than a fixed x, so it hugs
+  // the number whether it reads "28.2" or "1013.24".
+  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", 0, 0, UI_TEXT_3);
+  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
 
-  labelTempBig = makeLabel(measureScreen, "온도: --.--℃", 175, 58, 0x0EA5E9);
-  lv_obj_set_width(labelTempBig, 120);
-  lv_label_set_long_mode(labelTempBig, LV_LABEL_LONG_CLIP);
-
-  labelPressureBig = makeLabel(measureScreen, "압력: ----.-hPa", 300, 58, 0xF97316);
-  lv_obj_set_width(labelPressureBig, 120);
+  // Secondary quantity, when the active sensor reports one.
+  labelPressureBig = makeLabel(measureScreen, "기압 ----.-- hPa", colLeftX, contentTop + 122, UI_TEXT_2);
+  lv_obj_set_width(labelPressureBig, 340);
   lv_label_set_long_mode(labelPressureBig, LV_LABEL_LONG_CLIP);
 
-  labelHumidityBig = makeLabel(measureScreen, "", 425, 58, 0x16A34A);
-  lv_obj_set_width(labelHumidityBig, 120);
+  labelHumidityBig = makeLabel(measureScreen, "", colLeftX + 356, contentTop + 122, UI_TEXT_2);
+  lv_obj_set_width(labelHumidityBig, 340);
   lv_label_set_long_mode(labelHumidityBig, LV_LABEL_LONG_CLIP);
   lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
 
-  makeButton(measureScreen, "시작", 550, 50, 52, 36, start_event_cb);
-  makeButton(measureScreen, "정지", 605, 50, 52, 36, stop_event_cb);
-  makeButton(measureScreen, "일괄전송", 660, 50, 88, 36, dashboard_cloud_batch_upload_event_cb);
-  makeButton(measureScreen, "초기화", 751, 50, 65, 36, clear_event_cb);
-  makeButton(measureScreen, "홈", 819, 50, 70, 36, go_home_event_cb);
-  makeButton(measureScreen, "설정", 892, 50, 100, 36, go_settings_event_cb);
+  // =====================================================
+  // Chart
+  // =====================================================
+  const int chartCardY = contentTop + 152;
+  const int chartCardH = 530 - chartCardY;
 
-  // =====================================================
-  // 그래프 영역: 테이블과 겹치지 않도록 좌우 폭 재조정
-  // =====================================================
-  lv_obj_t *graphCard = makeCard(measureScreen, 12, 96, 748, 488, 0xFFFFFF);
-  lv_obj_set_style_pad_all(graphCard, 0, 0);
-  lv_obj_clear_flag(graphCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(graphCard, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_t *chartCard = makePanel(measureScreen, colLeftX, chartCardY, colLeftW, chartCardH);
 
   const int gChartX = 62;
-  const int gChartY = 54;
-  const int gChartW = 600;
-  const int gChartH = 350;
+  const int gChartY = 34;
+  const int gChartW = 556;
+  const int gChartH = chartCardH - 82;
 
-  labelMeasureTempAxisTitle = makeSmallLabel(graphCard, "온도(℃)", 6, 24, 0x0EA5E9);
-  labelMeasurePressureAxisTitle = makeSmallLabel(graphCard, "기압", 674, 24, 0xF97316);
+  labelMeasureTempAxisTitle = makeSmallLabel(chartCard, "온도(℃)", 14, 10, UI_ACCENT);
+  labelMeasurePressureAxisTitle = makeSmallLabel(chartCard, "기압", gChartX + gChartW + 8, 10, 0xB7791F);
 
-  chart = lv_chart_create(graphCard);
+  chart = lv_chart_create(chartCard);
   lv_obj_set_size(chart, gChartW, gChartH);
   lv_obj_align(chart, LV_ALIGN_TOP_LEFT, gChartX, gChartY);
   lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(chart, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chart, 0, 0);
+  lv_obj_set_style_pad_all(chart, 0, 0);
+  lv_obj_set_style_line_color(chart, lv_color_hex(0xEDF1F6), LV_PART_MAIN);
+  lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_size(chart, 0, LV_PART_INDICATOR);
 
   lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
   lv_chart_set_point_count(chart, CHART_POINTS);
   lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
-  lv_chart_set_div_line_count(chart, 6, 6);
+  lv_chart_set_div_line_count(chart, 5, 0);
 
-  // LVGL 기본 tick label은 끄고, 외부 label로 직접 표시
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_X, 0, 0, 0, 0, false, 0);
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_PRIMARY_Y, 0, 0, 0, 0, false, 0);
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_SECONDARY_Y, 0, 0, 0, 0, false, 0);
 
-  seriesTemp = lv_chart_add_series(
-    chart,
-    lv_palette_main(LV_PALETTE_BLUE),
-    LV_CHART_AXIS_PRIMARY_Y
-  );
-
-  seriesPressure = lv_chart_add_series(
-    chart,
-    lv_palette_main(LV_PALETTE_ORANGE),
-    LV_CHART_AXIS_SECONDARY_Y
-  );
+  seriesTemp = lv_chart_add_series(chart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+  seriesPressure = lv_chart_add_series(chart, lv_color_hex(0xB7791F), LV_CHART_AXIS_SECONDARY_Y);
 
   for (int i = 0; i < 6; i++)
   {
-    int tickX = gChartX + (gChartW * i) / 5;
-    int tickY = gChartY + gChartH - (gChartH * i) / 5;
+    const int tickX = gChartX + (gChartW * i) / 5;
+    const int tickY = gChartY + gChartH - (gChartH * i) / 5;
 
-    // x축 tick mark
-    makePlotRect(graphCard, tickX, gChartY + gChartH - 5, 1, 10, 0x64748B);
-
-    // 왼쪽 y축 tick mark
-    makePlotRect(graphCard, gChartX - 5, tickY, 10, 1, 0x64748B);
-
-    // 오른쪽 y축 tick mark
-    makePlotRect(graphCard, gChartX + gChartW - 5, tickY, 10, 1, 0x64748B);
-
-    labelMeasureTimeTicks[i] = makeSmallLabel(graphCard, "--", tickX - 40, gChartY + gChartH + 8, 0x374151);
+    labelMeasureTimeTicks[i] = makeSmallLabel(chartCard, "--", tickX - 40, gChartY + gChartH + 8, UI_TEXT_3);
     lv_obj_set_width(labelMeasureTimeTicks[i], 80);
     lv_obj_set_style_text_align(labelMeasureTimeTicks[i], LV_TEXT_ALIGN_CENTER, 0);
 
-    labelMeasureTempTicks[i] = makeSmallLabel(graphCard, "--", 2, tickY - 10, 0x0EA5E9);
-    lv_obj_set_width(labelMeasureTempTicks[i], 58);
+    labelMeasureTempTicks[i] = makeSmallLabel(chartCard, "--", 6, tickY - 9, UI_TEXT_3);
+    lv_obj_set_width(labelMeasureTempTicks[i], 50);
     lv_obj_set_style_text_align(labelMeasureTempTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
 
-    labelMeasurePressureTicks[i] = makeSmallLabel(graphCard, "--", 672, tickY - 10, 0xF97316);
-    lv_obj_set_width(labelMeasurePressureTicks[i], 72);
+    labelMeasurePressureTicks[i] = makeSmallLabel(chartCard, "--", gChartX + gChartW + 6, tickY - 9, UI_TEXT_3);
+    lv_obj_set_width(labelMeasurePressureTicks[i], 70);
     lv_obj_set_style_text_align(labelMeasurePressureTicks[i], LV_TEXT_ALIGN_LEFT, 0);
   }
 
-  labelGraphStart = makeSmallLabel(graphCard, "시간(s)", 312, 452, 0x374151);
+  labelGraphStart = makeSmallLabel(chartCard, "시간(s)", gChartX + gChartW / 2 - 50, chartCardH - 24, UI_TEXT_3);
   lv_obj_set_width(labelGraphStart, 100);
   lv_obj_set_style_text_align(labelGraphStart, LV_TEXT_ALIGN_CENTER, 0);
 
-  labelGraphEnd = makeSmallLabel(graphCard, "", 0, 0, 0x374151);
+  labelGraphEnd = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_3);
   lv_obj_add_flag(labelGraphEnd, LV_OBJ_FLAG_HIDDEN);
 
   // =====================================================
-  // 테이블 영역: 16px 폰트 기준 카드 내부에서 버튼과 겹치지 않게 표시.
+  // Session rail
   // =====================================================
-  lv_obj_t *tableCard = makeCard(measureScreen, 770, 96, 242, 488, 0xFFFFFF);
-  lv_obj_set_style_pad_all(tableCard, 4, 0);
-  lv_obj_clear_flag(tableCard, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(tableCard, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_t *elapsedCard = makePanel(measureScreen, railX, contentTop, 126, 70);
+  makeSmallLabel(elapsedCard, "경과 시간", 12, 10, UI_TEXT_3);
+  labelRuntime = makeLabel(elapsedCard, "00:00", 12, 32, UI_TEXT);
+  lv_obj_set_width(labelRuntime, 102);
+  lv_label_set_long_mode(labelRuntime, LV_LABEL_LONG_CLIP);
 
-  tableData = lv_table_create(tableCard);
-  lv_obj_set_size(tableData, 232, 420);
-  lv_obj_align(tableData, LV_ALIGN_TOP_MID, 0, 4);
+  lv_obj_t *countCard = makePanel(measureScreen, railX + 134, contentTop, 126, 70);
+  makeSmallLabel(countCard, "모은 값", 12, 10, UI_TEXT_3);
+  labelCount = makeLabel(countCard, "0", 12, 32, UI_TEXT);
+  lv_obj_set_width(labelCount, 102);
+  lv_label_set_long_mode(labelCount, LV_LABEL_LONG_CLIP);
 
-  lv_obj_set_style_text_font(tableData, &korean_16, LV_PART_MAIN);
-  lv_obj_set_style_text_font(tableData, &korean_16, LV_PART_ITEMS);
+  // Where the data has actually reached: the cloud, the card, the group.
+  lv_obj_t *sendCard = makePanel(measureScreen, railX, contentTop + 82, railW, 142);
+  makeSmallLabel(sendCard, "전송 상태", 14, 10, UI_TEXT_3);
 
-  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_ITEMS);
+  makeSmallLabel(sendCard, "과학실 ON", 14, 40, UI_TEXT_2);
+  labelMeasureIslState = makeSmallLabel(sendCard, "대기", 140, 40, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureIslState, 106);
+  lv_obj_set_style_text_align(labelMeasureIslState, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureIslState, LV_LABEL_LONG_CLIP);
 
-  lv_obj_set_style_pad_top(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_bottom(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_left(tableData, 0, LV_PART_ITEMS);
-  lv_obj_set_style_pad_right(tableData, 0, LV_PART_ITEMS);
+  makeSmallLabel(sendCard, "SD 카드", 14, 66, UI_TEXT_2);
+  labelSd = makeSmallLabel(sendCard, "--", 140, 66, UI_TEXT_3);
+  lv_obj_set_width(labelSd, 106);
+  lv_obj_set_style_text_align(labelSd, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelSd, LV_LABEL_LONG_CLIP);
 
-  lv_obj_clear_flag(tableData, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(tableData, LV_SCROLLBAR_MODE_OFF);
+  makeSmallLabel(sendCard, "모둠", 14, 92, UI_TEXT_2);
+  labelMeasureModum = makeSmallLabel(sendCard, "--", 140, 92, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureModum, 106);
+  lv_obj_set_style_text_align(labelMeasureModum, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureModum, LV_LABEL_LONG_CLIP);
 
-  lv_table_set_col_cnt(tableData, 4);
-  lv_table_set_row_cnt(tableData, TABLE_VISIBLE_ROWS + 1);
+  makeSmallLabel(sendCard, "블루투스", 14, 118, UI_TEXT_2);
+  labelMeasureBle = makeSmallLabel(sendCard, "--", 140, 118, UI_TEXT_3);
+  lv_obj_set_width(labelMeasureBle, 106);
+  lv_obj_set_style_text_align(labelMeasureBle, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelMeasureBle, LV_LABEL_LONG_CLIP);
 
-  lv_table_set_col_width(tableData, 0, 30);  // No
-  lv_table_set_col_width(tableData, 1, 60);  // 시간(s)
-  lv_table_set_col_width(tableData, 2, 70);  // 온도(℃)
-  lv_table_set_col_width(tableData, 3, 72);  // 기압(hPa)
+  // Secondary actions, kept quiet so they do not compete with 시작/정지.
+  makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
+  makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
-  // 하단 화살표 버튼 박스
-  lv_obj_t *tableNav = lv_obj_create(tableCard);
-  lv_obj_set_size(tableNav, 232, 40);
-  lv_obj_align(tableNav, LV_ALIGN_BOTTOM_MID, 0, -4);
-  lv_obj_set_style_bg_color(tableNav, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_set_style_bg_opa(tableNav, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(tableNav, 0, 0);
-  lv_obj_set_style_radius(tableNav, 0, 0);
-  lv_obj_set_style_pad_all(tableNav, 0, 0);
-  lv_obj_clear_flag(tableNav, LV_OBJ_FLAG_SCROLLABLE);
+  // The primary control. Start is the accent; stop is the only red on screen,
+  // because stopping is the only thing here that cannot be undone.
+  btnMeasureStart = makePrimaryButton(measureScreen, "측정 시작", railX, 466, railW, 64, UI_ACCENT, start_event_cb);
+  btnMeasureStop = makePrimaryButton(measureScreen, "측정 정지", railX, 466, railW, 64, UI_DANGER, stop_event_cb);
+  lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
 
-  makeArrowButton(tableNav, "<", 8, 5, 100, 30, table_older_event_cb);
-  makeArrowButton(tableNav, ">", 124, 5, 100, 30, table_newer_event_cb);
+  createTabBar(measureScreen, 1);
 
+  // Aliases kept for the older update paths.
   labelNow = labelDateTime;
   labelSample = labelCount;
   labelElapsed = labelRuntime;
@@ -7418,6 +7982,7 @@ void createMeasureUi()
   resetTable();
   clearChart();
   updateActiveSensorUiLabels();
+  refreshMeasureControls();
 }
 
 
@@ -7576,7 +8141,7 @@ void createIslUi()
   lv_textarea_set_one_line(islServiceKeyTa, true);
   lv_textarea_set_password_mode(islServiceKeyTa, true);
   lv_textarea_set_placeholder_text(islServiceKeyTa, "serviceKey");
-  lv_obj_set_style_text_font(islServiceKeyTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(islServiceKeyTa, FONT_KR, 0);
   lv_obj_add_event_cb(islServiceKeyTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islServiceKey) > 0 && strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0)
@@ -7591,7 +8156,7 @@ void createIslUi()
   lv_textarea_set_one_line(islModuleTa, true);
   lv_textarea_set_password_mode(islModuleTa, false);
   lv_textarea_set_placeholder_text(islModuleTa, "ON00000000000");
-  lv_obj_set_style_text_font(islModuleTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(islModuleTa, FONT_KR, 0);
   lv_obj_add_event_cb(islModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islRuntimeSerialNumber) > 0)
@@ -7695,7 +8260,7 @@ void createCsvUi()
   lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 20, 92);
   lv_textarea_set_one_line(homeCsvFileTa, true);
   lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
-  lv_obj_set_style_text_font(homeCsvFileTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
   lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
   lv_textarea_set_text(homeCsvFileTa, csvFileName);
 
@@ -7786,7 +8351,7 @@ void createSettingsUi()
   lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 88);
   lv_textarea_set_one_line(wifiSsidTa, true);
   lv_textarea_set_placeholder_text(wifiSsidTa, "SSID");
-  lv_obj_set_style_text_font(wifiSsidTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(wifiSsidTa, FONT_KR, 0);
   lv_obj_add_event_cb(wifiSsidTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   makeLabel(wifiCard, "비밀번호", 20, 142, 0x4B5563);
@@ -7797,7 +8362,7 @@ void createSettingsUi()
   lv_textarea_set_one_line(wifiPassTa, true);
   lv_textarea_set_password_mode(wifiPassTa, true);
   lv_textarea_set_placeholder_text(wifiPassTa, "Password");
-  lv_obj_set_style_text_font(wifiPassTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(wifiPassTa, FONT_KR, 0);
   lv_obj_add_event_cb(wifiPassTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   makeButton(wifiCard, "연결", 20, 238, 90, 42, wifi_connect_event_cb);
@@ -8164,26 +8729,38 @@ static void go_wifi_event_cb(lv_event_t *e)
 }
 
 #if HAS_IDF_WIFI
-bool ensureHostedWifiStarted()
+// The P4 has no radio of its own. Both WiFi and Bluetooth ride the ESP-Hosted
+// link to the companion ESP32-C6, so the transport is brought up once and
+// shared rather than owned by the WiFi path.
+bool ensureEspHostedTransport()
 {
 #if !HAS_ESP_HOSTED
   Serial.println("esp_hosted.h not found. ESP-Hosted host component include path is missing.");
   return false;
 #else
-  if (!espHostedStarted)
+  if (espHostedStarted) return true;
+
+  Serial.println("ESP-Hosted transport init start");
+  esp_hosted_init();
+  espHostedStarted = true;
+
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 1500)
   {
-    Serial.println("ESP-Hosted transport init start");
-    esp_hosted_init();
-    espHostedStarted = true;
-
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < 1500)
-    {
-      delay(10);
-    }
-
-    Serial.println("ESP-Hosted transport init done");
+    delay(10);
   }
+
+  Serial.println("ESP-Hosted transport init done");
+  return true;
+#endif
+}
+
+bool ensureHostedWifiStarted()
+{
+#if !HAS_ESP_HOSTED
+  return false;
+#else
+  if (!ensureEspHostedTransport()) return false;
 
   if (!idfWifiStarted)
   {
@@ -8292,7 +8869,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
 
   while (millis() - start < 12000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     if (esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK)
     {
@@ -8301,7 +8878,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
       unsigned long ipStart = millis();
       while (millis() - ipStart < 8000)
       {
-        lv_timer_handler();
+        uiTimerHandler();
 
         if (wifiStaNetif != NULL)
         {
@@ -8345,7 +8922,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
 
   while (millis() - start < 12000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     if (WiFi.status() == WL_CONNECTED && WiFi.localIP().toString() != "0.0.0.0")
     {
@@ -8551,15 +9128,6 @@ int getWifiRssiValue()
 // 지능형 과학실 ON API / 비동기 WiFi 전송
 // 측정 루프에서는 절대 HTTP/WiFi 연결을 직접 수행하지 않고 큐에만 넣습니다.
 // =====================================================
-bool isIslApiConfigured()
-{
-  if (!ISL_API_ENABLED) return false;
-  if (strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") == 0) return false;
-  if (strlen(islServiceKey) == 0) return false;
-  if (strlen(islRuntimeSerialNumber) == 0) return false;
-  return true;
-}
-
 void setIslStatusText(const char *text)
 {
   if (text == NULL) return;
@@ -9418,8 +9986,6 @@ bool cloudSendEventLogPacket(const CloudSamplePacket &packet)
   payload += String(packet.wifiRssi);
   payload += ",\"cloudQueuedDropped\":";
   payload += String((unsigned long)cloudQueuedDropped);
-  payload += ",\"islQueuedDropped\":";
-  payload += String((unsigned long)islQueuedDropped);
   payload += ",\"collectDate\":\"";
   payload += getCurrentDateTimeText();
   payload += "\"}";
@@ -9987,208 +10553,6 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
 #endif
 }
 
-bool islPostStatus(const char *code, const char *message)
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-  if (strlen(islSensorId) == 0) return false;
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\",";
-  payload += "\"code\":\"";
-  payload += code;
-  payload += "\",";
-  payload += "\"message\":\"";
-  payload += message;
-  payload += "\"}";
-
-  String response;
-  return httpPostJson(ISL_STATUS_URL, payload, &response);
-}
-
-bool islStartProcess()
-{
-  if (!isIslApiConfigured())
-  {
-    setIslStatusText("API: serviceKey/serialNumber 설정 필요");
-    return false;
-  }
-
-  if (!wifiConnected)
-  {
-    setIslStatusText("API: WiFi 대기");
-    return false;
-  }
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\"";
-  payload += "}";
-
-  String response;
-  if (!httpPostJson(ISL_START_URL, payload, &response))
-  {
-    setIslStatusText("API: 탐구시작 실패");
-    return false;
-  }
-
-  char code[8] = "";
-  extractJsonStringValue(response, "\"code\"", code, sizeof(code));
-
-  if (strcmp(code, "001") != 0)
-  {
-    setIslStatusText("API: 탐구시작 응답 오류");
-    return false;
-  }
-
-  if (!extractJsonStringValue(response, "\"sensorId\"", islSensorId, sizeof(islSensorId)))
-  {
-    snprintf(islSensorId, sizeof(islSensorId), "LOCAL_%s", islRuntimeSerialNumber);
-  }
-
-  islCollectPeriod = extractJsonIntValue(response, "\"collectPeriod\"", 1);
-  if (islCollectPeriod <= 0) islCollectPeriod = 1;
-
-  islSessionActive = true;
-  islPostStatus("001", "ESP32-P4 DPS310 연동 시작");
-  setIslStatusText("API: 탐구시작 완료");
-  return true;
-}
-
-bool islSendSamplePacket(const IslSamplePacket &packet)
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-
-  if (!islSessionActive)
-  {
-    if (!islStartProcess()) return false;
-  }
-
-  char tempValue[24];
-  char pressureValue[24];
-  snprintf(tempValue, sizeof(tempValue), "%.4f", packet.tempC);
-  snprintf(pressureValue, sizeof(pressureValue), "%.4f", packet.pressureHpa);
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"items\":[";
-
-  payload += "{";
-  payload += "\"sensorType\":\"" ISL_SENSOR_TYPE_TEMP "\",";
-  payload += "\"channelCode\":\"" ISL_CHANNEL_TEMP "\",";
-  payload += "\"sensorData\":\"";
-  payload += tempValue;
-  payload += "\",";
-  payload += "\"collectDate\":\"";
-  payload += packet.collectDate;
-  payload += "\",";
-  payload += "\"collectUnit\":\"" ISL_UNIT_TEMP "\"";
-  payload += "}";
-
-  if (pressureValueValid(packet.pressureHpa))
-  {
-    payload += ",";
-    payload += "{";
-    payload += "\"sensorType\":\"" ISL_SENSOR_TYPE_PRESSURE "\",";
-    payload += "\"channelCode\":\"" ISL_CHANNEL_PRESSURE "\",";
-    payload += "\"sensorData\":\"";
-    payload += pressureValue;
-    payload += "\",";
-    payload += "\"collectDate\":\"";
-    payload += packet.collectDate;
-    payload += "\",";
-    payload += "\"collectUnit\":\"" ISL_UNIT_PRESSURE "\"";
-    payload += "}";
-  }
-
-  payload += "]}";
-
-  String response;
-  bool ok = httpPostJson(ISL_DATA_URL, payload, &response);
-
-  if (ok)
-  {
-    setIslStatusText("API: 데이터 전송 완료");
-  }
-  else
-  {
-    setIslStatusText("API: 데이터 전송 실패, 재시도 대기");
-  }
-
-  return ok;
-}
-
-bool islStopProcess()
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-  if (!islSessionActive) return true;
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\"}";
-
-  String response;
-  bool ok = httpPostJson(ISL_STOP_URL, payload, &response);
-
-  if (ok)
-  {
-    islSessionActive = false;
-    setIslStatusText("API: 탐구종료 완료");
-  }
-
-  return ok;
-}
-
-void queueIslSample(int no, uint32_t timeS, float tempC, float pressureHpa)
-{
-  if (!isIslApiConfigured()) return;
-  if (islQueue == NULL) return;
-
-  IslSamplePacket packet;
-  packet.no = no;
-  packet.timeS = timeS;
-  packet.tempC = tempC;
-  packet.pressureHpa = pressureHpa;
-  formatIslCollectDate(packet.collectDate, sizeof(packet.collectDate));
-
-  if (xQueueSend(islQueue, &packet, 0) != pdPASS)
-  {
-    IslSamplePacket dropped;
-    xQueueReceive(islQueue, &dropped, 0);
-    islQueuedDropped++;
-    xQueueSend(islQueue, &packet, 0);
-  }
-}
-
 bool c6WifiConnectBackground(const char *ssid, const char *password)
 {
   if (ssid == NULL || strlen(ssid) == 0) return false;
@@ -10302,10 +10666,28 @@ void wifiApiTask(void *parameter)
 
   unsigned long lastWifiAttempt = 0;
   unsigned long lastStatusPost = 0;
+  bool bleStartAttempted = false;
 
   while (true)
   {
     unsigned long now = millis();
+
+    // Bluetooth shares the ESP-Hosted link with WiFi, so it is brought up here
+    // rather than in setup(): the transport costs about 1.5 s and this task is
+    // already the one that waits on it.
+    if (!bleStartAttempted)
+    {
+      bleStartAttempted = true;
+
+      if (ensureEspHostedTransport())
+      {
+        char bleName[32];
+        const size_t codeLen = strlen(islRuntimeSerialNumber);
+        const char *tail = codeLen > 4 ? islRuntimeSerialNumber + codeLen - 4 : "";
+        snprintf(bleName, sizeof(bleName), "SciSensor%s%s", codeLen > 4 ? "-" : "", tail);
+        bleSensorBegin(bleName);
+      }
+    }
 
     if (wifiConnected && !wifiReadyForHttp())
     {
@@ -10385,40 +10767,6 @@ void wifiApiTask(void *parameter)
       }
     }
 
-    if (wifiConnected && isIslApiConfigured())
-    {
-      if (islStartRequested && !islSessionActive)
-      {
-        islStartProcess();
-      }
-
-      if (islSessionActive && now - lastStatusPost >= 30000)
-      {
-        lastStatusPost = now;
-        islPostStatus("001", "ESP32-P4 DPS310 데이터 수집 중");
-      }
-
-      IslSamplePacket packet;
-      if (xQueueReceive(islQueue, &packet, pdMS_TO_TICKS(50)) == pdPASS)
-      {
-        if (!islSendSamplePacket(packet))
-        {
-          // 전송 실패 시 한 번만 뒤로 다시 넣고, 측정 루프는 계속 진행한다.
-          xQueueSendToFront(islQueue, &packet, 0);
-          vTaskDelay(pdMS_TO_TICKS(3000));
-        }
-      }
-
-      if (islStopRequested)
-      {
-        if (uxQueueMessagesWaiting(islQueue) == 0)
-        {
-          islStopProcess();
-          islStopRequested = false;
-          islStartRequested = false;
-        }
-      }
-    }
 
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -10426,13 +10774,6 @@ void wifiApiTask(void *parameter)
 
 void startWifiApiTask()
 {
-  islApiConfigured = isIslApiConfigured();
-
-  if (islQueue == NULL)
-  {
-    islQueue = xQueueCreate(ISL_QUEUE_DEPTH, sizeof(IslSamplePacket));
-  }
-
   if (cloudQueue == NULL)
   {
     cloudQueue = xQueueCreate(CLOUD_QUEUE_DEPTH, sizeof(CloudSamplePacket));
@@ -10440,10 +10781,13 @@ void startWifiApiTask()
 
   if (wifiApiTaskHandle == NULL)
   {
+    // This task runs the HTTPS uploads. An mbedTLS handshake with certificate
+    // bundle verification needs well over 12 kB of stack; the old 12288 value
+    // overflowed and showed up as a random freeze or reboot during WiFi work.
     xTaskCreatePinnedToCore(
       wifiApiTask,
       "wifi_api_task",
-      12288,
+      WIFI_API_TASK_STACK_BYTES,
       NULL,
       1,
       &wifiApiTaskHandle,
@@ -10568,7 +10912,7 @@ bool syncNtpTime()
 
   while (millis() - start < 10000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     time_t nowTime;
     struct tm timeInfo;
@@ -10602,7 +10946,7 @@ void tryAutoConnectSavedWifi()
 
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 자동 연결 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 자동 연결 중");
-  lv_timer_handler();
+  uiTimerHandler();
 
   wifiConnected = c6WifiConnect(wifiSavedSsid, wifiSavedPassword);
 
@@ -10685,7 +11029,7 @@ void bootScanThenAutoConnectWifi()
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 부팅 검색 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 부팅 검색 중");
   if (labelWifiScan) lv_label_set_text(labelWifiScan, "부팅 검색 중...");
-  lv_timer_handler();
+  uiTimerHandler();
 
   int count = c6WifiScan(wifiScanResults, WIFI_SCAN_MAX);
   populateWifiScanList(count);
@@ -10718,7 +11062,7 @@ void bootScanThenAutoConnectWifi()
 
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 자동 연결 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 자동 연결 중");
-  lv_timer_handler();
+  uiTimerHandler();
 
   wifiConnected = c6WifiConnect(wifiSavedSsid, wifiSavedPassword);
 
@@ -10881,72 +11225,6 @@ void servicePendingWifiCommand()
   ignoreTouchUntilMs = millis() + 250;
 }
 
-void createWifiUi()
-{
-  wifiScreen = lv_obj_create(NULL);
-  lv_obj_set_style_text_font(wifiScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(wifiScreen, lv_color_hex(0xEEF2F7), 0);
-  lv_obj_set_style_bg_opa(wifiScreen, LV_OPA_COVER, 0);
-
-  makeLabel(wifiScreen, "WiFi 설정", 30, 18, 0x111827);
-  makeButton(wifiScreen, "홈", 900, 20, 90, 45, go_home_event_cb);
-  makeButton(wifiScreen, "측정", 760, 20, 120, 45, go_measure_event_cb);
-
-  lv_obj_t *leftCard = makeCard(wifiScreen, 40, 90, 450, 430, 0xFFFFFF);
-  lv_obj_t *rightCard = makeCard(wifiScreen, 520, 90, 460, 430, 0xFFFFFF);
-
-  makeLabel(leftCard, "연결 정보", 20, 15, 0x111827);
-  makeLabel(leftCard, "SSID", 20, 62, 0x4B5563);
-
-  wifiSsidTa = lv_textarea_create(leftCard);
-  lv_obj_set_size(wifiSsidTa, 390, 45);
-  lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 90);
-  lv_textarea_set_one_line(wifiSsidTa, true);
-  lv_textarea_set_placeholder_text(wifiSsidTa, "SSID");
-  lv_obj_set_style_text_font(wifiSsidTa, &lv_font_montserrat_16, 0);
-  lv_obj_add_event_cb(wifiSsidTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-
-  makeLabel(leftCard, "비밀번호", 20, 150, 0x4B5563);
-
-  wifiPassTa = lv_textarea_create(leftCard);
-  lv_obj_set_size(wifiPassTa, 390, 45);
-  lv_obj_align(wifiPassTa, LV_ALIGN_TOP_LEFT, 20, 178);
-  lv_textarea_set_one_line(wifiPassTa, true);
-  lv_textarea_set_password_mode(wifiPassTa, true);
-  lv_textarea_set_placeholder_text(wifiPassTa, "Password");
-  lv_obj_set_style_text_font(wifiPassTa, &lv_font_montserrat_16, 0);
-  lv_obj_add_event_cb(wifiPassTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-
-  makeButton(leftCard, "연결", 20, 255, 120, 50, wifi_connect_event_cb);
-  makeButton(leftCard, "해제", 160, 255, 120, 50, wifi_disconnect_event_cb);
-  makeButton(leftCard, "검색", 300, 255, 100, 50, wifi_scan_event_cb);
-  makeButton(leftCard, "저장 삭제", 20, 320, 140, 45, wifi_forget_event_cb);
-
-  makeLabel(leftCard, "검색 후 직접 연결합니다. 자동 연결은 하지 않습니다.", 20, 380, 0x4B5563);
-
-  makeLabel(rightCard, "현재 상태", 20, 15, 0x111827);
-  labelWifiState = makeLabel(rightCard, "WiFi: 대기", 20, 65, 0x2563EB);
-  labelWifiIp = makeLabel(rightCard, "IP: --", 20, 110, 0x111827);
-  labelWifiSignal = makeLabel(rightCard, "신호: --", 20, 155, 0x111827);
-  labelWifiMode = makeLabel(rightCard, "방식: ESP32-C6 ESP-Hosted", 20, 200, 0x111827);
-
-  makeLabel(rightCard, "주변 WiFi", 20, 245, 0x111827);
-  labelWifiScan = makeLabel(rightCard, "검색 버튼을 누르세요.", 120, 245, 0x4B5563);
-
-  wifiList = lv_list_create(rightCard);
-  lv_obj_set_size(wifiList, 420, 130);
-  lv_obj_align(wifiList, LV_ALIGN_TOP_LEFT, 20, 285);
-  lv_obj_set_style_text_font(wifiList, FONT_KR, 0);
-
-  wifiKeyboard = lv_keyboard_create(wifiScreen);
-  lv_obj_set_size(wifiKeyboard, 1024, 150);
-  lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_event_cb(wifiKeyboard, wifi_keyboard_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
-  lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
-}
-
 // =====================================================
 // Setup
 // =====================================================
@@ -10978,25 +11256,14 @@ void setup()
   delay(120);
   Serial.println("[BOOT] after lcd.begin()");
 
-  // GT911 cold-boot stabilization:
-  // On a true POWERON reset, the LCD rail can be alive before the GT911 controller
-  // has finished its own power/reset settling. A software reboot works because
-  // the touch controller remains powered. Wait longer only on cold boot.
-  {
-    esp_reset_reason_t touchBootReason = esp_reset_reason();
-    const unsigned long gt911SettleMs =
-      (touchBootReason == ESP_RST_POWERON) ? 1200UL : 250UL;
-
-    Serial.print("[GT911] pre-init settle ");
-    Serial.print(gt911SettleMs);
-    Serial.println(" ms");
-    delay(gt911SettleMs);
-  }
+  // Let the touch rail settle after the LCD comes up. The controller does its
+  // own reset sequence in begin(), so this only has to cover the supply.
+  delay(200);
 
 #if ENABLE_GT911_TOUCH
   Serial.println("[BOOT] before GT911 touch.begin()");
-  touch.begin();
-  Serial.println("[BOOT] after GT911 touch.begin()");
+  touchReady = touch.begin();
+  Serial.println(touchReady ? "[BOOT] GT911 touch ready" : "[WARN] GT911 touch unavailable");
 #else
   Serial.println("[WARN] GT911 touch disabled by ENABLE_GT911_TOUCH=0");
 #endif
@@ -11086,7 +11353,7 @@ void setup()
 
   for (int i = 0; i < 30; i++)
   {
-    lv_timer_handler();
+    uiTimerHandler();
     delay(10);
   }
 
@@ -11184,7 +11451,7 @@ void loop()
   {
     lastLvglHandlerMs = now;
     serviceLightweightBatchUi();
-    lv_timer_handler();
+    uiTimerHandler();
     servicePendingScreenSwitch();
   }
 
@@ -11197,6 +11464,7 @@ void loop()
     lastUiClockMs = now;
     updateClockLabels();
     updateWifiRuntimeLabels();
+    refreshMeasureControls();
   }
 
   // WiFi 검색/자동 연결/API 전송은 백그라운드 task에서 처리한다.
@@ -11237,11 +11505,11 @@ void loop()
         if (labelStatus) lv_label_set_text(labelStatus, "상태: 측정 중");
 
         addSample(timeS, temperatureC, pressureHpa);
-        // CSV/SD logging removed for maximum stability.
+        appendCsv(timeS, temperatureC, pressureHpa);
+        bleSensorPublish(timeS, activeSensorName(), temperatureC, activePrimaryUnit());
         saveMeasurementBackupToNvs(false);
         if (activeSensorSupportsDirectIsl())
         {
-          queueIslSample(measurementCount, timeS, temperatureC, pressureHpa);
           queueCloudSample(measurementCount, timeS, temperatureC, pressureHpa);
         }
 
@@ -11250,21 +11518,8 @@ void loop()
         snprintf(text, sizeof(text), " %d", measurementCount);
         lv_label_set_text(labelCount, text);
 
-        if (labelSd)
-        {
-          if (sdReady && csvLoggingEnabled)
-          {
-          lv_label_set_text(labelSd, "SD: CSV 자동 저장 중");
-          }
-          else if (sdReady)
-          {
-            lv_label_set_text(labelSd, "SD: 마운트됨");
-           }
-           else
-           {
-            lv_label_set_text(labelSd, "SD: 저장 안 됨");
-          }
-        }
+        // labelSd is owned by refreshMeasureControls(); writing it here too
+        // made the two settle on different wording each second and flicker.
 
         if (tablePageOffset == 0)
         {
