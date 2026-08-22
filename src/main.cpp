@@ -247,7 +247,11 @@ static bool tmp117LastReadWasWaiting = false;
 // The 2026-07-21 ISL document has a generic Concentration=CTRT type,
 // but no explicit CO2/SCD41 sensor type. Keep direct ISL disabled until
 // the server mapping is verified. Set to 1 only after confirming CTRT accepts CO2 ppm.
-#define SCD41_DIRECT_ISL_ENABLED 0
+// CTRT (농도) is the closest the 2026-07-21 appendix offers for CO2; the spec
+// has no dedicated code. The registration path accepts 001/015 and reports a
+// refusal on screen, so let the server decide instead of leaving CO2 silently
+// unable to transmit.
+#define SCD41_DIRECT_ISL_ENABLED 1
 
 // =====================================================
 // TSL2591 digital light sensor
@@ -12039,35 +12043,31 @@ void loop()
       }
       else
       {
-        // DS18B20은 변환 대기, SCD41은 약 5초 periodic update 대기 때문에
-        // 정상 측정 중에도 readActiveSensor()가 false를 반환할 수 있습니다.
-        // 이 두 센서는 데이터 준비 대기를 오류로 표시하지 않습니다.
-        if (activeSensorMode == SENSOR_MODE_DS18B20)
+        // The loop polls every second, but a sensor between conversions is
+        // still measuring: SCD41 emits a sample about every 5 s, DS18B20
+        // converts on demand, TMP117 and VL53L1X have their own settling.
+        // Reporting that gap as a distinct state made the status read
+        // "측정 대기" for four seconds out of every five on SCD41, which
+        // looks exactly like a sensor that has stopped. Only a real fault
+        // should move the status away from 측정 중.
+        const bool waitingForNextSample =
+          activeSensorMode == SENSOR_MODE_DS18B20 ||
+          (activeSensorMode == SENSOR_MODE_TMP117 && tmp117LastReadWasWaiting) ||
+          (activeSensorMode == SENSOR_MODE_VL53L1X && vl53LastReadWasWaiting) ||
+          (activeSensorMode == SENSOR_MODE_SCD41 && scd41LastReadWasWaiting);
+
+        if (waitingForNextSample)
         {
           if (labelStatus) lv_label_set_text(labelStatus, "상태: 측정 중");
         }
-        else if (activeSensorMode == SENSOR_MODE_TMP117 && tmp117LastReadWasWaiting)
-        {
-          if (labelStatus) lv_label_set_text(labelStatus, "상태: TMP117 첫 변환 대기");
-        }
-        else if (activeSensorMode == SENSOR_MODE_VL53L1X && vl53LastReadWasWaiting)
-        {
-          if (labelStatus) lv_label_set_text(labelStatus, "상태: VL53L1X 측정 대기");
-        }
         else if (activeSensorMode == SENSOR_MODE_SCD41)
         {
-          if (scd41LastReadWasWaiting)
+          if (labelStatus) lv_label_set_text(labelStatus, "상태: SCD41 통신 재시도");
+
+          if (scd41ConsecutiveErrors >= 4)
           {
-            if (labelStatus) lv_label_set_text(labelStatus, "상태: SCD41 측정 대기");
-          }
-          else
-          {
-            if (labelStatus) lv_label_set_text(labelStatus, "상태: SCD41 통신 재시도");
-            if (scd41ConsecutiveErrors >= 4)
-            {
-              dpsReady = scd41Begin();
-              if (labelStatus) lv_label_set_text(labelStatus, dpsReady ? "상태: SCD41 재연결 / 5초 대기" : "상태: SCD41 인식 실패");
-            }
+            dpsReady = scd41Begin();
+            if (labelStatus) lv_label_set_text(labelStatus, dpsReady ? "상태: SCD41 재연결 / 5초 대기" : "상태: SCD41 인식 실패");
           }
         }
         else
