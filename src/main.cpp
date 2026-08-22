@@ -333,6 +333,11 @@ const int I2C_DELAY_US = 5;
 static char csvFileName[64] = CSV_DEFAULT_FILE;
 static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
+// Rows buffered before the CSV handle is flushed to the card. At the 1 Hz
+// sample rate this caps data loss on a power cut at CSV_FLUSH_EVERY_ROWS
+// seconds without paying for an fsync every sample.
+#define CSV_FLUSH_EVERY_ROWS 10
+
 // WiFi detection 테스트 시에는 SDMMC가 C6 SDIO 통신과 충돌할 수 있습니다.
 // SD는 부팅 자동 마운트 대신 설정 화면에서 수동으로 켜는 구조가 안전합니다.
 #define ENABLE_SD_CSV 0  // stability build: CSV/SD logging disabled
@@ -357,21 +362,7 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 지능형 과학실 ON API 설정
 // 실제 발급값으로 교체해야 전송이 시작됩니다.
 // =====================================================
-#define ISL_API_ENABLED 0  // 직접 지능형과학실 ON 전송 비활성화: ESP32-P4는 Cloud Run으로만 전송
 #define ISL_SERVICE_KEY "PUT_YOUR_SERVICE_KEY"
-#define ISL_SERIAL_NUMBER "ESP32P4_DPS310_001"
-
-#define ISL_START_URL "https://api-scion.kofac.re.kr/sensorapi/explortProcessStart"
-#define ISL_DATA_URL  "https://api-scion.kofac.re.kr/sensorapi/explortDataCollection"
-#define ISL_STOP_URL  "https://api-scion.kofac.re.kr/sensorapi/explortProcessStop"
-#define ISL_STATUS_URL "https://api-scion.kofac.re.kr/sensorapi/explortProcessStatus"
-
-#define ISL_SENSOR_TYPE_TEMP "TPR"
-#define ISL_SENSOR_TYPE_PRESSURE "PRS"
-#define ISL_CHANNEL_TEMP "01"
-#define ISL_CHANNEL_PRESSURE "02"
-#define ISL_UNIT_TEMP "C"
-#define ISL_UNIT_PRESSURE "hPa"
 
 // 2026-07-21 지능형 과학실 ON 오픈API 설계서 기준
 // 조도(Illuminance): 실제 sendSensorType API 호출 예제(page 27)는 sensorType=ILM 사용
@@ -385,8 +376,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define ISL_SENSOR_TYPE_CO2 "CTRT"
 #define ISL_CHANNEL_CO2 "01"
 #define ISL_UNIT_CO2 "ppm"
-
-#define ISL_QUEUE_DEPTH 16  // ISL direct API disabled; reduce reserved RAM
 
 
 #define CLOUD_FUNCTION_URL "https://sensor-data-582760051065.asia-northeast3.run.app"
@@ -421,15 +410,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 지능형 과학실 ON API 런타임 상태
 // HTTP/WiFi 작업은 별도 task에서 처리하고, 측정 loop는 큐에 넣기만 합니다.
 // =====================================================
-struct IslSamplePacket
-{
-  int no;
-  uint32_t timeS;
-  float tempC;
-  float pressureHpa;
-  char collectDate[32];
-};
-
 // Google Cloud Run 전송용 패킷입니다.
 // 지능형 과학실 ON API 설정 여부와 무관하게 Cloud Run으로 원시 측정값을 보냅니다.
 struct CloudSamplePacket
@@ -471,20 +451,14 @@ static char directIslLightSensorType[8] = "ILM";
 
 static unsigned long lastWifiLostNoticeMs = 0;
 
-static QueueHandle_t islQueue = NULL;
 static TaskHandle_t wifiApiTaskHandle = NULL;
 
 static volatile bool islApiConfigured = false;
-static volatile bool islSessionActive = false;
-static volatile bool islStartRequested = false;
-static volatile bool islStopRequested = false;
 
-static char islSensorId[128] = "";
 static char islStatusText[128] = "전송: 대기";
 static char islServiceKey[128] = ISL_SERVICE_KEY;
 static char islRuntimeSerialNumber[64] = "";   // 지능형 과학실 모듈/모둠 코드 → API serialNumber로 사용
 static int islCollectPeriod = 1;
-static uint32_t islQueuedDropped = 0;
 
 
 #ifndef SDMMC_FREQ_PROBING
@@ -794,7 +768,6 @@ void updateHomeWifiLabels();
 void updateWifiRuntimeLabels();
 void updateIslStatusLabels();
 void updateIslModuleCodeFromUi();
-bool isIslApiConfigured();
 void setIslStatusText(const char *text);
 void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa);
 void queueCloudAction(const char *action);
@@ -3317,8 +3290,27 @@ bool initSdCard()
   return true;
 }
 
+// The logging file stays open across samples. Re-opening and closing it once
+// per second is what made per-sample CSV logging heavy enough to be ripped out
+// before; holding the handle and flushing in batches keeps the loop cheap
+// while still bounding how much data a power cut can lose.
+static FILE *csvFile = NULL;
+static int csvRowsSinceFlush = 0;
+
+void closeCsvFile()
+{
+  if (csvFile == NULL) return;
+
+  fflush(csvFile);
+  fclose(csvFile);
+  csvFile = NULL;
+  csvRowsSinceFlush = 0;
+}
+
 void unmountSdCard()
 {
+  closeCsvFile();
+
   if (sdcard != NULL)
   {
     esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sdcard);
@@ -3328,31 +3320,44 @@ void unmountSdCard()
   sdReady = false;
 }
 
+static void reportCsvWriteFailure()
+{
+  Serial.println("CSV append failed");
+  closeCsvFile();
+  sdReady = false;
+
+  if (labelSd)
+  {
+    lv_label_set_text(labelSd, "SD: 저장 실패");
+  }
+
+  updateSdStatusLabels();
+}
+
 void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
 {
   if (!csvLoggingEnabled) return;
   if (!sdReady) return;
 
-  FILE *file = fopen(csvPath, "a");
-
-  if (file == NULL)
+  if (csvFile == NULL)
   {
-    Serial.println("CSV append failed");
-    sdReady = false;
+    csvFile = fopen(csvPath, "a");
 
-    if (labelSd)
+    if (csvFile == NULL)
     {
-      lv_label_set_text(labelSd, "SD: 저장 실패");
+      reportCsvWriteFailure();
+      return;
     }
 
-    updateSdStatusLabels();
-    return;
+    csvRowsSinceFlush = 0;
   }
+
+  int written;
 
   if (activeSensorHasPressure() && pressureValueValid(secondaryValue))
   {
-    fprintf(
-      file,
+    written = fprintf(
+      csvFile,
       "%d,%lu,%s,%.4f,%s,%.4f,%s,%ld,%ld\n",
       measurementCount,
       (unsigned long)timeS,
@@ -3367,8 +3372,8 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
   }
   else
   {
-    fprintf(
-      file,
+    written = fprintf(
+      csvFile,
       "%d,%lu,%s,%.4f,%s,,,%ld,%ld\n",
       measurementCount,
       (unsigned long)timeS,
@@ -3380,8 +3385,23 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
     );
   }
 
-  fclose(file);
-  updateDashboardCsvPreview();
+  if (written < 0)
+  {
+    reportCsvWriteFailure();
+    return;
+  }
+
+  csvRowsSinceFlush++;
+
+  if (csvRowsSinceFlush >= CSV_FLUSH_EVERY_ROWS)
+  {
+    csvRowsSinceFlush = 0;
+
+    if (fflush(csvFile) != 0)
+    {
+      reportCsvWriteFailure();
+    }
+  }
 }
 
 void updateSdStatusLabels()
@@ -3810,6 +3830,9 @@ void sanitizeCsvFileName(const char *input, char *out, size_t outSize)
 
 void updateCsvPath()
 {
+  // Drop any handle still pointing at the previous file, otherwise logging
+  // would keep appending to the old name after the user renames the file.
+  closeCsvFile();
   snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
 }
 
@@ -6054,6 +6077,7 @@ static void settings_csv_toggle_event_cb(lv_event_t *e)
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
   csvLoggingEnabled = !csvLoggingEnabled;
+  if (!csvLoggingEnabled) closeCsvFile();
 
   if (csvLoggingEnabled && !sdReady)
   {
@@ -6481,6 +6505,7 @@ static void dashboard_csv_toggle_event_cb(lv_event_t *e)
 
   updateCsvFileNameFromDashboard();
   csvLoggingEnabled = !csvLoggingEnabled;
+  if (!csvLoggingEnabled) closeCsvFile();
 
   if (csvLoggingEnabled && !sdReady)
   {
@@ -6586,6 +6611,7 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e)
   // 이 버튼은 현재까지 누적된 측정 데이터를 한 번에 저장한다.
   // 측정 루프의 자동 append 방식은 사용하지 않는다.
   csvLoggingEnabled = false;
+  closeCsvFile();
 
   if (labelSelectedSdFile)
   {
@@ -6650,6 +6676,7 @@ static void csv_stop_save_event_cb(lv_event_t *e)
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
   csvLoggingEnabled = false;
+  closeCsvFile();
   updateSdStatusLabels();
   updateDashboardCsvLabels();
   updateDashboardCsvPreview();
@@ -8529,15 +8556,6 @@ int getWifiRssiValue()
 // 지능형 과학실 ON API / 비동기 WiFi 전송
 // 측정 루프에서는 절대 HTTP/WiFi 연결을 직접 수행하지 않고 큐에만 넣습니다.
 // =====================================================
-bool isIslApiConfigured()
-{
-  if (!ISL_API_ENABLED) return false;
-  if (strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") == 0) return false;
-  if (strlen(islServiceKey) == 0) return false;
-  if (strlen(islRuntimeSerialNumber) == 0) return false;
-  return true;
-}
-
 void setIslStatusText(const char *text)
 {
   if (text == NULL) return;
@@ -9396,8 +9414,6 @@ bool cloudSendEventLogPacket(const CloudSamplePacket &packet)
   payload += String(packet.wifiRssi);
   payload += ",\"cloudQueuedDropped\":";
   payload += String((unsigned long)cloudQueuedDropped);
-  payload += ",\"islQueuedDropped\":";
-  payload += String((unsigned long)islQueuedDropped);
   payload += ",\"collectDate\":\"";
   payload += getCurrentDateTimeText();
   payload += "\"}";
@@ -9965,208 +9981,6 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
 #endif
 }
 
-bool islPostStatus(const char *code, const char *message)
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-  if (strlen(islSensorId) == 0) return false;
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\",";
-  payload += "\"code\":\"";
-  payload += code;
-  payload += "\",";
-  payload += "\"message\":\"";
-  payload += message;
-  payload += "\"}";
-
-  String response;
-  return httpPostJson(ISL_STATUS_URL, payload, &response);
-}
-
-bool islStartProcess()
-{
-  if (!isIslApiConfigured())
-  {
-    setIslStatusText("API: serviceKey/serialNumber 설정 필요");
-    return false;
-  }
-
-  if (!wifiConnected)
-  {
-    setIslStatusText("API: WiFi 대기");
-    return false;
-  }
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\"";
-  payload += "}";
-
-  String response;
-  if (!httpPostJson(ISL_START_URL, payload, &response))
-  {
-    setIslStatusText("API: 탐구시작 실패");
-    return false;
-  }
-
-  char code[8] = "";
-  extractJsonStringValue(response, "\"code\"", code, sizeof(code));
-
-  if (strcmp(code, "001") != 0)
-  {
-    setIslStatusText("API: 탐구시작 응답 오류");
-    return false;
-  }
-
-  if (!extractJsonStringValue(response, "\"sensorId\"", islSensorId, sizeof(islSensorId)))
-  {
-    snprintf(islSensorId, sizeof(islSensorId), "LOCAL_%s", islRuntimeSerialNumber);
-  }
-
-  islCollectPeriod = extractJsonIntValue(response, "\"collectPeriod\"", 1);
-  if (islCollectPeriod <= 0) islCollectPeriod = 1;
-
-  islSessionActive = true;
-  islPostStatus("001", "ESP32-P4 DPS310 연동 시작");
-  setIslStatusText("API: 탐구시작 완료");
-  return true;
-}
-
-bool islSendSamplePacket(const IslSamplePacket &packet)
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-
-  if (!islSessionActive)
-  {
-    if (!islStartProcess()) return false;
-  }
-
-  char tempValue[24];
-  char pressureValue[24];
-  snprintf(tempValue, sizeof(tempValue), "%.4f", packet.tempC);
-  snprintf(pressureValue, sizeof(pressureValue), "%.4f", packet.pressureHpa);
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"items\":[";
-
-  payload += "{";
-  payload += "\"sensorType\":\"" ISL_SENSOR_TYPE_TEMP "\",";
-  payload += "\"channelCode\":\"" ISL_CHANNEL_TEMP "\",";
-  payload += "\"sensorData\":\"";
-  payload += tempValue;
-  payload += "\",";
-  payload += "\"collectDate\":\"";
-  payload += packet.collectDate;
-  payload += "\",";
-  payload += "\"collectUnit\":\"" ISL_UNIT_TEMP "\"";
-  payload += "}";
-
-  if (pressureValueValid(packet.pressureHpa))
-  {
-    payload += ",";
-    payload += "{";
-    payload += "\"sensorType\":\"" ISL_SENSOR_TYPE_PRESSURE "\",";
-    payload += "\"channelCode\":\"" ISL_CHANNEL_PRESSURE "\",";
-    payload += "\"sensorData\":\"";
-    payload += pressureValue;
-    payload += "\",";
-    payload += "\"collectDate\":\"";
-    payload += packet.collectDate;
-    payload += "\",";
-    payload += "\"collectUnit\":\"" ISL_UNIT_PRESSURE "\"";
-    payload += "}";
-  }
-
-  payload += "]}";
-
-  String response;
-  bool ok = httpPostJson(ISL_DATA_URL, payload, &response);
-
-  if (ok)
-  {
-    setIslStatusText("API: 데이터 전송 완료");
-  }
-  else
-  {
-    setIslStatusText("API: 데이터 전송 실패, 재시도 대기");
-  }
-
-  return ok;
-}
-
-bool islStopProcess()
-{
-  if (!isIslApiConfigured()) return false;
-  if (!wifiConnected) return false;
-  if (!islSessionActive) return true;
-
-  String payload = "{";
-  payload += "\"serviceKey\":\"";
-  payload += islServiceKey;
-  payload += "\",";
-  payload += "\"serialNumber\":\"";
-  payload += islRuntimeSerialNumber;
-  payload += "\",";
-  payload += "\"sensorId\":\"";
-  payload += islSensorId;
-  payload += "\"}";
-
-  String response;
-  bool ok = httpPostJson(ISL_STOP_URL, payload, &response);
-
-  if (ok)
-  {
-    islSessionActive = false;
-    setIslStatusText("API: 탐구종료 완료");
-  }
-
-  return ok;
-}
-
-void queueIslSample(int no, uint32_t timeS, float tempC, float pressureHpa)
-{
-  if (!isIslApiConfigured()) return;
-  if (islQueue == NULL) return;
-
-  IslSamplePacket packet;
-  packet.no = no;
-  packet.timeS = timeS;
-  packet.tempC = tempC;
-  packet.pressureHpa = pressureHpa;
-  formatIslCollectDate(packet.collectDate, sizeof(packet.collectDate));
-
-  if (xQueueSend(islQueue, &packet, 0) != pdPASS)
-  {
-    IslSamplePacket dropped;
-    xQueueReceive(islQueue, &dropped, 0);
-    islQueuedDropped++;
-    xQueueSend(islQueue, &packet, 0);
-  }
-}
-
 bool c6WifiConnectBackground(const char *ssid, const char *password)
 {
   if (ssid == NULL || strlen(ssid) == 0) return false;
@@ -10363,40 +10177,6 @@ void wifiApiTask(void *parameter)
       }
     }
 
-    if (wifiConnected && isIslApiConfigured())
-    {
-      if (islStartRequested && !islSessionActive)
-      {
-        islStartProcess();
-      }
-
-      if (islSessionActive && now - lastStatusPost >= 30000)
-      {
-        lastStatusPost = now;
-        islPostStatus("001", "ESP32-P4 DPS310 데이터 수집 중");
-      }
-
-      IslSamplePacket packet;
-      if (xQueueReceive(islQueue, &packet, pdMS_TO_TICKS(50)) == pdPASS)
-      {
-        if (!islSendSamplePacket(packet))
-        {
-          // 전송 실패 시 한 번만 뒤로 다시 넣고, 측정 루프는 계속 진행한다.
-          xQueueSendToFront(islQueue, &packet, 0);
-          vTaskDelay(pdMS_TO_TICKS(3000));
-        }
-      }
-
-      if (islStopRequested)
-      {
-        if (uxQueueMessagesWaiting(islQueue) == 0)
-        {
-          islStopProcess();
-          islStopRequested = false;
-          islStartRequested = false;
-        }
-      }
-    }
 
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -10404,13 +10184,6 @@ void wifiApiTask(void *parameter)
 
 void startWifiApiTask()
 {
-  islApiConfigured = isIslApiConfigured();
-
-  if (islQueue == NULL)
-  {
-    islQueue = xQueueCreate(ISL_QUEUE_DEPTH, sizeof(IslSamplePacket));
-  }
-
   if (cloudQueue == NULL)
   {
     cloudQueue = xQueueCreate(CLOUD_QUEUE_DEPTH, sizeof(CloudSamplePacket));
@@ -11152,11 +10925,10 @@ void loop()
         if (labelStatus) lv_label_set_text(labelStatus, "상태: 측정 중");
 
         addSample(timeS, temperatureC, pressureHpa);
-        // CSV/SD logging removed for maximum stability.
+        appendCsv(timeS, temperatureC, pressureHpa);
         saveMeasurementBackupToNvs(false);
         if (activeSensorSupportsDirectIsl())
         {
-          queueIslSample(measurementCount, timeS, temperatureC, pressureHpa);
           queueCloudSample(measurementCount, timeS, temperatureC, pressureHpa);
         }
 
@@ -11169,14 +10941,14 @@ void loop()
         {
           if (sdReady && csvLoggingEnabled)
           {
-          lv_label_set_text(labelSd, "SD: CSV 자동 저장 중");
+            lv_label_set_text(labelSd, "SD: CSV 자동 저장 중");
           }
           else if (sdReady)
           {
             lv_label_set_text(labelSd, "SD: 마운트됨");
-           }
-           else
-           {
+          }
+          else
+          {
             lv_label_set_text(labelSd, "SD: 저장 안 됨");
           }
         }
