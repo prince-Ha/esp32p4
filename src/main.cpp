@@ -412,6 +412,13 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
 // CO2 mapping candidate from the generic "Concentration" entry in the 2026-07-21 API appendix.
 // Disabled by SCD41_DIRECT_ISL_ENABLED until server-side acceptance is verified.
+// Distance. The appendix gives DITC; no worked example in the spec uses a
+// distance sensor, and the codes the server actually accepts have not matched
+// the appendix before (조도 is ILM in the examples, ILMN in the table), so the
+// registration tries the alternatives in turn the way 조도 already does.
+#define ISL_CHANNEL_DISTANCE "01"
+#define ISL_UNIT_DISTANCE "mm"
+
 #define ISL_SENSOR_TYPE_CO2 "CTRT"
 #define ISL_CHANNEL_CO2 "01"
 #define ISL_UNIT_CO2 "ppm"
@@ -487,6 +494,7 @@ static bool directIslStatusOk = false;
 // 따라서 등록 시 ILM -> ILMN 순서로 자동 fallback하고,
 // 실제로 성공한 코드를 데이터 전송에도 그대로 사용합니다.
 static char directIslLightSensorType[8] = "ILM";
+static char directIslDistanceSensorType[8] = "DITC";
 
 static unsigned long lastWifiLostNoticeMs = 0;
 
@@ -2678,15 +2686,32 @@ bool activeSensorHasPressure()
   return activeSensorMode == SENSOR_MODE_DPS310;
 }
 
+// The 별칭 the platform shows beside the reading. Registration and every data
+// packet must agree on it, so it lives in one place.
+const char *islTemperatureNickname()
+{
+  if (activeSensorMode == SENSOR_MODE_DS18B20) return "수온센서";
+  if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
+  return "온도센서";
+}
+
 bool activeSensorSupportsDirectIsl()
 {
   // 지능형과학실 ON:
-  // - DPS310/DS18B20: 기존 검증 코드 유지
-  // - TSL2591 조도: ILM / ILMN fallback 유지
-  // - SCD41: 문서에 CO2 전용 코드가 없어 CTRT(농도) 매핑은 명시적으로 검증 후 활성화
+  // - DPS310/DS18B20/TMP117: temperature, all on the verified TPR code
+  // - TSL2591 조도: ILM / ILMN fallback
+  // - VL53L1X 거리: DITC with fallbacks, since no example in the spec uses one
+  // - SCD41: the spec has no CO2 code, so the CTRT(농도) mapping stays behind
+  //   SCD41_DIRECT_ISL_ENABLED until the server is seen to accept it
+  //
+  // Every sensor the home screen offers must be listed here. A sensor that is
+  // selectable but absent from this list measures and logs normally while
+  // silently sending nothing, which is not a failure anyone notices in class.
   return activeSensorMode == SENSOR_MODE_DPS310 ||
          activeSensorMode == SENSOR_MODE_DS18B20 ||
+         activeSensorMode == SENSOR_MODE_TMP117 ||
          activeSensorMode == SENSOR_MODE_TSL2591 ||
+         activeSensorMode == SENSOR_MODE_VL53L1X ||
          (SCD41_DIRECT_ISL_ENABLED && activeSensorMode == SENSOR_MODE_SCD41);
 }
 
@@ -10047,7 +10072,63 @@ bool directIslSendSensorTypeIfNeeded()
   }
 
   // =====================================================
+  // VL53L1X 거리: try the appendix code, then plausible alternatives.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_VL53L1X)
+  {
+    static const char *distanceCandidates[] = { "DITC", "DIST", "DIS" };
+
+    for (int candidate = 0; candidate < 3; candidate++)
+    {
+      const char *sensorType = distanceCandidates[candidate];
+
+      String payload = "{";
+      payload += "\"serviceKey\":\"";
+      payload += jsonEscapeString(islServiceKey);
+      payload += "\",\"uniqueCode\":\"";
+      payload += jsonEscapeString(directIslUniqueCode);
+      payload += "\",\"sensorCount\":1,\"items\":[";
+      payload += "{\"sensorType\":\"";
+      payload += sensorType;
+      payload += "\",\"sensorNicNm\":\"거리센서\",\"channelCode\":\"" ISL_CHANNEL_DISTANCE "\"}";
+      payload += "]}";
+
+      Serial.print("DISTANCE TYPE DEBUG: try ");
+      Serial.println(sensorType);
+
+      String response;
+      const bool httpOk = httpPostJsonReliable(
+        DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_DISTANCE", 2, 700);
+
+      Serial.print("DISTANCE TYPE RESPONSE: ");
+      Serial.println(response);
+
+      char code[12] = "";
+      extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+      if (httpOk && (strcmp(code, "001") == 0 || strcmp(code, "015") == 0))
+      {
+        strncpy(directIslDistanceSensorType, sensorType, sizeof(directIslDistanceSensorType) - 1);
+        directIslDistanceSensorType[sizeof(directIslDistanceSensorType) - 1] = '\0';
+        directIslSensorTypeOk = true;
+
+        char okLine[96];
+        snprintf(okLine, sizeof(okLine), "거리 센서등록 OK: %s", directIslDistanceSensorType);
+        setIslStatusText(okLine);
+        return true;
+      }
+
+      Serial.print("DISTANCE TYPE REJECTED: ");
+      Serial.println(sensorType);
+    }
+
+    setIslStatusText("거리 센서등록 실패: DITC/DIST/DIS 모두 거부");
+    return false;
+  }
+
+  // =====================================================
   // 기존에 정상 동작하던 온도/기압/수온 로직은 그대로 유지
+  // TMP117 also lands here: it is a temperature sensor on the verified TPR code.
   // =====================================================
   String payload = "{";
   payload += "\"serviceKey\":\"";
@@ -10066,7 +10147,9 @@ bool directIslSendSensorTypeIfNeeded()
   {
     payload += "\",\"sensorCount\":1,";
     payload += "\"items\":[";
-    payload += "{\"sensorType\":\"TPR\",\"sensorNicNm\":\"수온센서\",\"channelCode\":\"01\"}";
+    payload += "{\"sensorType\":\"TPR\",\"sensorNicNm\":\"";
+    payload += islTemperatureNickname();
+    payload += "\",\"channelCode\":\"01\"}";
   }
 
   payload += "]}";
@@ -10195,10 +10278,20 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
     }
+    else if (activeSensorMode == SENSOR_MODE_VL53L1X)
+    {
+      payload += "{\"sensorType\":\"";
+      payload += directIslDistanceSensorType;
+      payload += "\",\"sensorNicNm\":\"거리센서\",\"channelCode\":\"" ISL_CHANNEL_DISTANCE "\",\"sensorData\":\"";
+      payload += primaryValue;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"" ISL_UNIT_DISTANCE "\"}";
+    }
     else
     {
       payload += "{\"sensorType\":\"TPR\",\"sensorNicNm\":\"";
-      payload += activeSensorMode == SENSOR_MODE_DS18B20 ? "수온센서" : "온도센서";
+      payload += islTemperatureNickname();
       payload += "\",\"channelCode\":\"01\",\"sensorData\":\"";
       payload += primaryValue;
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
@@ -10503,10 +10596,20 @@ bool cloudSendBatchHistory()
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
       }
+      else if (activeSensorMode == SENSOR_MODE_VL53L1X)
+      {
+        payload += "{\"sensorType\":\"";
+        payload += directIslDistanceSensorType;
+        payload += "\",\"sensorNicNm\":\"거리센서\",\"channelCode\":\"" ISL_CHANNEL_DISTANCE "\",\"sensorData\":\"";
+        payload += tempValue;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_DISTANCE "\"}";
+      }
       else
       {
         payload += "{\"sensorType\":\"TPR\",\"sensorNicNm\":\"";
-        payload += activeSensorMode == SENSOR_MODE_DS18B20 ? "수온센서" : "온도센서";
+        payload += islTemperatureNickname();
         payload += "\",\"channelCode\":\"01\",\"sensorData\":\"";
         payload += tempValue;
         payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
