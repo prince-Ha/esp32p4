@@ -67,6 +67,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "lwip/netdb.h"   // getaddrinfo for the DNS probe
 #define HAS_IDF_WIFI 1
 #else
 #define HAS_IDF_WIFI 0
@@ -8996,6 +8997,55 @@ bool ensureHostedWifiStarted()
 }
 #endif
 
+// The host every upload depends on. Resolving it is the difference between a
+// usable network and one that only looks connected.
+#define ISL_API_HOST "api-scion.kosac.re.kr"
+
+// Public resolvers to fall back through when the network's own cannot answer.
+static const char *kFallbackDnsServers[] = { "8.8.8.8", "1.1.1.1" };
+
+static void setDnsServer(const char *address)
+{
+#if HAS_IDF_WIFI
+  esp_netif_dns_info_t dns;
+  memset(&dns, 0, sizeof(dns));
+  dns.ip.type = ESP_IPADDR_TYPE_V4;
+  dns.ip.u_addr.ip4.addr = esp_ip4addr_aton(address);
+  esp_netif_set_dns_info(wifiStaNetif, ESP_NETIF_DNS_MAIN, &dns);
+#else
+  (void)address;
+#endif
+}
+
+// True when the API host resolves. lwIP caches the answer, so a success here
+// also warms the cache for the upload that follows.
+static bool resolvesApiHost()
+{
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  struct addrinfo *res = NULL;
+  const int rc = getaddrinfo(ISL_API_HOST, "443", &hints, &res);
+
+  if (rc == 0 && res != NULL)
+  {
+    char text[16] = "";
+    struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+    esp_ip4_addr_t ip4;
+    ip4.addr = addr->sin_addr.s_addr;
+    snprintf(text, sizeof(text), IPSTR, IP2STR(&ip4));
+    Serial.printf("[DNS] %s -> %s\n", ISL_API_HOST, text);
+    freeaddrinfo(res);
+    return true;
+  }
+
+  if (res != NULL) freeaddrinfo(res);
+  Serial.printf("[DNS] %s did not resolve (rc=%d)\n", ISL_API_HOST, rc);
+  return false;
+}
+
 // A connected board with no working name server fails every upload with
 // "getaddrinfo() returns 202", which on screen looks identical to the server
 // being down. Report what DHCP handed over, and install a public resolver when
@@ -9017,17 +9067,42 @@ void ensureDnsServer()
     return;
   }
 
-  Serial.println("[DNS] none from DHCP; falling back to 8.8.8.8");
+  Serial.println("[DNS] none from DHCP");
+#endif
+}
 
-  esp_netif_dns_info_t fallback;
-  memset(&fallback, 0, sizeof(fallback));
-  fallback.ip.type = ESP_IPADDR_TYPE_V4;
-  fallback.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+// Check the resolver the network gave us, and move to a public one if it
+// cannot answer for the API host. A DHCP-provided server that resolves
+// nothing looks exactly like a working network until the first upload.
+void verifyDnsOrFallback()
+{
+#if HAS_IDF_WIFI
+  if (wifiStaNetif == NULL) return;
 
-  if (esp_netif_set_dns_info(wifiStaNetif, ESP_NETIF_DNS_MAIN, &fallback) != ESP_OK)
+  ensureDnsServer();
+
+  if (resolvesApiHost())
   {
-    Serial.println("[DNS] fallback could not be set");
+    setIslStatusText("WiFi: 서버 주소 확인됨");
+    return;
   }
+
+  for (size_t i = 0; i < sizeof(kFallbackDnsServers) / sizeof(kFallbackDnsServers[0]); i++)
+  {
+    Serial.printf("[DNS] trying %s\n", kFallbackDnsServers[i]);
+    setDnsServer(kFallbackDnsServers[i]);
+
+    if (resolvesApiHost())
+    {
+      char line[96];
+      snprintf(line, sizeof(line), "WiFi: DNS를 %s로 대체함", kFallbackDnsServers[i]);
+      setIslStatusText(line);
+      return;
+    }
+  }
+
+  // Say so now rather than letting every upload fail with a generic message.
+  setIslStatusText("WiFi: 서버 주소를 찾지 못함 (이 네트워크는 전송 불가)");
 #endif
 }
 
@@ -9100,7 +9175,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
             snprintf(ipText, sizeof(ipText), IPSTR, IP2STR(&ipInfo.ip));
             Serial.print("WiFi DHCP IP: ");
             Serial.println(ipText);
-            ensureDnsServer();
+            verifyDnsOrFallback();
             return true;
           }
         }
@@ -10657,7 +10732,7 @@ bool cloudSendBatchHistory()
 
 // Routes a queued packet to 지능형 과학실.
 //
-// A 지능형과학실 relay used to sit behind this, forwarding to Google Sheets. It
+// A Cloud Run relay used to sit behind this, forwarding to Google Sheets. It
 // was already unreachable for measurements — every start/stop/data/batch path
 // returned above it once REALTIME_DIRECT_ISL_ENABLED was on — and the only
 // traffic left for it was a button log switched off by a separate flag.
@@ -10863,7 +10938,7 @@ bool c6WifiConnectBackground(const char *ssid, const char *password)
           esp_netif_ip_info_t ipInfo;
           if (esp_netif_get_ip_info(wifiStaNetif, &ipInfo) == ESP_OK && ipInfo.ip.addr != 0)
           {
-            ensureDnsServer();
+            verifyDnsOrFallback();
             return true;
           }
         }
