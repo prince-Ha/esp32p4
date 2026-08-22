@@ -97,7 +97,10 @@
 // Korean font
 // src/korean_16.c 안의 실제 폰트 이름도 korean_16 이어야 합니다.
 // =====================================================
-LV_FONT_DECLARE(korean_24);
+// Display weights, cut from Malgun Gothic Bold by tools/make_heading_font.py.
+// Noto Sans KR ships here in Regular only, so a real bold needs another file.
+LV_FONT_DECLARE(korean_24_bold);
+
 LV_FONT_DECLARE(korean_16);
 LV_FONT_DECLARE(korean_14);
 
@@ -111,7 +114,7 @@ LV_FONT_DECLARE(digits_64);
 
 // Headings. 24 px is the largest Hangul face built into the firmware, so it
 // carries every screen title and the sensor tile names.
-#define FONT_KR_HEAD &korean_24
+#define FONT_KR_HEAD &korean_24_bold
 #define FONT_KR_SMALL &korean_14
 #define FONT_VALUE &digits_64
 
@@ -693,6 +696,13 @@ bool plotFilterTime120Plus = true;
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
 #define HOME_SENSOR_TILE_COUNT 6
+static lv_obj_t *homeCodePanel;
+
+// The on-screen keyboard covers the lower third, including where the group
+// code sits, so the panel is lifted while it is being edited.
+#define HOME_CODE_PANEL_Y 416
+#define HOME_CODE_PANEL_EDIT_Y 118
+
 static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
 static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
 static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
@@ -2746,6 +2756,14 @@ static void formatPrimaryPlaceholderText(char *out, size_t outSize)
   else snprintf(out, outSize, "온도: --.--℃");
 }
 
+// The value label is width-to-content, so the unit has to be re-pinned every
+// time the number changes width.
+static void realignPrimaryUnit()
+{
+  if (labelTempBig == NULL || labelMeasurePrimaryUnit == NULL) return;
+  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+}
+
 void updateActiveSensorUiLabels()
 {
   char text[96];
@@ -2764,6 +2782,7 @@ void updateActiveSensorUiLabels()
   {
     formatPrimaryPlaceholderNumber(text, sizeof(text));
     lv_label_set_text(labelTempBig, text);
+    realignPrimaryUnit();
   }
 
   if (labelPressureBig)
@@ -2950,6 +2969,7 @@ static void refreshLatestMeasurementLabels()
   const int idx = sampleCount - 1;
   formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
   lv_label_set_text(labelTempBig, text);
+  realignPrimaryUnit();
 
   if (labelPressureBig)
   {
@@ -3596,7 +3616,6 @@ void updateSdStatusLabels()
   }
 
   if (labelHomeSd) lv_label_set_text(labelHomeSd, sdText);
-  if (labelSd) lv_label_set_text(labelSd, sdText);
   if (labelSettingsSd) lv_label_set_text(labelSettingsSd, sdText);
   if (labelSettingsCsv) lv_label_set_text(labelSettingsCsv, csvText);
   if (labelHomeCsv) lv_label_set_text(labelHomeCsv, csvText);
@@ -4522,6 +4541,12 @@ static void dashboard_textarea_event_cb(lv_event_t *e)
     lv_keyboard_set_textarea(keyboard, lv_event_get_target(e));
     lv_obj_clear_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
   }
+
+  if (homeCodePanel && lv_event_get_target(e) == homeIslModuleTa)
+  {
+    lv_obj_align(homeCodePanel, LV_ALIGN_TOP_LEFT, 28, HOME_CODE_PANEL_EDIT_Y);
+    lv_obj_move_foreground(homeCodePanel);
+  }
 }
 
 static void dashboard_keyboard_event_cb(lv_event_t *e)
@@ -4536,6 +4561,11 @@ static void dashboard_keyboard_event_cb(lv_event_t *e)
     {
       lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
       lv_keyboard_set_textarea(keyboard, NULL);
+    }
+
+    if (homeCodePanel)
+    {
+      lv_obj_align(homeCodePanel, LV_ALIGN_TOP_LEFT, 28, HOME_CODE_PANEL_Y);
     }
   }
 }
@@ -7607,7 +7637,8 @@ void createHomeUi()
   // Group code: show the saved value, and only raise the keyboard on 변경.
   // The old screen kept an always-open text field plus a save button.
   // =====================================================
-  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, HOME_CODE_PANEL_Y, 604, 72);
+  homeCodePanel = codePanel;
 
   makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
 
@@ -7705,7 +7736,10 @@ void createMeasureUi()
   lv_obj_set_style_text_font(labelTempBig, FONT_VALUE, 0);
   lv_obj_align(labelTempBig, LV_ALIGN_TOP_LEFT, colLeftX, contentTop + 34);
 
-  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", colLeftX + 232, contentTop + 74, UI_TEXT_3);
+  // Pinned to the value's own right edge rather than a fixed x, so it hugs
+  // the number whether it reads "28.2" or "1013.24".
+  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", 0, 0, UI_TEXT_3);
+  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
 
   // Secondary quantity, when the active sensor reports one.
   labelPressureBig = makeLabel(measureScreen, "기압 ----.-- hPa", colLeftX, contentTop + 122, UI_TEXT_2);
@@ -11357,21 +11391,8 @@ void loop()
         snprintf(text, sizeof(text), " %d", measurementCount);
         lv_label_set_text(labelCount, text);
 
-        if (labelSd)
-        {
-          if (sdReady && csvLoggingEnabled)
-          {
-            lv_label_set_text(labelSd, "SD: CSV 자동 저장 중");
-          }
-          else if (sdReady)
-          {
-            lv_label_set_text(labelSd, "SD: 마운트됨");
-          }
-          else
-          {
-            lv_label_set_text(labelSd, "SD: 저장 안 됨");
-          }
-        }
+        // labelSd is owned by refreshMeasureControls(); writing it here too
+        // made the two settle on different wording each second and flicker.
 
         if (tablePageOffset == 0)
         {
