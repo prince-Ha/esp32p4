@@ -100,7 +100,6 @@
 LV_FONT_DECLARE(korean_24);
 LV_FONT_DECLARE(korean_16);
 LV_FONT_DECLARE(korean_14);
-LV_FONT_DECLARE(korean_12);
 
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
@@ -678,6 +677,12 @@ bool plotFilterTime60_120 = true;
 bool plotFilterTime120Plus = true;
 
 
+// Home sensor grid, kept so the selected tile can follow the active sensor.
+#define HOME_SENSOR_TILE_COUNT 6
+static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
+static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
+
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
 static lv_obj_t *wifiKeyboard;
@@ -855,9 +860,31 @@ bool saveMeasurementBackupToNvs(bool force);
 void updateChartAutoScale();
 void clearChart();
 
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
+
+// Move the "선택됨" state onto the tile for `mode`.
+void refreshHomeSensorTilesFor(int mode)
+{
+  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+  {
+    styleSensorTile(
+      homeSensorTiles[i],
+      homeSensorTileMarks[i],
+      homeSensorTileModes[i] == mode
+    );
+  }
+}
+
+void refreshHomeSensorTiles()
+{
+  refreshHomeSensorTilesFor(activeSensorMode);
+}
+
 void refreshHomeSensorLabels()
 {
   char buf[96];
+
+  refreshHomeSensorTiles();
 
   if (labelHomeSensorMode)
   {
@@ -948,6 +975,13 @@ void servicePendingSensorMode()
 
   uiInputLocked = true;
   ignoreTouchUntilMs = millis() + 200;
+
+  // Move the selection and paint it before switching sensors. Bringing a
+  // sensor up probes I2C and can block for a second or more, and doing that
+  // first made the tap feel unacknowledged.
+  refreshHomeSensorTilesFor(mode);
+  lv_refr_now(NULL);
+
   setActiveSensorMode(mode);
   uiInputLocked = false;
   ignoreTouchUntilMs = millis() + 200;
@@ -1046,6 +1080,7 @@ void applyRestoredMeasurementToUi();
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
 lv_obj_t *makeTableNavButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 
 #if HAS_IDF_WIFI
 static bool idfWifiStarted = false;
@@ -3626,7 +3661,9 @@ lv_obj_t *makeSmallLabel(lv_obj_t *parent, const char *text, int x, int y, uint3
 // Light UI components
 // =====================================================
 
-// A plain surface: no shadow, one hairline border, generous corner radius.
+// A plain surface. White on the grey ground carries the grouping on its own,
+// the way iOS grouped lists do, so there is no border and no shadow to add
+// visual noise.
 lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
 {
   lv_obj_t *panel = lv_obj_create(parent);
@@ -3634,9 +3671,9 @@ lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
   lv_obj_align(panel, LV_ALIGN_TOP_LEFT, x, y);
   lv_obj_set_style_bg_color(panel, lv_color_hex(UI_SURFACE), 0);
   lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(panel, 14, 0);
-  lv_obj_set_style_border_width(panel, 1, 0);
-  lv_obj_set_style_border_color(panel, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_radius(panel, 16, 0);
+  lv_obj_set_style_border_width(panel, 0, 0);
+  lv_obj_set_style_outline_width(panel, 0, 0);
   lv_obj_set_style_shadow_width(panel, 0, 0);
   lv_obj_set_style_pad_all(panel, 0, 0);
   lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
@@ -3726,19 +3763,35 @@ lv_obj_t *makeQuietButton(lv_obj_t *parent, const char *text, int x, int y,
   return btn;
 }
 
+// Selection styling lives here so it can be re-applied when the active sensor
+// changes, rather than being baked in when the tile is built.
+void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
+{
+  if (tile == NULL) return;
+
+  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
+  lv_obj_set_style_border_width(tile, selected ? 2 : 0, 0);
+  lv_obj_set_style_border_color(tile, lv_color_hex(UI_ACCENT), 0);
+
+  if (mark == NULL) return;
+
+  if (selected) lv_obj_clear_flag(mark, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
+}
+
 // Sensor tile. Named by the quantity it measures, not the part number, and
-// large enough that a fingertip cannot reach two of them at once.
+// large enough that a fingertip cannot reach two of them at once. The caller
+// keeps `markOut` so the selected state can be moved later.
 lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
-                         int x, int y, int w, int h, bool selected, lv_event_cb_t cb)
+                         int x, int y, int w, int h, bool selected,
+                         lv_event_cb_t cb, lv_obj_t **markOut)
 {
   lv_obj_t *tile = lv_btn_create(parent);
   lv_obj_set_size(tile, w, h);
   lv_obj_align(tile, LV_ALIGN_TOP_LEFT, x, y);
-  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(tile, 14, 0);
-  lv_obj_set_style_border_width(tile, selected ? 2 : 1, 0);
-  lv_obj_set_style_border_color(tile, lv_color_hex(selected ? UI_ACCENT : UI_LINE), 0);
+  lv_obj_set_style_radius(tile, 16, 0);
+  lv_obj_set_style_outline_width(tile, 0, 0);
   lv_obj_set_style_shadow_width(tile, 0, 0);
   lv_obj_set_style_pad_all(tile, 0, 0);
   lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
@@ -3748,23 +3801,23 @@ lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
   lv_label_set_text(nameLabel, name);
   lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
-  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 16, 14);
+  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 18, 16);
 
   lv_obj_t *unitLabel = lv_label_create(tile);
   lv_label_set_text(unitLabel, unit);
   lv_obj_set_style_text_color(unitLabel, lv_color_hex(UI_TEXT_3), 0);
   lv_obj_set_style_text_font(unitLabel, FONT_KR_SMALL, 0);
-  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 16, -12);
+  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 18, -14);
 
-  if (selected)
-  {
-    lv_obj_t *mark = lv_label_create(tile);
-    lv_label_set_text(mark, "선택됨");
-    lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
-    lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
-    lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -16, -12);
-  }
+  lv_obj_t *mark = lv_label_create(tile);
+  lv_label_set_text(mark, "선택됨");
+  lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
+  lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
 
+  styleSensorTile(tile, mark, selected);
+
+  if (markOut != NULL) *markOut = mark;
   return tile;
 }
 
@@ -3982,18 +4035,18 @@ void createStatusBar(
   lv_obj_set_style_text_font(titleLabel, FONT_KR, 0);
   lv_obj_align(titleLabel, LV_ALIGN_LEFT_MID, 24, 0);
 
-  // Right edge, laid out right-to-left: clock, then SD, then WiFi.
+  // Clock centred; connection state pinned to the right edge.
   *timeLabel = lv_label_create(bar);
   lv_label_set_text(*timeLabel, "--:--");
-  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(UI_TEXT_2), 0);
+  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(*timeLabel, FONT_KR, 0);
-  lv_obj_align(*timeLabel, LV_ALIGN_RIGHT_MID, -24, 0);
+  lv_obj_align(*timeLabel, LV_ALIGN_CENTER, 0, 0);
 
   *sdLabel = makeChip(bar, "SD --", 0, 0, 128, UI_CHIP_BG, UI_TEXT_2);
-  lv_obj_align(lv_obj_get_parent(*sdLabel), LV_ALIGN_RIGHT_MID, -160, 0);
+  lv_obj_align(lv_obj_get_parent(*sdLabel), LV_ALIGN_RIGHT_MID, -20, 0);
 
   *wifiLabel = makeChip(bar, "WiFi --", 0, 0, 168, UI_CHIP_BG, UI_TEXT_2);
-  lv_obj_align(lv_obj_get_parent(*wifiLabel), LV_ALIGN_RIGHT_MID, -296, 0);
+  lv_obj_align(lv_obj_get_parent(*wifiLabel), LV_ALIGN_RIGHT_MID, -156, 0);
 }
 
 void updateStatusBars()
@@ -5685,7 +5738,11 @@ static lv_obj_t *islScreenBase = NULL;
 
 uint32_t screenBgColor(lv_obj_t *screen)
 {
-  if (screen == homeScreen) return 0x0B1020;
+  // ensureOpaqueScreenBase() paints a full-screen object in this colour behind
+  // every widget, so it — not the screen's own bg_color — is what the user
+  // sees. Screens still on the old dark theme keep 0x0B1020 until they are
+  // converted.
+  if (screen == homeScreen) return UI_BG;
   if (screen == measureScreen) return UI_LIGHT_BG;
   if (screen == plotScreen) return UI_LIGHT_BG;
   if (screen == csvScreen) return UI_LIGHT_BG;
@@ -7379,7 +7436,7 @@ void createHomeUi()
   // Everything else — WiFi detail, upload mode, restart — lives one tap away
   // in Settings, so a student meets six choices instead of fifteen controls.
   // =====================================================
-  makeHeading(homeScreen, "무엇을 측정할까요?", 28, 60, UI_TEXT);
+  makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
   makeSmallLabel(homeScreen, "센서를 고르면 측정 화면으로 넘어갑니다.", 28, 94, UI_TEXT_3);
 
   // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
@@ -7409,12 +7466,13 @@ void createHomeUi()
     { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb }
   };
 
-  for (int i = 0; i < 6; i++)
+  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
   {
     const int col = i % 3;
     const int row = i / 3;
 
-    makeSensorTile(
+    homeSensorTileModes[i] = tiles[i].mode;
+    homeSensorTiles[i] = makeSensorTile(
       homeScreen,
       tiles[i].name,
       tiles[i].unit,
@@ -7423,7 +7481,8 @@ void createHomeUi()
       tileW,
       tileH,
       activeSensorMode == tiles[i].mode,
-      tiles[i].cb
+      tiles[i].cb,
+      &homeSensorTileMarks[i]
     );
   }
 

@@ -46,7 +46,9 @@ def main() -> int:
 
     cmd = [
         "lv_font_conv.cmd" if sys.platform == "win32" else "lv_font_conv",
-        "--bpp", "2",
+        # bpp 4 matches LVGL's own Montserrat faces. At bpp 2 the Hangul looked
+        # visibly rougher than the Latin next to it.
+        "--bpp", "4",
         "--size", "24",
         "--no-compress",
         "--font", str(TTF),
