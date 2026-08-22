@@ -620,6 +620,7 @@ static lv_chart_series_t *seriesTemp;
 static lv_chart_series_t *seriesPressure;
 
 static lv_obj_t *tableData;
+static lv_obj_t *labelCsvRowRange;
 
 // =====================================================
 // Plot screen objects
@@ -4713,6 +4714,26 @@ void updateTable()
 
   char text[32];
 
+  // Which slice of the run is on screen, so paging has a reference point.
+  if (labelCsvRowRange)
+  {
+    char range[48];
+
+    if (sampleCount <= 0)
+    {
+      snprintf(range, sizeof(range), "측정값 없음");
+    }
+    else
+    {
+      const int first = tablePageOffset + 1;
+      int last = tablePageOffset + TABLE_VISIBLE_ROWS;
+      if (last > sampleCount) last = sampleCount;
+      snprintf(range, sizeof(range), "%d-%d / %d", first, last, sampleCount);
+    }
+
+    lv_label_set_text(labelCsvRowRange, range);
+  }
+
   int maxOffset = 0;
 
   if (sampleCount > 0)
@@ -5910,10 +5931,10 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == homeScreen) return UI_BG;
   if (screen == measureScreen) return UI_BG;
   if (screen == plotScreen) return UI_LIGHT_BG;
-  if (screen == csvScreen) return UI_LIGHT_BG;
-  if (screen == settingsScreen) return UI_LIGHT_BG;
-  if (screen == fileViewerScreen) return 0x0B1020;
-  if (screen == islScreen) return 0x0B1020;
+  if (screen == csvScreen) return UI_BG;
+  if (screen == settingsScreen) return UI_BG;
+  if (screen == fileViewerScreen) return UI_BG;
+  if (screen == islScreen) return UI_BG;
   if (screen == bleScreen) return UI_BG;
   return 0x0B1020;
 }
@@ -8128,32 +8149,39 @@ void createPlotUi()
 void createIslUi()
 {
   islScreen = lv_obj_create(NULL);
+  lv_obj_set_size(islScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(islScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(islScreen, lv_color_hex(0x0B1020), 0);
+  lv_obj_set_style_bg_color(islScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(islScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(islScreen, LV_OBJ_FLAG_SCROLLABLE);
 
   createStatusBar(
     islScreen,
-    "지능형 과학실 전송",
+    "",
     &labelBarIslTime,
     &labelBarIslWifi,
     &labelBarIslSd
   );
 
-  makeButton(islScreen, "홈", 875, 50, 90, 38, go_home_event_cb);
+  makeHeading(islScreen, "전송 설정", 28, 58, UI_TEXT);
+  makeSmallLabel(islScreen, "지능형 과학실 ON으로 측정값을 보내기 위한 값입니다.", 28, 92, UI_TEXT_3);
 
-  lv_obj_t *card = makeCard(islScreen, 35, 90, 955, 420, 0x111827);
-  lv_obj_set_style_border_color(card, lv_color_hex(0x1F2937), 0);
+  lv_obj_t *card = makePanel(islScreen, 28, 124, 968, 250);
 
-  makeLabel(card, "serviceKey", 25, 25, 0xFFFFFF);
+  makeSmallLabel(card, "인증키 (serviceKey)", 24, 18, UI_TEXT_3);
+
   islServiceKeyTa = lv_textarea_create(card);
-  lv_obj_set_size(islServiceKeyTa, 720, 44);
-  lv_obj_align(islServiceKeyTa, LV_ALIGN_TOP_LEFT, 25, 58);
+  lv_obj_set_size(islServiceKeyTa, 920, 46);
+  lv_obj_align(islServiceKeyTa, LV_ALIGN_TOP_LEFT, 24, 42);
   lv_textarea_set_one_line(islServiceKeyTa, true);
   lv_textarea_set_password_mode(islServiceKeyTa, true);
-  lv_textarea_set_placeholder_text(islServiceKeyTa, "serviceKey");
+  lv_textarea_set_placeholder_text(islServiceKeyTa, "발급받은 인증키");
   lv_obj_set_style_text_font(islServiceKeyTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(islServiceKeyTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(islServiceKeyTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(islServiceKeyTa, 0, 0);
+  lv_obj_set_style_radius(islServiceKeyTa, 10, 0);
+  lv_obj_set_style_text_color(islServiceKeyTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(islServiceKeyTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islServiceKey) > 0 && strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0)
@@ -8161,14 +8189,20 @@ void createIslUi()
     lv_textarea_set_text(islServiceKeyTa, islServiceKey);
   }
 
-  makeLabel(card, "모둠코드", 25, 125, 0xFFFFFF);
+  makeSmallLabel(card, "모둠코드", 24, 104, UI_TEXT_3);
+
   islModuleTa = lv_textarea_create(card);
-  lv_obj_set_size(islModuleTa, 360, 44);
-  lv_obj_align(islModuleTa, LV_ALIGN_TOP_LEFT, 25, 158);
+  lv_obj_set_size(islModuleTa, 560, 46);
+  lv_obj_align(islModuleTa, LV_ALIGN_TOP_LEFT, 24, 128);
   lv_textarea_set_one_line(islModuleTa, true);
   lv_textarea_set_password_mode(islModuleTa, false);
-  lv_textarea_set_placeholder_text(islModuleTa, "ON00000000000");
+  lv_textarea_set_placeholder_text(islModuleTa, "예: ON040000093851");
   lv_obj_set_style_text_font(islModuleTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(islModuleTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(islModuleTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(islModuleTa, 0, 0);
+  lv_obj_set_style_radius(islModuleTa, 10, 0);
+  lv_obj_set_style_text_color(islModuleTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(islModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islRuntimeSerialNumber) > 0)
@@ -8176,23 +8210,38 @@ void createIslUi()
     lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
   }
 
-  makeButton(card, "저장", 420, 158, 90, 44, dashboard_isl_save_event_cb);
-  makeButton(card, "전송", 525, 158, 90, 44, dashboard_isl_start_event_cb);
-  makeButton(card, "중지", 630, 158, 90, 44, dashboard_isl_stop_event_cb);
+  makePrimaryButton(card, "저장", 600, 128, 150, 46, UI_ACCENT, dashboard_isl_save_event_cb);
+  makeQuietButton(card, "전송 시작", 760, 128, 184, 46, dashboard_isl_start_event_cb);
 
-  labelHomeIsl = makeLabel(card, "API: 대기", 25, 245, 0x60A5FA);
-  lv_obj_set_width(labelHomeIsl, 820);
+  makeSmallLabel(card, "전송 방식", 24, 194, UI_TEXT_3);
+  makeQuietButton(card, "실시간", 120, 186, 130, 40, dashboard_cloud_realtime_event_cb);
+  makeQuietButton(card, "일괄전송", 260, 186, 150, 40, dashboard_cloud_batch_event_cb);
+  makeQuietButton(card, "전송 중지", 420, 186, 150, 40, dashboard_isl_stop_event_cb);
+
+  labelCloudMode = makeSmallLabel(card, "", 588, 198, UI_TEXT_3);
+  lv_obj_set_width(labelCloudMode, 356);
+  lv_obj_set_style_text_align(labelCloudMode, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
+
+  lv_obj_t *statusCard = makePanel(islScreen, 28, 390, 968, 100);
+
+  makeSmallLabel(statusCard, "상태", 24, 16, UI_TEXT_3);
+
+  labelHomeIsl = makeLabel(statusCard, "API: 대기", 24, 44, UI_ACCENT);
+  lv_obj_set_width(labelHomeIsl, 920);
   lv_label_set_long_mode(labelHomeIsl, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeIsl);
 
   islKeyboard = lv_keyboard_create(islScreen);
-  lv_obj_set_size(islKeyboard, 1024, 150);
+  lv_obj_set_size(islKeyboard, LCD_H_RES, 220);
   lv_obj_align(islKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(islKeyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(islKeyboard, dashboard_keyboard_event_cb, LV_EVENT_ALL, NULL);
   lv_obj_set_style_text_font(islKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(islKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
+  createTabBar(islScreen, 3);
+
+  updateCloudModeLabel();
   updateIslStatusLabels();
 }
 
@@ -8203,42 +8252,50 @@ void createIslUi()
 void createFileViewerUi()
 {
   fileViewerScreen = lv_obj_create(NULL);
+  lv_obj_set_size(fileViewerScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(fileViewerScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(fileViewerScreen, lv_color_hex(0x0B1020), 0);
+  lv_obj_set_style_bg_color(fileViewerScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(fileViewerScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(fileViewerScreen, LV_OBJ_FLAG_SCROLLABLE);
 
   createStatusBar(
     fileViewerScreen,
-    "파일 보기",
+    "",
     &labelBarFileViewerTime,
     &labelBarFileViewerWifi,
     &labelBarFileViewerSd
   );
 
-  makeButton(fileViewerScreen, "CSV", 812, 50, 84, 38, go_csv_event_cb);
-  makeButton(fileViewerScreen, "홈", 910, 50, 84, 38, go_home_event_cb);
-
-  labelFileViewerTitle = makeLabel(fileViewerScreen, "파일 보기: 없음", 25, 55, 0xFFFFFF);
-  lv_obj_set_width(labelFileViewerTitle, 620);
+  labelFileViewerTitle = makeHeading(fileViewerScreen, "파일 보기", 28, 58, UI_TEXT);
+  lv_obj_set_width(labelFileViewerTitle, 700);
   lv_label_set_long_mode(labelFileViewerTitle, LV_LABEL_LONG_CLIP);
 
-  labelFileViewerPageInfo = makeSmallLabel(fileViewerScreen, "0 / 0 bytes", 25, 558, 0xCBD5E1);
-  lv_obj_set_width(labelFileViewerPageInfo, 620);
+  makeQuietButton(fileViewerScreen, "이전", 700, 60, 92, 40, csv_viewer_prev_event_cb);
+  makeQuietButton(fileViewerScreen, "다음", 800, 60, 92, 40, csv_viewer_next_event_cb);
+  makeQuietButton(fileViewerScreen, "기록", 900, 60, 96, 40, go_csv_event_cb);
+
+  lv_obj_t *card = makePanel(fileViewerScreen, 28, 110, 968, 372);
+
+  // Read-only: this is a viewer, and an editable field invites a keyboard the
+  // screen has no room for.
+  fileViewerTextArea = lv_textarea_create(card);
+  lv_obj_set_size(fileViewerTextArea, 940, 344);
+  lv_obj_align(fileViewerTextArea, LV_ALIGN_TOP_LEFT, 14, 14);
+  lv_textarea_set_one_line(fileViewerTextArea, false);
+  lv_textarea_set_text(fileViewerTextArea, "기록 화면에서 파일을 열면 여기에 표시됩니다.");
+  lv_textarea_set_cursor_click_pos(fileViewerTextArea, false);
+  lv_obj_set_style_text_font(fileViewerTextArea, FONT_KR_SMALL, 0);
+  lv_obj_set_style_bg_opa(fileViewerTextArea, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_text_color(fileViewerTextArea, lv_color_hex(UI_TEXT), 0);
+  lv_obj_set_style_border_width(fileViewerTextArea, 0, 0);
+  lv_obj_set_style_pad_all(fileViewerTextArea, 0, 0);
+  lv_obj_set_scrollbar_mode(fileViewerTextArea, LV_SCROLLBAR_MODE_AUTO);
+
+  labelFileViewerPageInfo = makeSmallLabel(fileViewerScreen, "0 / 0 bytes", 28, 494, UI_TEXT_3);
+  lv_obj_set_width(labelFileViewerPageInfo, 968);
   lv_label_set_long_mode(labelFileViewerPageInfo, LV_LABEL_LONG_CLIP);
 
-  fileViewerTextArea = lv_textarea_create(fileViewerScreen);
-  lv_obj_set_size(fileViewerTextArea, 974, 450);
-  lv_obj_align(fileViewerTextArea, LV_ALIGN_TOP_LEFT, 25, 95);
-  lv_textarea_set_one_line(fileViewerTextArea, false);
-  lv_textarea_set_text(fileViewerTextArea, "CSV/TXT 파일을 열면 여기에 표시됩니다.");
-  lv_textarea_set_cursor_click_pos(fileViewerTextArea, false);
-  lv_obj_set_style_text_font(fileViewerTextArea, FONT_KR, 0);
-  lv_obj_set_style_bg_color(fileViewerTextArea, lv_color_hex(0x111827), 0);
-  lv_obj_set_style_text_color(fileViewerTextArea, lv_color_hex(0xE5E7EB), 0);
-  lv_obj_set_style_border_color(fileViewerTextArea, lv_color_hex(0x374151), 0);
-  lv_obj_set_style_radius(fileViewerTextArea, 10, 0);
-  lv_obj_set_scrollbar_mode(fileViewerTextArea, LV_SCROLLBAR_MODE_AUTO);
+  createTabBar(fileViewerScreen, 2);
 }
 
 // =====================================================
@@ -8247,82 +8304,131 @@ void createFileViewerUi()
 void createCsvUi()
 {
   csvScreen = lv_obj_create(NULL);
+  lv_obj_set_size(csvScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(csvScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(csvScreen, lv_color_hex(0xEEF2F7), 0);
+  lv_obj_set_style_bg_color(csvScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(csvScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(csvScreen, LV_OBJ_FLAG_SCROLLABLE);
 
   createStatusBar(
     csvScreen,
-    "CSV 저장",
+    "",
     &labelBarCsvTime,
     &labelBarCsvWifi,
     &labelBarCsvSd
   );
 
-  makeButton(csvScreen, "측정", 770, 50, 110, 38, go_measure_event_cb);
-  makeButton(csvScreen, "홈", 895, 50, 100, 38, go_home_event_cb);
+  makeHeading(csvScreen, "기록", 28, 58, UI_TEXT);
 
-  lv_obj_t *fileCard = makeCard(csvScreen, 25, 100, 470, 390, 0xFFFFFF);
-  makeLabel(fileCard, "측정 데이터 CSV", 20, 12, 0x111827);
-  makeLabel(fileCard, "파일명", 20, 62, 0x4B5563);
+  // =====================================================
+  // The measurement table lives here rather than on the measurement screen.
+  // During an experiment the value and its graph are what matter; the numbers
+  // are what you go back and read afterwards, which is this screen's job.
+  // =====================================================
+  lv_obj_t *tableCard = makePanel(csvScreen, 28, 104, 620, 412);
+
+  tableData = lv_table_create(tableCard);
+  lv_obj_set_size(tableData, 596, 346);
+  lv_obj_align(tableData, LV_ALIGN_TOP_LEFT, 12, 12);
+
+  lv_obj_set_style_text_font(tableData, FONT_KR, LV_PART_MAIN);
+  lv_obj_set_style_text_font(tableData, FONT_KR, LV_PART_ITEMS);
+  lv_obj_set_style_text_color(tableData, lv_color_hex(UI_TEXT), LV_PART_ITEMS);
+  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+  lv_obj_set_style_text_align(tableData, LV_TEXT_ALIGN_CENTER, LV_PART_ITEMS);
+  lv_obj_set_style_bg_opa(tableData, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(tableData, 0, LV_PART_MAIN);
+  lv_obj_set_style_border_color(tableData, lv_color_hex(UI_LINE), LV_PART_ITEMS);
+  lv_obj_set_style_border_width(tableData, 1, LV_PART_ITEMS);
+  lv_obj_set_style_border_side(tableData, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS);
+  lv_obj_set_style_pad_ver(tableData, 4, LV_PART_ITEMS);
+  lv_obj_set_style_pad_hor(tableData, 0, LV_PART_ITEMS);
+
+  lv_obj_clear_flag(tableData, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(tableData, LV_SCROLLBAR_MODE_OFF);
+
+  lv_table_set_col_cnt(tableData, 4);
+  lv_table_set_row_cnt(tableData, TABLE_VISIBLE_ROWS + 1);
+
+  lv_table_set_col_width(tableData, 0, 70);   // No
+  lv_table_set_col_width(tableData, 1, 120);  // 시간(s)
+  lv_table_set_col_width(tableData, 2, 200);  // primary
+  lv_table_set_col_width(tableData, 3, 200);  // secondary
+
+  makeQuietButton(tableCard, "이전", 12, 366, 140, 40, table_older_event_cb);
+  makeQuietButton(tableCard, "다음", 160, 366, 140, 40, table_newer_event_cb);
+
+  labelCsvRowRange = makeSmallLabel(tableCard, "", 316, 378, UI_TEXT_3);
+  lv_obj_set_width(labelCsvRowRange, 290);
+  lv_obj_set_style_text_align(labelCsvRowRange, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelCsvRowRange, LV_LABEL_LONG_CLIP);
+
+  // =====================================================
+  // File side
+  // =====================================================
+  lv_obj_t *fileCard = makePanel(csvScreen, 668, 104, 328, 412);
+
+  makeSmallLabel(fileCard, "저장 파일", 16, 14, UI_TEXT_3);
 
   homeCsvFileTa = lv_textarea_create(fileCard);
-  lv_obj_set_size(homeCsvFileTa, 380, 42);
-  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 20, 92);
+  lv_obj_set_size(homeCsvFileTa, 296, 44);
+  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 16, 36);
   lv_textarea_set_one_line(homeCsvFileTa, true);
   lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
   lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(homeCsvFileTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(homeCsvFileTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(homeCsvFileTa, 0, 0);
+  lv_obj_set_style_radius(homeCsvFileTa, 10, 0);
+  lv_obj_set_style_text_color(homeCsvFileTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
   lv_textarea_set_text(homeCsvFileTa, csvFileName);
 
-  makeButton(fileCard, "측정 데이터 저장", 20, 155, 185, 42, csv_save_measurement_data_event_cb);
-  makeButton(fileCard, "미리보기", 220, 155, 100, 42, dashboard_csv_preview_event_cb);
-  makeButton(fileCard, "파일 목록", 20, 210, 120, 38, settings_sd_list_event_cb);
-  makeButton(fileCard, "열기", 155, 210, 90, 38, csv_open_current_file_event_cb);
+  makePrimaryButton(fileCard, "측정값 저장", 16, 92, 296, 44, UI_ACCENT, csv_save_measurement_data_event_cb);
 
-  labelSelectedSdFile = makeLabel(fileCard, "선택: 없음", 20, 255, 0x6B7280);
-  lv_obj_set_width(labelSelectedSdFile, 420);
-  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelSelectedSdFile);
+  makeQuietButton(fileCard, "미리보기", 16, 146, 142, 40, dashboard_csv_preview_event_cb);
+  makeQuietButton(fileCard, "파일 목록", 170, 146, 142, 40, settings_sd_list_event_cb);
 
-  labelHomeCsv = makeLabel(fileCard, "CSV: 수동 저장 모드", 20, 292, 0x2563EB);
-  lv_obj_set_width(labelHomeCsv, 420);
+  labelHomeCsv = makeSmallLabel(fileCard, "CSV: 수동 저장 모드", 16, 198, UI_TEXT_2);
+  lv_obj_set_width(labelHomeCsv, 296);
   lv_label_set_long_mode(labelHomeCsv, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeCsv);
 
-  labelHomeCsvPath = makeLabel(fileCard, "파일: --", 20, 330, 0x4B5563);
-  lv_obj_set_width(labelHomeCsvPath, 420);
+  labelHomeCsvPath = makeSmallLabel(fileCard, "파일: --", 16, 222, UI_TEXT_3);
+  lv_obj_set_width(labelHomeCsvPath, 296);
   lv_label_set_long_mode(labelHomeCsvPath, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeCsvPath);
 
-  lv_obj_t *dataCard = makeCard(csvScreen, 520, 100, 480, 390, 0xFFFFFF);
-  makeLabel(dataCard, "CSV/TXT 파일 보기", 20, 12, 0x111827);
+  labelSelectedSdFile = makeSmallLabel(fileCard, "선택: 없음", 16, 246, UI_TEXT_3);
+  lv_obj_set_width(labelSelectedSdFile, 296);
+  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_CLIP);
 
-  labelHomeCsvPreview = makeLabel(dataCard, "최근 데이터 없음", 20, 55, 0x111827);
-  lv_obj_set_width(labelHomeCsvPreview, 430);
-  lv_obj_set_height(labelHomeCsvPreview, 170);
-  lv_label_set_long_mode(labelHomeCsvPreview, LV_LABEL_LONG_WRAP);
-  lv_obj_add_flag(labelHomeCsvPreview, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(labelHomeCsvPreview, LV_SCROLLBAR_MODE_AUTO);
-  enableCopyOnDoubleClick(labelHomeCsvPreview);
-
-  sdFileList = lv_list_create(dataCard);
-  lv_obj_set_size(sdFileList, 430, 120);
-  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 20, 245);
-  lv_obj_set_style_text_font(sdFileList, FONT_KR, 0);
+  sdFileList = lv_list_create(fileCard);
+  lv_obj_set_size(sdFileList, 296, 128);
+  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 16, 274);
+  lv_obj_set_style_text_font(sdFileList, FONT_KR_SMALL, 0);
+  lv_obj_set_style_bg_opa(sdFileList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(sdFileList, 0, 0);
+  lv_obj_set_style_pad_all(sdFileList, 0, 0);
   lv_list_add_text(sdFileList, "SD 파일 목록 대기");
 
+  // The preview is only meaningful once a file is opened, so it sits behind
+  // 미리보기 rather than taking permanent space.
+  labelHomeCsvPreview = makeSmallLabel(csvScreen, "", 28, 522, UI_TEXT_3);
+  lv_obj_set_width(labelHomeCsvPreview, 968);
+  lv_label_set_long_mode(labelHomeCsvPreview, LV_LABEL_LONG_CLIP);
+
   csvKeyboard = lv_keyboard_create(csvScreen);
-  lv_obj_set_size(csvKeyboard, 1024, 150);
+  lv_obj_set_size(csvKeyboard, LCD_H_RES, 220);
   lv_obj_align(csvKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(csvKeyboard, csv_keyboard_event_cb, LV_EVENT_ALL, NULL);
   lv_obj_set_style_text_font(csvKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(csvKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
+  createTabBar(csvScreen, 2);
+
+  resetTable();
+  updateTable();
   updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
 }
 
 // =====================================================
@@ -8523,86 +8629,114 @@ void createBleUi()
 void createSettingsUi()
 {
   settingsScreen = lv_obj_create(NULL);
+  lv_obj_set_size(settingsScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(settingsScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(0xEEF2F7), 0);
+  lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(settingsScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(settingsScreen, LV_OBJ_FLAG_SCROLLABLE);
 
   createStatusBar(
     settingsScreen,
-    "WiFi 설정",
+    "",
     &labelBarSettingsTime,
     &labelBarSettingsWifi,
     &labelBarSettingsSd
   );
 
-  makeButton(settingsScreen, "홈", 900, 50, 90, 38, go_home_event_cb);
-  makeButton(settingsScreen, "측정", 760, 50, 120, 38, go_measure_event_cb);
-  makeButton(settingsScreen, "블루투스", 600, 50, 150, 38, go_ble_event_cb);
+  makeHeading(settingsScreen, "설정", 28, 58, UI_TEXT);
 
-  // WiFi 설정 화면에는 WiFi 관련 항목만 배치한다.
-  lv_obj_t *wifiCard = makeCard(settingsScreen, 25, 95, 470, 420, 0xFFFFFF);
-  makeLabel(wifiCard, "WiFi 연결", 20, 12, 0x111827);
-  makeLabel(wifiCard, "SSID", 20, 62, 0x4B5563);
+  // =====================================================
+  // WiFi
+  // =====================================================
+  lv_obj_t *wifiCard = makePanel(settingsScreen, 28, 104, 620, 412);
+
+  makeSmallLabel(wifiCard, "WiFi", 20, 16, UI_TEXT_3);
 
   wifiSsidTa = lv_textarea_create(wifiCard);
-  lv_obj_set_size(wifiSsidTa, 420, 42);
-  lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 88);
+  lv_obj_set_size(wifiSsidTa, 580, 46);
+  lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 40);
   lv_textarea_set_one_line(wifiSsidTa, true);
-  lv_textarea_set_placeholder_text(wifiSsidTa, "SSID");
+  lv_textarea_set_placeholder_text(wifiSsidTa, "네트워크 이름");
   lv_obj_set_style_text_font(wifiSsidTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(wifiSsidTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(wifiSsidTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(wifiSsidTa, 0, 0);
+  lv_obj_set_style_radius(wifiSsidTa, 10, 0);
+  lv_obj_set_style_text_color(wifiSsidTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(wifiSsidTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
-  makeLabel(wifiCard, "비밀번호", 20, 142, 0x4B5563);
-
   wifiPassTa = lv_textarea_create(wifiCard);
-  lv_obj_set_size(wifiPassTa, 420, 42);
-  lv_obj_align(wifiPassTa, LV_ALIGN_TOP_LEFT, 20, 168);
+  lv_obj_set_size(wifiPassTa, 580, 46);
+  lv_obj_align(wifiPassTa, LV_ALIGN_TOP_LEFT, 20, 94);
   lv_textarea_set_one_line(wifiPassTa, true);
   lv_textarea_set_password_mode(wifiPassTa, true);
-  lv_textarea_set_placeholder_text(wifiPassTa, "Password");
+  lv_textarea_set_placeholder_text(wifiPassTa, "비밀번호");
   lv_obj_set_style_text_font(wifiPassTa, FONT_KR, 0);
+  lv_obj_set_style_bg_color(wifiPassTa, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(wifiPassTa, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(wifiPassTa, 0, 0);
+  lv_obj_set_style_radius(wifiPassTa, 10, 0);
+  lv_obj_set_style_text_color(wifiPassTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(wifiPassTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
-  makeButton(wifiCard, "연결", 20, 238, 90, 42, wifi_connect_event_cb);
-  makeButton(wifiCard, "해제", 122, 238, 90, 42, wifi_disconnect_event_cb);
-  makeButton(wifiCard, "검색", 224, 238, 90, 42, wifi_scan_event_cb);
-  makeButton(wifiCard, "저장 삭제", 326, 238, 115, 42, wifi_forget_event_cb);
+  makePrimaryButton(wifiCard, "연결", 20, 154, 180, 46, UI_ACCENT, wifi_connect_event_cb);
+  makeQuietButton(wifiCard, "해제", 210, 154, 130, 46, wifi_disconnect_event_cb);
+  makeQuietButton(wifiCard, "저장 삭제", 350, 154, 150, 46, wifi_forget_event_cb);
 
-  labelWifiState = makeLabel(wifiCard, "WiFi: 대기", 20, 310, 0x2563EB);
-  lv_obj_set_width(labelWifiState, 410);
+  labelWifiState = makeLabel(wifiCard, "WiFi: 대기", 20, 224, UI_ACCENT);
+  lv_obj_set_width(labelWifiState, 580);
   lv_label_set_long_mode(labelWifiState, LV_LABEL_LONG_CLIP);
 
-  labelWifiIp = makeLabel(wifiCard, "IP: --", 20, 348, 0x111827);
-  lv_obj_set_width(labelWifiIp, 190);
+  labelWifiIp = makeSmallLabel(wifiCard, "IP: --", 20, 258, UI_TEXT_2);
+  lv_obj_set_width(labelWifiIp, 280);
   lv_label_set_long_mode(labelWifiIp, LV_LABEL_LONG_CLIP);
 
-  labelWifiSignal = makeLabel(wifiCard, "신호: --", 230, 348, 0x111827);
-  lv_obj_set_width(labelWifiSignal, 190);
+  labelWifiSignal = makeSmallLabel(wifiCard, "신호: --", 320, 258, UI_TEXT_2);
+  lv_obj_set_width(labelWifiSignal, 280);
   lv_label_set_long_mode(labelWifiSignal, LV_LABEL_LONG_CLIP);
 
-  labelWifiMode = makeLabel(wifiCard, "방식: ESP32-C6 ESP-Hosted", 20, 382, 0x4B5563);
-  lv_obj_set_width(labelWifiMode, 410);
+  labelWifiMode = makeSmallLabel(wifiCard, "방식: ESP32-C6 ESP-Hosted", 20, 284, UI_TEXT_3);
+  lv_obj_set_width(labelWifiMode, 580);
   lv_label_set_long_mode(labelWifiMode, LV_LABEL_LONG_CLIP);
 
-  lv_obj_t *scanCard = makeCard(settingsScreen, 520, 95, 480, 420, 0xFFFFFF);
-  makeLabel(scanCard, "주변 WiFi", 20, 12, 0x111827);
-  labelWifiScan = makeLabel(scanCard, "검색 버튼을 누르세요.", 130, 12, 0x4B5563);
-  lv_obj_set_width(labelWifiScan, 310);
+  // Device-level entries that are not WiFi.
+  makeQuietButton(wifiCard, "블루투스 센서", 20, 330, 200, 46, go_ble_event_cb);
+  makeQuietButton(wifiCard, "전송 설정", 230, 330, 170, 46, go_isl_event_cb);
+  makeQuietButton(wifiCard, "다시 시작", 410, 330, 150, 46, board_restart_event_cb);
+
+  labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 384, UI_TEXT_3);
+  lv_obj_set_width(labelSettingsNote, 580);
+  lv_label_set_long_mode(labelSettingsNote, LV_LABEL_LONG_CLIP);
+
+  // =====================================================
+  // Nearby networks
+  // =====================================================
+  lv_obj_t *scanCard = makePanel(settingsScreen, 668, 104, 328, 412);
+
+  makeSmallLabel(scanCard, "주변 WiFi", 16, 14, UI_TEXT_3);
+  makeQuietButton(scanCard, "검색", 196, 8, 116, 38, wifi_scan_event_cb);
+
+  labelWifiScan = makeSmallLabel(scanCard, "검색 버튼을 누르세요.", 16, 52, UI_TEXT_3);
+  lv_obj_set_width(labelWifiScan, 296);
   lv_label_set_long_mode(labelWifiScan, LV_LABEL_LONG_CLIP);
 
   wifiList = lv_list_create(scanCard);
-  lv_obj_set_size(wifiList, 430, 335);
-  lv_obj_align(wifiList, LV_ALIGN_TOP_LEFT, 20, 60);
-  lv_obj_set_style_text_font(wifiList, FONT_KR, 0);
+  lv_obj_set_size(wifiList, 296, 330);
+  lv_obj_align(wifiList, LV_ALIGN_TOP_LEFT, 16, 76);
+  lv_obj_set_style_text_font(wifiList, FONT_KR_SMALL, 0);
+  lv_obj_set_style_bg_opa(wifiList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(wifiList, 0, 0);
+  lv_obj_set_style_pad_all(wifiList, 0, 0);
 
   wifiKeyboard = lv_keyboard_create(settingsScreen);
-  lv_obj_set_size(wifiKeyboard, 1024, 150);
+  lv_obj_set_size(wifiKeyboard, LCD_H_RES, 220);
   lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(wifiKeyboard, wifi_keyboard_event_cb, LV_EVENT_ALL, NULL);
   lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
+
+  createTabBar(settingsScreen, 3);
 
   updateWifiRuntimeLabels();
 }
