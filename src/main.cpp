@@ -8996,6 +8996,41 @@ bool ensureHostedWifiStarted()
 }
 #endif
 
+// A connected board with no working name server fails every upload with
+// "getaddrinfo() returns 202", which on screen looks identical to the server
+// being down. Report what DHCP handed over, and install a public resolver when
+// it handed over nothing — school networks do that more often than not.
+void ensureDnsServer()
+{
+#if HAS_IDF_WIFI
+  if (wifiStaNetif == NULL) return;
+
+  esp_netif_dns_info_t dns;
+  memset(&dns, 0, sizeof(dns));
+
+  const esp_err_t ret = esp_netif_get_dns_info(wifiStaNetif, ESP_NETIF_DNS_MAIN, &dns);
+  const uint32_t addr = (ret == ESP_OK) ? dns.ip.u_addr.ip4.addr : 0;
+
+  if (addr != 0)
+  {
+    Serial.printf("[DNS] server " IPSTR "\n", IP2STR(&dns.ip.u_addr.ip4));
+    return;
+  }
+
+  Serial.println("[DNS] none from DHCP; falling back to 8.8.8.8");
+
+  esp_netif_dns_info_t fallback;
+  memset(&fallback, 0, sizeof(fallback));
+  fallback.ip.type = ESP_IPADDR_TYPE_V4;
+  fallback.ip.u_addr.ip4.addr = esp_ip4addr_aton("8.8.8.8");
+
+  if (esp_netif_set_dns_info(wifiStaNetif, ESP_NETIF_DNS_MAIN, &fallback) != ESP_OK)
+  {
+    Serial.println("[DNS] fallback could not be set");
+  }
+#endif
+}
+
 bool c6WifiConnect(const char *ssid, const char *password)
 {
   if (ssid == NULL || strlen(ssid) == 0)
@@ -9065,6 +9100,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
             snprintf(ipText, sizeof(ipText), IPSTR, IP2STR(&ipInfo.ip));
             Serial.print("WiFi DHCP IP: ");
             Serial.println(ipText);
+            ensureDnsServer();
             return true;
           }
         }
@@ -9566,6 +9602,12 @@ bool httpPostJson(const char *url, const String &payload, String *response)
 
   Serial.print("esp_http_client result: ");
   Serial.println(esp_err_to_name(err));
+
+  if (err == ESP_ERR_HTTP_CONNECT)
+  {
+    // Distinguish "cannot resolve the name" from "server refused us".
+    setIslStatusText("전송 실패: 서버 주소를 찾지 못함 (DNS/인터넷 확인)");
+  }
   Serial.print("HTTP status: ");
   Serial.println(statusCode);
   Serial.print("HTTP content length: ");
@@ -10821,6 +10863,7 @@ bool c6WifiConnectBackground(const char *ssid, const char *password)
           esp_netif_ip_info_t ipInfo;
           if (esp_netif_get_ip_info(wifiStaNetif, &ipInfo) == ESP_OK && ipInfo.ip.addr != 0)
           {
+            ensureDnsServer();
             return true;
           }
         }
