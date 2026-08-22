@@ -6097,7 +6097,7 @@ static void go_plot_event_cb(lv_event_t *e)
 static void go_csv_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  setIslStatusText("CSV 기능 제거: 안정성 우선");
+  requestScreenSwitch(csvScreen);
 }
 
 static void go_isl_event_cb(lv_event_t *e)
@@ -11682,14 +11682,20 @@ void setup()
   createMeasureUi();
   createSettingsUi();
   createBleUi();
-  // Plot/CSV/FileViewer are intentionally not created in the stability build.
+  createCsvUi();
+  createFileViewerUi();
   createIslUi();
+  // The plot screen stays uncreated: it is not reachable from the tab bar and
+  // its drawing buffers were cut down to stubs.
 
   // Allocate every main screen base during setup, not on the first user tap.
   ensureOpaqueScreenBase(homeScreen);
   ensureOpaqueScreenBase(measureScreen);
   ensureOpaqueScreenBase(settingsScreen);
   ensureOpaqueScreenBase(islScreen);
+  ensureOpaqueScreenBase(bleScreen);
+  ensureOpaqueScreenBase(csvScreen);
+  ensureOpaqueScreenBase(fileViewerScreen);
 
   activateScreenNow(homeScreen);
 
