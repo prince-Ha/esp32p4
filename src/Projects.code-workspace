@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "esp32_p4",
+			"path": "../../esp32_p4"
+		},
+		{
+			"name": "esp32p4",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
