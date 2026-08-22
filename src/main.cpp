@@ -97,6 +97,7 @@
 // Korean font
 // src/korean_16.c 안의 실제 폰트 이름도 korean_16 이어야 합니다.
 // =====================================================
+LV_FONT_DECLARE(korean_24);
 LV_FONT_DECLARE(korean_16);
 LV_FONT_DECLARE(korean_14);
 LV_FONT_DECLARE(korean_12);
@@ -104,6 +105,11 @@ LV_FONT_DECLARE(korean_12);
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
 #define FONT_GRAPH_SMALL &korean_16
+
+// Headings. 24 px is the largest Hangul face built into the firmware, so it
+// carries every screen title and the sensor tile names.
+#define FONT_KR_HEAD &korean_24
+#define FONT_KR_SMALL &korean_14
 
 #define FONT_KR_TITLE FONT_KR
 #define FONT_KR_NORMAL FONT_KR
@@ -297,6 +303,31 @@ static bool tmp117LastReadWasWaiting = false;
 
 // UI/touch stability
 #define UI_LIGHT_BG 0xEEF2F7
+
+// =====================================================
+// Light UI palette
+// One accent carries every interactive affordance; semantic colours are kept
+// separate from it so "connected" never reads as "tappable". Every state that
+// uses colour also carries a word, so it survives colour-blind viewing and the
+// glare of a classroom projector.
+// =====================================================
+#define UI_BG          0xF4F6F8
+#define UI_SURFACE     0xFFFFFF
+#define UI_LINE        0xE2E7EE
+#define UI_TEXT        0x14181F
+#define UI_TEXT_2      0x4A5566
+#define UI_TEXT_3      0x79849A
+#define UI_ACCENT      0x0B6BCB
+#define UI_ACCENT_DARK 0x0A5BAD
+#define UI_ACCENT_SOFT 0xF2F7FE
+#define UI_ACCENT_TINT 0xE9F1FC
+#define UI_OK          0x1B7A44
+#define UI_OK_SOFT     0xE3F3E9
+#define UI_DANGER      0xC0392B
+#define UI_CHIP_BG     0xEDF1F6
+
+#define UI_STATUSBAR_H 44
+#define UI_TABBAR_H    54
 #define TOUCH_PRESS_DEBOUNCE_MS 12UL
 #define TOUCH_RELEASE_DEBOUNCE_MS 45UL
 #define TOUCH_REARM_MS 55UL
@@ -801,6 +832,9 @@ void updateTable();
 
 static void go_plot_event_cb(lv_event_t *e);
 static void go_csv_event_cb(lv_event_t *e);
+static void go_home_event_cb(lv_event_t *e);
+static void go_measure_event_cb(lv_event_t *e);
+static void go_settings_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -3588,6 +3622,221 @@ lv_obj_t *makeSmallLabel(lv_obj_t *parent, const char *text, int x, int y, uint3
   return label;
 }
 
+// =====================================================
+// Light UI components
+// =====================================================
+
+// A plain surface: no shadow, one hairline border, generous corner radius.
+lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
+{
+  lv_obj_t *panel = lv_obj_create(parent);
+  lv_obj_set_size(panel, w, h);
+  lv_obj_align(panel, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(panel, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(panel, 14, 0);
+  lv_obj_set_style_border_width(panel, 1, 0);
+  lv_obj_set_style_border_color(panel, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_shadow_width(panel, 0, 0);
+  lv_obj_set_style_pad_all(panel, 0, 0);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_OFF);
+  return panel;
+}
+
+lv_obj_t *makeHeading(lv_obj_t *parent, const char *text, int x, int y, uint32_t color)
+{
+  lv_obj_t *label = lv_label_create(parent);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+  lv_obj_set_style_text_font(label, FONT_KR_HEAD, 0);
+  lv_obj_align(label, LV_ALIGN_TOP_LEFT, x, y);
+  return label;
+}
+
+// Status pill. The caller owns the returned label so the text can change; the
+// pill always carries a word, never colour alone.
+lv_obj_t *makeChip(lv_obj_t *parent, const char *text, int x, int y, int w,
+                   uint32_t bgColor, uint32_t textColor)
+{
+  lv_obj_t *chip = lv_obj_create(parent);
+  lv_obj_set_size(chip, w, 26);
+  lv_obj_align(chip, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(chip, lv_color_hex(bgColor), 0);
+  lv_obj_set_style_bg_opa(chip, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(chip, 13, 0);
+  lv_obj_set_style_border_width(chip, 0, 0);
+  lv_obj_set_style_shadow_width(chip, 0, 0);
+  lv_obj_set_style_pad_all(chip, 0, 0);
+  lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *label = lv_label_create(chip);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(textColor), 0);
+  lv_obj_set_style_text_font(label, FONT_KR_SMALL, 0);
+  lv_obj_center(label);
+  return label;
+}
+
+// Filled accent button for the one primary action on a screen.
+lv_obj_t *makePrimaryButton(lv_obj_t *parent, const char *text, int x, int y,
+                            int w, int h, uint32_t color, lv_event_cb_t cb)
+{
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn, 12, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_pad_all(btn, 0, 0);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_text_font(label, FONT_KR_HEAD, 0);
+  lv_obj_center(label);
+  return btn;
+}
+
+// Quiet button: accent text on a tinted ground, for secondary actions.
+lv_obj_t *makeQuietButton(lv_obj_t *parent, const char *text, int x, int y,
+                          int w, int h, lv_event_cb_t cb)
+{
+  lv_obj_t *btn = lv_btn_create(parent);
+  lv_obj_set_size(btn, w, h);
+  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(UI_ACCENT_TINT), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(btn, 10, 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_pad_all(btn, 0, 0);
+  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *label = lv_label_create(btn);
+  lv_label_set_text(label, text);
+  lv_obj_set_style_text_color(label, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_set_style_text_font(label, FONT_KR, 0);
+  lv_obj_center(label);
+  return btn;
+}
+
+// Sensor tile. Named by the quantity it measures, not the part number, and
+// large enough that a fingertip cannot reach two of them at once.
+lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
+                         int x, int y, int w, int h, bool selected, lv_event_cb_t cb)
+{
+  lv_obj_t *tile = lv_btn_create(parent);
+  lv_obj_set_size(tile, w, h);
+  lv_obj_align(tile, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
+  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(tile, 14, 0);
+  lv_obj_set_style_border_width(tile, selected ? 2 : 1, 0);
+  lv_obj_set_style_border_color(tile, lv_color_hex(selected ? UI_ACCENT : UI_LINE), 0);
+  lv_obj_set_style_shadow_width(tile, 0, 0);
+  lv_obj_set_style_pad_all(tile, 0, 0);
+  lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(tile, cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *nameLabel = lv_label_create(tile);
+  lv_label_set_text(nameLabel, name);
+  lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
+  lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
+  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 16, 14);
+
+  lv_obj_t *unitLabel = lv_label_create(tile);
+  lv_label_set_text(unitLabel, unit);
+  lv_obj_set_style_text_color(unitLabel, lv_color_hex(UI_TEXT_3), 0);
+  lv_obj_set_style_text_font(unitLabel, FONT_KR_SMALL, 0);
+  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 16, -12);
+
+  if (selected)
+  {
+    lv_obj_t *mark = lv_label_create(tile);
+    lv_label_set_text(mark, "선택됨");
+    lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
+    lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
+    lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -16, -12);
+  }
+
+  return tile;
+}
+
+// Bottom tab bar, identical on every screen so "back" is always in one place.
+// Icons come from the Montserrat symbol range; the Korean caption sits below
+// them in the Hangul face, so each tab reads without relying on the glyph.
+void createTabBar(lv_obj_t *parent, int activeIndex)
+{
+  static const char *tabIcons[4] = {
+    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
+  };
+  static const char *tabNames[4] = { "홈", "측정", "기록", "설정" };
+
+  lv_event_cb_t tabCallbacks[4] = {
+    go_home_event_cb, go_measure_event_cb, go_csv_event_cb, go_settings_event_cb
+  };
+
+  lv_obj_t *bar = lv_obj_create(parent);
+  lv_obj_set_size(bar, LCD_H_RES, UI_TABBAR_H);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(bar, 0, 0);
+  lv_obj_set_style_border_width(bar, 0, 0);
+  lv_obj_set_style_pad_all(bar, 0, 0);
+  lv_obj_set_style_shadow_width(bar, 0, 0);
+  lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Hairline along the top edge only.
+  lv_obj_t *hairline = lv_obj_create(bar);
+  lv_obj_set_size(hairline, LCD_H_RES, 1);
+  lv_obj_align(hairline, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(hairline, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_bg_opa(hairline, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hairline, 0, 0);
+  lv_obj_set_style_radius(hairline, 0, 0);
+  lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
+
+  const int tabWidth = LCD_H_RES / 4;
+
+  for (int i = 0; i < 4; i++)
+  {
+    const bool active = (i == activeIndex);
+    const uint32_t tint = active ? UI_ACCENT : UI_TEXT_3;
+
+    lv_obj_t *tab = lv_btn_create(bar);
+    lv_obj_set_size(tab, tabWidth, UI_TABBAR_H - 1);
+    lv_obj_align(tab, LV_ALIGN_TOP_LEFT, i * tabWidth, 1);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tab, 0, 0);
+    lv_obj_set_style_shadow_width(tab, 0, 0);
+    lv_obj_set_style_radius(tab, 0, 0);
+    lv_obj_set_style_pad_all(tab, 0, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    // The active tab is already here; tapping it would reload the screen.
+    if (!active) lv_obj_add_event_cb(tab, tabCallbacks[i], LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *icon = lv_label_create(tab);
+    lv_label_set_text(icon, tabIcons[i]);
+    lv_obj_set_style_text_color(icon, lv_color_hex(tint), 0);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *caption = lv_label_create(tab);
+    lv_label_set_text(caption, tabNames[i]);
+    lv_obj_set_style_text_color(caption, lv_color_hex(tint), 0);
+    lv_obj_set_style_text_font(caption, FONT_KR_SMALL, 0);
+    lv_obj_align(caption, LV_ALIGN_BOTTOM_MID, 0, -7);
+  }
+}
+
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb)
 {
@@ -3707,37 +3956,44 @@ void createStatusBar(
 )
 {
   lv_obj_t *bar = lv_obj_create(parent);
-  lv_obj_set_size(bar, 1024, 40);
+  lv_obj_set_size(bar, LCD_H_RES, UI_STATUSBAR_H);
   lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);
-  lv_obj_set_style_bg_color(bar, lv_color_hex(0x111827), 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(UI_SURFACE), 0);
   lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bar, 0, 0);
   lv_obj_set_style_radius(bar, 0, 0);
+  lv_obj_set_style_shadow_width(bar, 0, 0);
+  lv_obj_set_style_pad_all(bar, 0, 0);
   lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Hairline along the bottom edge separates the bar from the page.
+  lv_obj_t *hairline = lv_obj_create(bar);
+  lv_obj_set_size(hairline, LCD_H_RES, 1);
+  lv_obj_align(hairline, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_style_bg_color(hairline, lv_color_hex(UI_LINE), 0);
+  lv_obj_set_style_bg_opa(hairline, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hairline, 0, 0);
+  lv_obj_set_style_radius(hairline, 0, 0);
+  lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
 
   lv_obj_t *titleLabel = lv_label_create(bar);
   lv_label_set_text(titleLabel, title);
-  lv_obj_set_style_text_color(titleLabel, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_color(titleLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(titleLabel, FONT_KR, 0);
-  lv_obj_align(titleLabel, LV_ALIGN_LEFT_MID, 18, 0);
+  lv_obj_align(titleLabel, LV_ALIGN_LEFT_MID, 24, 0);
 
+  // Right edge, laid out right-to-left: clock, then SD, then WiFi.
   *timeLabel = lv_label_create(bar);
-  lv_label_set_text(*timeLabel, "----.--.-- --:--");
-  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(0xFFFFFF), 0);
+  lv_label_set_text(*timeLabel, "--:--");
+  lv_obj_set_style_text_color(*timeLabel, lv_color_hex(UI_TEXT_2), 0);
   lv_obj_set_style_text_font(*timeLabel, FONT_KR, 0);
-  lv_obj_align(*timeLabel, LV_ALIGN_CENTER, -40, 0);
+  lv_obj_align(*timeLabel, LV_ALIGN_RIGHT_MID, -24, 0);
 
-  *wifiLabel = lv_label_create(bar);
-  lv_label_set_text(*wifiLabel, "WiFi --");
-  lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(0xD1D5DB), 0);
-  lv_obj_set_style_text_font(*wifiLabel, FONT_KR, 0);
-  lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -125, 0);
+  *sdLabel = makeChip(bar, "SD --", 0, 0, 128, UI_CHIP_BG, UI_TEXT_2);
+  lv_obj_align(lv_obj_get_parent(*sdLabel), LV_ALIGN_RIGHT_MID, -160, 0);
 
-  *sdLabel = lv_label_create(bar);
-  lv_label_set_text(*sdLabel, "SD --");
-  lv_obj_set_style_text_color(*sdLabel, lv_color_hex(0xD1D5DB), 0);
-  lv_obj_set_style_text_font(*sdLabel, FONT_KR, 0);
-  lv_obj_align(*sdLabel, LV_ALIGN_RIGHT_MID, -18, 0);
+  *wifiLabel = makeChip(bar, "WiFi --", 0, 0, 168, UI_CHIP_BG, UI_TEXT_2);
+  lv_obj_align(lv_obj_get_parent(*wifiLabel), LV_ALIGN_RIGHT_MID, -296, 0);
 }
 
 void updateStatusBars()
@@ -7106,7 +7362,7 @@ void createHomeUi()
   homeScreen = lv_obj_create(NULL);
   lv_obj_set_size(homeScreen, LCD_H_RES, LCD_V_RES);
   lv_obj_set_style_text_font(homeScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(homeScreen, lv_color_hex(0x0B1020), 0);
+  lv_obj_set_style_bg_color(homeScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(homeScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(homeScreen, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -7118,70 +7374,88 @@ void createHomeUi()
     &labelBarHomeSd
   );
 
-  // ZWO ASIAIR 스타일에 맞춘 단순 카드형 대시보드
-  lv_obj_t *wifiCard = makeCard(homeScreen, 22, 62, 310, 205, 0x111827);
-  lv_obj_set_style_border_color(wifiCard, lv_color_hex(0x1F2937), 0);
-  makeLabel(wifiCard, "WiFi", 14, 10, 0xFFFFFF);
+  // =====================================================
+  // The home screen asks one question: which sensor?
+  // Everything else — WiFi detail, upload mode, restart — lives one tap away
+  // in Settings, so a student meets six choices instead of fifteen controls.
+  // =====================================================
+  makeHeading(homeScreen, "무엇을 측정할까요?", 28, 60, UI_TEXT);
+  makeSmallLabel(homeScreen, "센서를 고르면 측정 화면으로 넘어갑니다.", 28, 94, UI_TEXT_3);
 
-  labelHomeWifi = makeLabel(wifiCard, "연결 안 됨", 14, 52, 0x60A5FA);
-  lv_obj_set_width(labelHomeWifi, 270);
-  lv_label_set_long_mode(labelHomeWifi, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeWifi);
+  // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
+  const int tileW = 316;
+  const int tileH = 112;
+  const int tileGapX = 14;
+  const int tileGapY = 14;
+  const int tileLeft = 28;
+  const int tileTop = 128;
 
-  labelHomeIp = makeLabel(wifiCard, "IP: --", 14, 88, 0xD1D5DB);
-  lv_obj_set_width(labelHomeIp, 270);
-  lv_label_set_long_mode(labelHomeIp, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeIp);
+  struct SensorTileSpec
+  {
+    const char *name;
+    const char *unit;
+    int mode;
+    lv_event_cb_t cb;
+  };
 
-  labelHomeSignal = makeLabel(wifiCard, "신호: --", 14, 124, 0xD1D5DB);
-  lv_obj_set_width(labelHomeSignal, 165);
-  lv_label_set_long_mode(labelHomeSignal, LV_LABEL_LONG_CLIP);
-  enableCopyOnDoubleClick(labelHomeSignal);
+  // Named by the quantity measured, not the part number: a student reads
+  // "이산화탄소", not "SCD41".
+  const SensorTileSpec tiles[6] = {
+    { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
+    { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
+    { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
+    { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
+    { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
+    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb }
+  };
 
-  makeButton(wifiCard, "설정", 190, 132, 88, 38, go_settings_event_cb);
+  for (int i = 0; i < 6; i++)
+  {
+    const int col = i % 3;
+    const int row = i / 3;
 
-  // 측정 센서 카드는 넓게 사용하고, 모델명이 아니라 측정 물리량으로 선택한다.
-  lv_obj_t *measureCard = makeCard(homeScreen, 357, 62, 645, 205, 0x111827);
-  lv_obj_set_style_border_color(measureCard, lv_color_hex(0x1F2937), 0);
-  makeLabel(measureCard, "SENSOR", 16, 10, 0xFFFFFF);
+    makeSensorTile(
+      homeScreen,
+      tiles[i].name,
+      tiles[i].unit,
+      tileLeft + col * (tileW + tileGapX),
+      tileTop + row * (tileH + tileGapY),
+      tileW,
+      tileH,
+      activeSensorMode == tiles[i].mode,
+      tiles[i].cb
+    );
+  }
 
-  labelHomeSensorMode = makeLabel(measureCard, "선택: 온도 · 기압", 16, 48, 0x60A5FA);
-  lv_obj_set_width(labelHomeSensorMode, 600);
+  // Sensor state, kept as one quiet line under the grid rather than a card.
+  labelHomeSensorMode = makeSmallLabel(homeScreen, "선택: --", 28, 388, UI_TEXT_2);
+  lv_obj_set_width(labelHomeSensorMode, 560);
   lv_label_set_long_mode(labelHomeSensorMode, LV_LABEL_LONG_CLIP);
 
-  labelHomeSensorStatus = makeLabel(measureCard, "상태: 준비", 16, 82, 0xD1D5DB);
-  lv_obj_set_width(labelHomeSensorStatus, 600);
+  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 388, UI_TEXT_2);
+  lv_obj_set_width(labelHomeSensorStatus, 392);
+  lv_obj_set_style_text_align(labelHomeSensorStatus, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
 
-  makeButton(measureCard, "온도·기압", 14, 128, 98, 48, home_sensor_dps_event_cb);
-  makeButton(measureCard, "수온",      118, 128, 62, 48, home_sensor_water_event_cb);
-  makeButton(measureCard, "CO2",       186, 128, 58, 48, home_sensor_co2_event_cb);
-  makeButton(measureCard, "조도",      250, 128, 62, 48, home_sensor_light_event_cb);
-  makeButton(measureCard, "정밀온도",  318, 128, 90, 48, home_sensor_tmp117_event_cb);
-  makeButton(measureCard, "거리",      414, 128, 62, 48, home_sensor_vl53_event_cb);
-  makeButton(measureCard, "측정 화면", 482, 128, 142, 48, go_measure_event_cb);
-
-  // 복구/재시작 상세 문구는 숨기고, 기능 버튼은 아래 지능형과학실 카드에 배치한다.
-  labelHomeResetReason = NULL;
-  labelHomeRecovery = NULL;
-
-
   // =====================================================
-  // 지능형과학실 모둠코드 입력 카드
-  // - Cloud Run으로 modumId를 넘기는 실제 운영 입력칸입니다.
-  // - 서비스키는 Cloud Run 환경변수에 두고, ESP32에는 모둠코드만 입력합니다.
+  // Group code: show the saved value, and only raise the keyboard on 변경.
+  // The old screen kept an always-open text field plus a save button.
   // =====================================================
-  lv_obj_t *cloudCard = makeCard(homeScreen, 22, 292, 980, 188, 0x111827);
-  lv_obj_set_style_border_color(cloudCard, lv_color_hex(0x1F2937), 0);
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
 
-  makeLabel(cloudCard, "지능형 과학실 모둠코드", 14, 8, 0xFFFFFF);
-  homeIslModuleTa = lv_textarea_create(cloudCard);
-  lv_obj_set_size(homeIslModuleTa, 360, 44);
-  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 14, 50);
+  makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
+
+  homeIslModuleTa = lv_textarea_create(codePanel);
+  lv_obj_set_size(homeIslModuleTa, 448, 34);
+  lv_obj_align(homeIslModuleTa, LV_ALIGN_TOP_LEFT, 14, 32);
   lv_textarea_set_one_line(homeIslModuleTa, true);
   lv_textarea_set_password_mode(homeIslModuleTa, false);
   lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
   lv_obj_set_style_text_font(homeIslModuleTa, FONT_KR, 0);
+  lv_obj_set_style_bg_opa(homeIslModuleTa, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(homeIslModuleTa, 0, 0);
+  lv_obj_set_style_pad_all(homeIslModuleTa, 4, 0);
+  lv_obj_set_style_text_color(homeIslModuleTa, lv_color_hex(UI_TEXT), 0);
   lv_obj_add_event_cb(homeIslModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islRuntimeSerialNumber) > 0)
@@ -7189,40 +7463,27 @@ void createHomeUi()
     lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
   }
 
-  // 모둠코드 카드에서는 코드 저장과 전송 방식 선택만 합니다.
-  // 시작/정지 제어는 측정 화면의 시작/정지 버튼으로 처리합니다.
-  makeButton(cloudCard, "저장", 395, 50, 80, 44, dashboard_isl_save_event_cb);
-  makeButton(cloudCard, "전송설정", 490, 50, 110, 44, go_isl_event_cb);
-  // Plot/CSV removed in stability build.
-  makeButton(cloudCard, "재시작", 620, 50, 170, 44, board_restart_event_cb);
+  makeQuietButton(codePanel, "저장", 486, 18, 100, 38, dashboard_isl_save_event_cb);
 
-  makeSmallLabel(cloudCard, "전송방식", 14, 106, 0xCBD5E1);
-  makeButton(cloudCard, "실시간", 110, 100, 90, 38, dashboard_cloud_realtime_event_cb);
-  makeButton(cloudCard, "일괄전송", 215, 100, 115, 38, dashboard_cloud_batch_event_cb);
+  // The one primary action on this screen.
+  makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
 
-  labelCloudMode = makeSmallLabel(cloudCard, "방식: 실시간", 345, 110, 0x60A5FA);
-  lv_obj_set_width(labelCloudMode, 480);
+  // Upload mode is a teacher-side setting; keep only its current value here.
+  labelCloudMode = makeSmallLabel(homeScreen, "방식: 실시간", 28, 500, UI_TEXT_3);
+  lv_obj_set_width(labelCloudMode, 968);
   lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
 
-  lv_obj_t *cloudNote = makeSmallLabel(
-    cloudCard,
-    "실시간=측정 중 계속 전송 / 일괄전송=측정 화면 [일괄전송] 버튼으로 누적 데이터 업로드",
-    14,
-    152,
-    0xCBD5E1
-  );
-  lv_obj_set_width(cloudNote, 930);
-  lv_label_set_long_mode(cloudNote, LV_LABEL_LONG_CLIP);
-  updateCloudModeLabel();
-
   homeKeyboard = lv_keyboard_create(homeScreen);
-  lv_obj_set_size(homeKeyboard, 1024, 150);
+  lv_obj_set_size(homeKeyboard, LCD_H_RES, 220);
   lv_obj_align(homeKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(homeKeyboard, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(homeKeyboard, dashboard_keyboard_event_cb, LV_EVENT_ALL, NULL);
   lv_obj_set_style_text_font(homeKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(homeKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
+  createTabBar(homeScreen, 0);
+
+  updateCloudModeLabel();
   updateHomeWifiLabels();
   refreshHomeSensorLabels();
 }
