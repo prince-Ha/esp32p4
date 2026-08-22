@@ -654,6 +654,16 @@ static lv_obj_t *labelBarBleTime;
 static lv_obj_t *labelBarBleWifi;
 static lv_obj_t *labelBarBleSd;
 static volatile bool pendingBleScan = false;
+
+// Bluetooth is off unless asked for. NimBLE holds DMA-capable internal RAM,
+// and that is the same pool the AES accelerator draws from for a TLS
+// handshake — with it running, uploads to 지능형 과학실 began failing
+// intermittently with "esp-aes: Generating DMA descriptors failed". The
+// upload path is what the board is for; Bluetooth is not yet.
+static bool bleEnabled = false;
+bool loadBleEnabled();
+void saveBleEnabled(bool enabled);
+static lv_obj_t *labelBleEnabledState;
 static lv_obj_t *labelBarIslTime;
 static lv_obj_t *labelBarIslWifi;
 static lv_obj_t *labelBarIslSd;
@@ -8499,6 +8509,25 @@ static void go_settings_event_cb(lv_event_t *e)
 // known there is nothing to connect to, so finding and naming devices comes
 // before pairing with them.
 // =====================================================
+static void ble_enable_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  bleEnabled = !bleEnabled;
+  saveBleEnabled(bleEnabled);
+
+  // NimBLE cannot be torn down cleanly once the host task is running, so the
+  // change takes effect on the next boot rather than pretending otherwise.
+  if (labelBleEnabledState)
+  {
+    lv_label_set_text(
+      labelBleEnabledState,
+      bleEnabled ? "블루투스: 켜짐 (다시 시작하면 적용)"
+                 : "블루투스: 꺼짐 (다시 시작하면 적용)"
+    );
+  }
+}
+
 static void ble_scan_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -8519,7 +8548,11 @@ void refreshBleScreen()
 
   if (labelBleState)
   {
-    if (bleScanIsRunning())
+    if (!bleEnabled)
+    {
+      lv_label_set_text(labelBleState, "블루투스가 꺼져 있습니다.");
+    }
+    else if (bleScanIsRunning())
     {
       lv_label_set_text(labelBleState, "검색 중...");
     }
@@ -8655,10 +8688,15 @@ void createBleUi()
   lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_CLIP);
 
   makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
+  makeQuietButton(bleScreen, "켜기/끄기", 648, 60, 168, 44, ble_enable_event_cb);
+
+  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 116, UI_TEXT_2);
+  lv_obj_set_width(labelBleEnabledState, 968);
+  lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_CLIP);
 
   bleList = lv_obj_create(bleScreen);
-  lv_obj_set_size(bleList, 968, 366);
-  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 124);
+  lv_obj_set_size(bleList, 968, 336);
+  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 148);
   lv_obj_set_style_bg_color(bleList, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(bleList, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bleList, 0, 0);
@@ -8674,6 +8712,11 @@ void createBleUi()
     28,
     500,
     UI_TEXT_3
+  );
+
+  lv_label_set_text(
+    labelBleEnabledState,
+    bleEnabled ? "블루투스: 켜짐" : "블루투스: 꺼짐 — 켜면 다음 시작부터 검색할 수 있습니다."
   );
 
   createTabBar(bleScreen, 3);
@@ -8859,6 +8902,28 @@ bool loadWifiCredentials()
   Serial.print("NVS WiFi loaded: ");
   Serial.println(wifiSavedSsid);
   return true;
+}
+
+bool loadBleEnabled()
+{
+  nvs_handle_t handle;
+  if (nvs_open("ble_cfg", NVS_READONLY, &handle) != ESP_OK) return false;
+
+  uint8_t value = 0;
+  const esp_err_t ret = nvs_get_u8(handle, "enabled", &value);
+  nvs_close(handle);
+
+  return ret == ESP_OK && value != 0;
+}
+
+void saveBleEnabled(bool enabled)
+{
+  nvs_handle_t handle;
+  if (nvs_open("ble_cfg", NVS_READWRITE, &handle) != ESP_OK) return;
+
+  nvs_set_u8(handle, "enabled", enabled ? 1 : 0);
+  nvs_commit(handle);
+  nvs_close(handle);
 }
 
 void initNvsStorage()
@@ -9588,6 +9653,18 @@ static esp_err_t cloudHttpEventHandler(esp_http_client_event_t *evt)
 }
 #endif
 
+void logHeapState(const char *context)
+{
+  Serial.printf(
+    "[HEAP] %s free=%u internal=%u dma=%u largest_dma=%u\n",
+    context,
+    (unsigned)esp_get_free_heap_size(),
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA)
+  );
+}
+
 bool httpPostJson(const char *url, const String &payload, String *response)
 {
 #if HAS_HTTP_CLIENT
@@ -9599,6 +9676,7 @@ bool httpPostJson(const char *url, const String &payload, String *response)
   http.setTimeout(CLOUD_HTTP_TIMEOUT_MS);
 
   Serial.println("----- HTTP POST START -----");
+  logHeapState("before POST");
   Serial.print("URL: ");
   Serial.println(url);
   Serial.print("Payload length: ");
@@ -9644,6 +9722,7 @@ bool httpPostJson(const char *url, const String &payload, String *response)
   String body;
 
   Serial.println("----- HTTP POST START -----");
+  logHeapState("before POST");
   Serial.print("URL: ");
   Serial.println(url);
   Serial.print("Payload length: ");
@@ -11139,7 +11218,7 @@ void wifiApiTask(void *parameter)
     // Bluetooth shares the ESP-Hosted link with WiFi, so it is brought up here
     // rather than in setup(): the transport costs about 1.5 s and this task is
     // already the one that waits on it.
-    if (!bleStartAttempted)
+    if (!bleStartAttempted && bleEnabled)
     {
       bleStartAttempted = true;
 
@@ -11653,12 +11732,16 @@ void servicePendingWifiCommand()
     strncpy(wifiSavedPassword, pendingWifiPassword, sizeof(wifiSavedPassword) - 1);
     wifiSavedPassword[sizeof(wifiSavedPassword) - 1] = '\0';
 
+    // Save before connecting: the entry is worth keeping whether or not the
+    // access point answers, and retyping a password on a touch keyboard to
+    // retry is the worst part of a failed attempt.
+    saveWifiCredentials(wifiSavedSsid, wifiSavedPassword);
+
     if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 연결 시도 중");
     wifiConnected = c6WifiConnect(wifiSavedSsid, wifiSavedPassword);
     if (wifiConnected)
     {
       resetDirectIslSessionCache("WiFi manual connect");
-      saveWifiCredentials(wifiSavedSsid, wifiSavedPassword);
       configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
       if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 연결됨");
       if (labelWifiMode) lv_label_set_text(labelWifiMode, "방식: ESP32-C6 ESP-Hosted / 수동");
@@ -11827,6 +11910,14 @@ void setup()
   ensureOpaqueScreenBase(bleScreen);
   ensureOpaqueScreenBase(csvScreen);
   ensureOpaqueScreenBase(fileViewerScreen);
+
+  // Put the saved network back in the fields now that they exist, so Settings
+  // shows the remembered entry rather than blanks.
+  loadWifiCredentials();
+
+  bleEnabled = loadBleEnabled();
+  Serial.print("[BLE] enabled at boot: ");
+  Serial.println(bleEnabled ? 1 : 0);
 
   activateScreenNow(homeScreen);
 
