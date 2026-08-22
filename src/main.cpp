@@ -288,6 +288,10 @@ static bool tmp117LastReadWasWaiting = false;
 // LVGL handler throttling. 5 ms is usually enough for touch/UI responsiveness.
 #define LVGL_HANDLER_PERIOD_MS 8
 
+// Stack for the background WiFi/API task. It performs TLS handshakes, so it
+// needs far more than the FreeRTOS default; 12 kB was overflowing.
+#define WIFI_API_TASK_STACK_BYTES 24576
+
 // Main loop idle time. Prevents 100% CPU busy-loop.
 #define MAIN_LOOP_IDLE_MS 2
 
@@ -297,10 +301,8 @@ static bool tmp117LastReadWasWaiting = false;
 #define TOUCH_RELEASE_DEBOUNCE_MS 45UL
 #define TOUCH_REARM_MS 55UL
 
-// Hardware clear disabled. Direct LCD clear caused persistent dark strips on this panel.
-// Page cleanup is handled by opaque LVGL backgrounds plus targeted invalidation.
-#define FAST_CLEAR_ROWS 24
-#define ENABLE_HOME_FAST_CLEAR 0
+// Direct LCD clears left persistent dark strips on this panel, so page cleanup
+// is handled by opaque LVGL backgrounds plus targeted invalidation instead.
 
 #define REG_PRS_B2    0x00
 #define REG_TMP_B2    0x03
@@ -671,7 +673,6 @@ bool plotFilterTime60_120 = true;
 bool plotFilterTime120Plus = true;
 
 
-static lv_obj_t *wifiScreen;
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
 static lv_obj_t *wifiKeyboard;
@@ -1139,6 +1140,21 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
   );
 
   lv_disp_flush_ready(disp);
+}
+
+// LVGL is not re-entrant. Several blocking waits (WiFi connect, NTP sync)
+// pump the UI so the screen keeps updating, and those waits can themselves be
+// reached from an LVGL callback. Route every call through this guard so a
+// nested pump becomes a no-op instead of corrupting LVGL's internal state.
+static bool lvglHandlerBusy = false;
+
+static void uiTimerHandler()
+{
+  if (lvglHandlerBusy) return;
+
+  lvglHandlerBusy = true;
+  lv_timer_handler();
+  lvglHandlerBusy = false;
 }
 
 // =====================================================
@@ -1663,7 +1679,7 @@ bool dps310Begin()
       }
     }
 
-    lv_timer_handler();
+    uiTimerHandler();
     delay(10);
   }
 
@@ -1710,7 +1726,7 @@ bool readDps310(float *temperatureC, float *pressureHpa)
       }
     }
 
-    lv_timer_handler();
+    uiTimerHandler();
     delay(5);
   }
 
@@ -5376,7 +5392,6 @@ void prepareScreenNoScroll(lv_obj_t *screen)
 }
 
 static lv_obj_t *currentLoadedScreen = NULL;
-static lv_color_t *fastClearBuf = NULL;
 
 // v13: each screen gets an opaque full-screen base object.
 // This prevents old pixels/black lines from remaining in empty areas
@@ -5388,7 +5403,6 @@ static lv_obj_t *csvScreenBase = NULL;
 static lv_obj_t *settingsScreenBase = NULL;
 static lv_obj_t *fileViewerScreenBase = NULL;
 static lv_obj_t *islScreenBase = NULL;
-static lv_obj_t *wifiScreenBase = NULL;
 
 uint32_t screenBgColor(lv_obj_t *screen)
 {
@@ -5399,7 +5413,6 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == settingsScreen) return UI_LIGHT_BG;
   if (screen == fileViewerScreen) return 0x0B1020;
   if (screen == islScreen) return 0x0B1020;
-  if (screen == wifiScreen) return UI_LIGHT_BG;
   return 0x0B1020;
 }
 
@@ -5412,7 +5425,6 @@ lv_obj_t **screenBaseSlot(lv_obj_t *screen)
   if (screen == settingsScreen) return &settingsScreenBase;
   if (screen == fileViewerScreen) return &fileViewerScreenBase;
   if (screen == islScreen) return &islScreenBase;
-  if (screen == wifiScreen) return &wifiScreenBase;
   return NULL;
 }
 
@@ -5443,40 +5455,6 @@ void ensureOpaqueScreenBase(lv_obj_t *screen)
   lv_obj_set_style_bg_opa(*slot, LV_OPA_COVER, 0);
   lv_obj_move_background(*slot);
   lv_obj_invalidate(*slot);
-}
-
-void fastLcdClear(uint32_t colorHex)
-{
-#if ENABLE_HOME_FAST_CLEAR
-  if (fastClearBuf == NULL)
-  {
-    fastClearBuf = (lv_color_t *)heap_caps_malloc(
-      LCD_H_RES * FAST_CLEAR_ROWS * sizeof(lv_color_t),
-      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
-    );
-
-    if (fastClearBuf == NULL)
-    {
-      Serial.println("[WARN] fast clear buffer allocation failed");
-      return;
-    }
-  }
-
-  lv_color_t color = lv_color_hex(colorHex);
-  const int pixels = LCD_H_RES * FAST_CLEAR_ROWS;
-
-  for (int i = 0; i < pixels; i++)
-  {
-    fastClearBuf[i] = color;
-  }
-
-  for (int y = 0; y < LCD_V_RES; y += FAST_CLEAR_ROWS)
-  {
-    int h = FAST_CLEAR_ROWS;
-    if (y + h > LCD_V_RES) h = LCD_V_RES - y;
-    lcd.lcd_draw_bitmap(0, y, LCD_H_RES, y + h, &fastClearBuf[0].full);
-  }
-#endif
 }
 
 void forceScreenFlush(lv_obj_t *screen)
@@ -7176,7 +7154,7 @@ void createHomeUi()
   lv_textarea_set_one_line(homeIslModuleTa, true);
   lv_textarea_set_password_mode(homeIslModuleTa, false);
   lv_textarea_set_placeholder_text(homeIslModuleTa, "예: ON040000093851");
-  lv_obj_set_style_text_font(homeIslModuleTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(homeIslModuleTa, FONT_KR, 0);
   lv_obj_add_event_cb(homeIslModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islRuntimeSerialNumber) > 0)
@@ -7576,7 +7554,7 @@ void createIslUi()
   lv_textarea_set_one_line(islServiceKeyTa, true);
   lv_textarea_set_password_mode(islServiceKeyTa, true);
   lv_textarea_set_placeholder_text(islServiceKeyTa, "serviceKey");
-  lv_obj_set_style_text_font(islServiceKeyTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(islServiceKeyTa, FONT_KR, 0);
   lv_obj_add_event_cb(islServiceKeyTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islServiceKey) > 0 && strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0)
@@ -7591,7 +7569,7 @@ void createIslUi()
   lv_textarea_set_one_line(islModuleTa, true);
   lv_textarea_set_password_mode(islModuleTa, false);
   lv_textarea_set_placeholder_text(islModuleTa, "ON00000000000");
-  lv_obj_set_style_text_font(islModuleTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(islModuleTa, FONT_KR, 0);
   lv_obj_add_event_cb(islModuleTa, dashboard_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   if (strlen(islRuntimeSerialNumber) > 0)
@@ -7695,7 +7673,7 @@ void createCsvUi()
   lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 20, 92);
   lv_textarea_set_one_line(homeCsvFileTa, true);
   lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
-  lv_obj_set_style_text_font(homeCsvFileTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
   lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
   lv_textarea_set_text(homeCsvFileTa, csvFileName);
 
@@ -7786,7 +7764,7 @@ void createSettingsUi()
   lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 88);
   lv_textarea_set_one_line(wifiSsidTa, true);
   lv_textarea_set_placeholder_text(wifiSsidTa, "SSID");
-  lv_obj_set_style_text_font(wifiSsidTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(wifiSsidTa, FONT_KR, 0);
   lv_obj_add_event_cb(wifiSsidTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   makeLabel(wifiCard, "비밀번호", 20, 142, 0x4B5563);
@@ -7797,7 +7775,7 @@ void createSettingsUi()
   lv_textarea_set_one_line(wifiPassTa, true);
   lv_textarea_set_password_mode(wifiPassTa, true);
   lv_textarea_set_placeholder_text(wifiPassTa, "Password");
-  lv_obj_set_style_text_font(wifiPassTa, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(wifiPassTa, FONT_KR, 0);
   lv_obj_add_event_cb(wifiPassTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
 
   makeButton(wifiCard, "연결", 20, 238, 90, 42, wifi_connect_event_cb);
@@ -8292,7 +8270,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
 
   while (millis() - start < 12000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     if (esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK)
     {
@@ -8301,7 +8279,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
       unsigned long ipStart = millis();
       while (millis() - ipStart < 8000)
       {
-        lv_timer_handler();
+        uiTimerHandler();
 
         if (wifiStaNetif != NULL)
         {
@@ -8345,7 +8323,7 @@ bool c6WifiConnect(const char *ssid, const char *password)
 
   while (millis() - start < 12000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     if (WiFi.status() == WL_CONNECTED && WiFi.localIP().toString() != "0.0.0.0")
     {
@@ -10440,10 +10418,13 @@ void startWifiApiTask()
 
   if (wifiApiTaskHandle == NULL)
   {
+    // This task runs the HTTPS uploads. An mbedTLS handshake with certificate
+    // bundle verification needs well over 12 kB of stack; the old 12288 value
+    // overflowed and showed up as a random freeze or reboot during WiFi work.
     xTaskCreatePinnedToCore(
       wifiApiTask,
       "wifi_api_task",
-      12288,
+      WIFI_API_TASK_STACK_BYTES,
       NULL,
       1,
       &wifiApiTaskHandle,
@@ -10568,7 +10549,7 @@ bool syncNtpTime()
 
   while (millis() - start < 10000)
   {
-    lv_timer_handler();
+    uiTimerHandler();
 
     time_t nowTime;
     struct tm timeInfo;
@@ -10602,7 +10583,7 @@ void tryAutoConnectSavedWifi()
 
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 자동 연결 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 자동 연결 중");
-  lv_timer_handler();
+  uiTimerHandler();
 
   wifiConnected = c6WifiConnect(wifiSavedSsid, wifiSavedPassword);
 
@@ -10685,7 +10666,7 @@ void bootScanThenAutoConnectWifi()
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 부팅 검색 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 부팅 검색 중");
   if (labelWifiScan) lv_label_set_text(labelWifiScan, "부팅 검색 중...");
-  lv_timer_handler();
+  uiTimerHandler();
 
   int count = c6WifiScan(wifiScanResults, WIFI_SCAN_MAX);
   populateWifiScanList(count);
@@ -10718,7 +10699,7 @@ void bootScanThenAutoConnectWifi()
 
   if (labelWifiState) lv_label_set_text(labelWifiState, "WiFi: 자동 연결 중");
   if (labelSettingsWifi) lv_label_set_text(labelSettingsWifi, "WiFi: 자동 연결 중");
-  lv_timer_handler();
+  uiTimerHandler();
 
   wifiConnected = c6WifiConnect(wifiSavedSsid, wifiSavedPassword);
 
@@ -10881,72 +10862,6 @@ void servicePendingWifiCommand()
   ignoreTouchUntilMs = millis() + 250;
 }
 
-void createWifiUi()
-{
-  wifiScreen = lv_obj_create(NULL);
-  lv_obj_set_style_text_font(wifiScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(wifiScreen, lv_color_hex(0xEEF2F7), 0);
-  lv_obj_set_style_bg_opa(wifiScreen, LV_OPA_COVER, 0);
-
-  makeLabel(wifiScreen, "WiFi 설정", 30, 18, 0x111827);
-  makeButton(wifiScreen, "홈", 900, 20, 90, 45, go_home_event_cb);
-  makeButton(wifiScreen, "측정", 760, 20, 120, 45, go_measure_event_cb);
-
-  lv_obj_t *leftCard = makeCard(wifiScreen, 40, 90, 450, 430, 0xFFFFFF);
-  lv_obj_t *rightCard = makeCard(wifiScreen, 520, 90, 460, 430, 0xFFFFFF);
-
-  makeLabel(leftCard, "연결 정보", 20, 15, 0x111827);
-  makeLabel(leftCard, "SSID", 20, 62, 0x4B5563);
-
-  wifiSsidTa = lv_textarea_create(leftCard);
-  lv_obj_set_size(wifiSsidTa, 390, 45);
-  lv_obj_align(wifiSsidTa, LV_ALIGN_TOP_LEFT, 20, 90);
-  lv_textarea_set_one_line(wifiSsidTa, true);
-  lv_textarea_set_placeholder_text(wifiSsidTa, "SSID");
-  lv_obj_set_style_text_font(wifiSsidTa, &lv_font_montserrat_16, 0);
-  lv_obj_add_event_cb(wifiSsidTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-
-  makeLabel(leftCard, "비밀번호", 20, 150, 0x4B5563);
-
-  wifiPassTa = lv_textarea_create(leftCard);
-  lv_obj_set_size(wifiPassTa, 390, 45);
-  lv_obj_align(wifiPassTa, LV_ALIGN_TOP_LEFT, 20, 178);
-  lv_textarea_set_one_line(wifiPassTa, true);
-  lv_textarea_set_password_mode(wifiPassTa, true);
-  lv_textarea_set_placeholder_text(wifiPassTa, "Password");
-  lv_obj_set_style_text_font(wifiPassTa, &lv_font_montserrat_16, 0);
-  lv_obj_add_event_cb(wifiPassTa, wifi_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-
-  makeButton(leftCard, "연결", 20, 255, 120, 50, wifi_connect_event_cb);
-  makeButton(leftCard, "해제", 160, 255, 120, 50, wifi_disconnect_event_cb);
-  makeButton(leftCard, "검색", 300, 255, 100, 50, wifi_scan_event_cb);
-  makeButton(leftCard, "저장 삭제", 20, 320, 140, 45, wifi_forget_event_cb);
-
-  makeLabel(leftCard, "검색 후 직접 연결합니다. 자동 연결은 하지 않습니다.", 20, 380, 0x4B5563);
-
-  makeLabel(rightCard, "현재 상태", 20, 15, 0x111827);
-  labelWifiState = makeLabel(rightCard, "WiFi: 대기", 20, 65, 0x2563EB);
-  labelWifiIp = makeLabel(rightCard, "IP: --", 20, 110, 0x111827);
-  labelWifiSignal = makeLabel(rightCard, "신호: --", 20, 155, 0x111827);
-  labelWifiMode = makeLabel(rightCard, "방식: ESP32-C6 ESP-Hosted", 20, 200, 0x111827);
-
-  makeLabel(rightCard, "주변 WiFi", 20, 245, 0x111827);
-  labelWifiScan = makeLabel(rightCard, "검색 버튼을 누르세요.", 120, 245, 0x4B5563);
-
-  wifiList = lv_list_create(rightCard);
-  lv_obj_set_size(wifiList, 420, 130);
-  lv_obj_align(wifiList, LV_ALIGN_TOP_LEFT, 20, 285);
-  lv_obj_set_style_text_font(wifiList, FONT_KR, 0);
-
-  wifiKeyboard = lv_keyboard_create(wifiScreen);
-  lv_obj_set_size(wifiKeyboard, 1024, 150);
-  lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_add_flag(wifiKeyboard, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_event_cb(wifiKeyboard, wifi_keyboard_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
-  lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
-}
-
 // =====================================================
 // Setup
 // =====================================================
@@ -11086,7 +11001,7 @@ void setup()
 
   for (int i = 0; i < 30; i++)
   {
-    lv_timer_handler();
+    uiTimerHandler();
     delay(10);
   }
 
@@ -11184,7 +11099,7 @@ void loop()
   {
     lastLvglHandlerMs = now;
     serviceLightweightBatchUi();
-    lv_timer_handler();
+    uiTimerHandler();
     servicePendingScreenSwitch();
   }
 
