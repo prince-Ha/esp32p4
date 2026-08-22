@@ -1168,7 +1168,6 @@ float pressureHistory[MAX_SAMPLES];
 float humidityHistory[MAX_SAMPLES];
 uint32_t timeHistory[MAX_SAMPLES];
 int noHistory[MAX_SAMPLES];
-char collectDateHistory[MAX_SAMPLES][32];
 bool sampleEnabled[MAX_SAMPLES];
 
 int sampleCount = 0;
@@ -1200,7 +1199,27 @@ struct MeasurementBackupBlob
   uint8_t enabled[MAX_SAMPLES];
 };
 
-static MeasurementBackupBlob measurementBackupScratch;
+// 15 kB of scratch for the NVS snapshot. Kept in PSRAM rather than internal
+// RAM: it is touched twice per backup at 1 Hz, so the slower bus costs
+// nothing, and internal RAM is the pool a TLS handshake and the Bluetooth
+// stack compete for.
+static MeasurementBackupBlob *measurementBackupScratch = NULL;
+
+static MeasurementBackupBlob *measurementBackupBuffer()
+{
+  if (measurementBackupScratch != NULL) return measurementBackupScratch;
+
+  measurementBackupScratch = (MeasurementBackupBlob *)heap_caps_malloc(
+    sizeof(MeasurementBackupBlob), MALLOC_CAP_SPIRAM);
+
+  if (measurementBackupScratch == NULL)
+  {
+    // No PSRAM: fall back so a backup still works, just from the smaller pool.
+    measurementBackupScratch = (MeasurementBackupBlob *)malloc(sizeof(MeasurementBackupBlob));
+  }
+
+  return measurementBackupScratch;
+}
 
 
 // =====================================================
@@ -3334,7 +3353,6 @@ void setActiveSensorMode(int mode)
       pressureHistory[i] = NO_PRESSURE_VALUE;
       humidityHistory[i] = NAN;
       timeHistory[i] = 0;
-      collectDateHistory[i][0] = '\0';
     }
   }
 
@@ -4900,8 +4918,6 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     pressureHistory[sampleCount] = pressureHpa;
     humidityHistory[sampleCount] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
     timeHistory[sampleCount] = timeS;
-    strncpy(collectDateHistory[sampleCount], collectText.c_str(), sizeof(collectDateHistory[sampleCount]) - 1);
-    collectDateHistory[sampleCount][sizeof(collectDateHistory[sampleCount]) - 1] = '\0';
     sampleEnabled[sampleCount] = true;
     sampleCount++;
   }
@@ -4916,8 +4932,6 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
       pressureHistory[i - 1] = pressureHistory[i];
       humidityHistory[i - 1] = humidityHistory[i];
       timeHistory[i - 1] = timeHistory[i];
-      strncpy(collectDateHistory[i - 1], collectDateHistory[i], sizeof(collectDateHistory[i - 1]) - 1);
-      collectDateHistory[i - 1][sizeof(collectDateHistory[i - 1]) - 1] = '\0';
       sampleEnabled[i - 1] = sampleEnabled[i];
     }
 
@@ -4926,8 +4940,6 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     pressureHistory[MAX_SAMPLES - 1] = pressureHpa;
     humidityHistory[MAX_SAMPLES - 1] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
     timeHistory[MAX_SAMPLES - 1] = timeS;
-    strncpy(collectDateHistory[MAX_SAMPLES - 1], collectText.c_str(), sizeof(collectDateHistory[MAX_SAMPLES - 1]) - 1);
-    collectDateHistory[MAX_SAMPLES - 1][sizeof(collectDateHistory[MAX_SAMPLES - 1]) - 1] = '\0';
     sampleEnabled[MAX_SAMPLES - 1] = true;
   }
 }
@@ -4945,7 +4957,9 @@ bool saveMeasurementBackupToNvs(bool force)
   if (!force && MEAS_BACKUP_EVERY_SAMPLES > 1 && (measurementCount % MEAS_BACKUP_EVERY_SAMPLES) != 0) return true;
   if (!force && (millis() - lastBackupWriteMs < MEAS_BACKUP_MIN_INTERVAL_MS)) return true;
 
-  MeasurementBackupBlob &backup = measurementBackupScratch;
+  MeasurementBackupBlob *backupPtr = measurementBackupBuffer();
+  if (backupPtr == NULL) return false;
+  MeasurementBackupBlob &backup = *backupPtr;
   memset(&backup, 0, sizeof(backup));
   backup.magic = MEAS_BACKUP_MAGIC;
   backup.version = MEAS_BACKUP_VERSION;
@@ -4987,7 +5001,9 @@ bool restoreMeasurementBackupFromNvs()
   esp_err_t ret = nvs_open("meas_bak", NVS_READONLY, &handle);
   if (ret != ESP_OK) return false;
 
-  MeasurementBackupBlob &backup = measurementBackupScratch;
+  MeasurementBackupBlob *backupPtr = measurementBackupBuffer();
+  if (backupPtr == NULL) return false;
+  MeasurementBackupBlob &backup = *backupPtr;
   size_t len = sizeof(backup);
   ret = nvs_get_blob(handle, "data", &backup, &len);
   nvs_close(handle);
@@ -6503,7 +6519,6 @@ static void clear_event_cb(lv_event_t *e)
     {
       sampleEnabled[i] = true;
       noHistory[i] = 0;
-      collectDateHistory[i][0] = '\0';
     }
     wifiAutoRetryEnabled = false;
     lastAutoWifiRetryMs = millis();
