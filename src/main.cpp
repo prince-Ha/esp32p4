@@ -427,6 +427,14 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define ISL_CHANNEL_CO2 "01"
 #define ISL_UNIT_CO2 "ppm"
 
+// SCD41 reports temperature and humidity alongside CO2. 습도 is HMDT in the
+// appendix; temperature reuses the TPR code the server already accepts. They
+// are separate sensor types, so each takes channel 01 (별첨3).
+#define ISL_SENSOR_TYPE_HUMIDITY "HMDT"
+#define ISL_CHANNEL_HUMIDITY "01"
+#define ISL_UNIT_HUMIDITY "%"
+#define ISL_CHANNEL_SCD41_TEMP "01"
+
 
 #define CLOUD_FUNCTION_URL "https://sensor-data-582760051065.asia-northeast3.run.app"
 #define CLOUD_FUNCTION_ENABLED 1
@@ -468,6 +476,7 @@ struct CloudSamplePacket
   uint32_t timeS;
   float tempC;
   float pressureHpa;
+  float humidityPct;
   char collectDate[32];
   char sensorName[32];
   char modumId[64];
@@ -10055,8 +10064,10 @@ bool directIslSendSensorTypeIfNeeded()
     payload += jsonEscapeString(islServiceKey);
     payload += "\",\"uniqueCode\":\"";
     payload += jsonEscapeString(directIslUniqueCode);
-    payload += "\",\"sensorCount\":1,\"items\":[";
-    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CO2 "\",\"sensorNicNm\":\"이산화탄소센서\",\"channelCode\":\"" ISL_CHANNEL_CO2 "\"}";
+    payload += "\",\"sensorCount\":3,\"items\":[";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CO2 "\",\"sensorNicNm\":\"이산화탄소센서\",\"channelCode\":\"" ISL_CHANNEL_CO2 "\"},";
+    payload += "{\"sensorType\":\"TPR\",\"sensorNicNm\":\"온도센서\",\"channelCode\":\"" ISL_CHANNEL_SCD41_TEMP "\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_HUMIDITY "\",\"sensorNicNm\":\"습도센서\",\"channelCode\":\"" ISL_CHANNEL_HUMIDITY "\"}";
     payload += "]}";
 
     String response;
@@ -10345,11 +10356,34 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
 
     if (activeSensorMode == SENSOR_MODE_SCD41)
     {
+      // The part measures all three at once; send all three.
       payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CO2 "\",\"sensorNicNm\":\"이산화탄소센서\",\"channelCode\":\"" ISL_CHANNEL_CO2 "\",\"sensorData\":\"";
       payload += primaryValue;
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_CO2 "\"}";
+
+      if (!isnan(packet.pressureHpa))
+      {
+        char scdTemp[24];
+        snprintf(scdTemp, sizeof(scdTemp), "%.4f", packet.pressureHpa);
+        payload += ",{\"sensorType\":\"TPR\",\"sensorNicNm\":\"온도센서\",\"channelCode\":\"" ISL_CHANNEL_SCD41_TEMP "\",\"sensorData\":\"";
+        payload += scdTemp;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"C\"}";
+      }
+
+      if (!isnan(packet.humidityPct))
+      {
+        char scdHum[24];
+        snprintf(scdHum, sizeof(scdHum), "%.4f", packet.humidityPct);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_HUMIDITY "\",\"sensorNicNm\":\"습도센서\",\"channelCode\":\"" ISL_CHANNEL_HUMIDITY "\",\"sensorData\":\"";
+        payload += scdHum;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_HUMIDITY "\"}";
+      }
     }
     else if (activeSensorMode == SENSOR_MODE_TSL2591)
     {
@@ -10668,6 +10702,28 @@ bool cloudSendBatchHistory()
         payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_CO2 "\"}";
+
+        if (!isnan(pressureHistory[i]))
+        {
+          char scdTemp[24];
+          snprintf(scdTemp, sizeof(scdTemp), "%.4f", pressureHistory[i]);
+          payload += ",{\"sensorType\":\"TPR\",\"sensorNicNm\":\"온도센서\",\"channelCode\":\"" ISL_CHANNEL_SCD41_TEMP "\",\"sensorData\":\"";
+          payload += scdTemp;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"C\"}";
+        }
+
+        if (!isnan(humidityHistory[i]))
+        {
+          char scdHum[24];
+          snprintf(scdHum, sizeof(scdHum), "%.4f", humidityHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_HUMIDITY "\",\"sensorNicNm\":\"습도센서\",\"channelCode\":\"" ISL_CHANNEL_HUMIDITY "\",\"sensorData\":\"";
+          payload += scdHum;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_HUMIDITY "\"}";
+        }
       }
       else if (activeSensorMode == SENSOR_MODE_TSL2591)
       {
@@ -11044,6 +11100,7 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
 #if CLOUD_FUNCTION_ENABLED
   if (cloudQueue == NULL) return;
 
+
   if (cloudUploadMode == CLOUD_UPLOAD_BATCH)
   {
     if (no % 10 == 0)
@@ -11075,6 +11132,8 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
   packet.timeS = timeS;
   packet.tempC = tempC;
   packet.pressureHpa = pressureHpa;
+  // Read straight after the sample that produced it, in the same loop pass.
+  packet.humidityPct = scd41LastHumidityPct;
   formatIslCollectDate(packet.collectDate, sizeof(packet.collectDate));
   snprintf(packet.sensorName, sizeof(packet.sensorName), "%s", activeSensorName());
   copyCurrentModumIdTo(packet.modumId, sizeof(packet.modumId));
