@@ -119,7 +119,6 @@ LV_FONT_DECLARE(digits_64);
 #define FONT_KR_SMALL &korean_14
 #define FONT_VALUE &digits_64
 
-#define FONT_KR_TITLE FONT_KR
 #define FONT_KR_NORMAL FONT_KR
 // =====================================================
 // WiFi scan result buffer
@@ -330,13 +329,10 @@ static bool tmp117LastReadWasWaiting = false;
 #define UI_TEXT_2      0x4A5566
 #define UI_TEXT_3      0x79849A
 #define UI_ACCENT      0x0B6BCB
-#define UI_ACCENT_DARK 0x0A5BAD
 #define UI_ACCENT_SOFT 0xF2F7FE
 #define UI_ACCENT_TINT 0xE9F1FC
 #define UI_OK          0x1B7A44
-#define UI_OK_SOFT     0xE3F3E9
 #define UI_DANGER      0xC0392B
-#define UI_CHIP_BG     0xEDF1F6
 
 #define UI_STATUSBAR_H 44
 #define UI_TABBAR_H    54
@@ -383,7 +379,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
 // WiFi detection 테스트 시에는 SDMMC가 C6 SDIO 통신과 충돌할 수 있습니다.
 // SD는 부팅 자동 마운트 대신 설정 화면에서 수동으로 켜는 구조가 안전합니다.
-#define ENABLE_SD_CSV 0  // stability build: CSV/SD logging disabled
 #define SD_AUTO_MOUNT_ON_BOOT 0
 #define CSV_LOG_DEFAULT false
 
@@ -392,9 +387,8 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
 
 // =====================================================
-// 현재 권장 전송 구조
-// ESP32-P4 -> Cloud Run -> Google Sheets
-// Cloud Run -> 지능형과학실 ON relay 시도
+// 전송 구조
+// ESP32-P4 -> 지능형 과학실 ON 오픈API (직접 HTTPS)
 //
 // 중요:
 // ESP32-P4에서 지능형과학실 ON으로 직접 HTTPS 전송하지 않습니다.
@@ -410,7 +404,6 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 2026-07-21 지능형 과학실 ON 오픈API 설계서 기준
 // 조도(Illuminance): 실제 sendSensorType API 호출 예제(page 27)는 sensorType=ILM 사용
 // 별첨 표에는 ILMN으로 기재되어 있으나, 실제 API 예제의 정상 응답(001)에 맞춰 ILM 사용
-#define ISL_SENSOR_TYPE_LIGHT "ILM"
 #define ISL_CHANNEL_LIGHT "01"
 #define ISL_UNIT_LIGHT "Lux"
 
@@ -436,17 +429,16 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define ISL_CHANNEL_SCD41_TEMP "01"
 
 
-#define CLOUD_FUNCTION_URL "https://sensor-data-582760051065.asia-northeast3.run.app"
-#define CLOUD_FUNCTION_ENABLED 1
+// Gates the queue that carries samples to the upload task.
+#define UPLOAD_QUEUE_ENABLED 1
 
 // =====================================================
 // 실시간 직접 전송 옵션
 // - 실시간 start/data/stop: ESP32 -> 지능형과학실 ON 직접 전송
-// - 버튼 로그/상태 로그/일괄전송: ESP32 -> Cloud Run -> Google Sheets/지능형과학실
+// - 일괄전송: 누적 측정값을 지능형과학실로 한 번에 전송
 // 직접 전송을 쓰려면 지능형과학실 설정 화면에 serviceKey를 저장해야 합니다.
 // =====================================================
 #define REALTIME_DIRECT_ISL_ENABLED 1
-#define CLOUD_BUTTON_LOG_ENABLED 0  // 실시간 안정화: 버튼 로그는 기본 비활성
 #define DIRECT_ISL_AXIS_PADDED 1
 
 #define DIRECT_ISL_START_URL "https://api-scion.kosac.re.kr/sensorapi/startExplortProcess"
@@ -455,10 +447,10 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define DIRECT_ISL_DATA_URL "https://api-scion.kosac.re.kr/sensorapi/sendExplortData"
 #define DIRECT_ISL_STOP_URL "https://api-scion.kosac.re.kr/sensorapi/stopExplortProcess"
 
-// Cloud Run HTTPS 전송 안정화 설정
+// HTTPS 전송 안정화 설정
 // 1초마다 HTTPS를 새로 연결하면 TLS handshake 때문에 실패할 수 있습니다.
 // 우선 5개 샘플마다 1번만 전송하고, 안정화되면 1로 낮추면 됩니다.
-#define CLOUD_SEND_EVERY_N_SAMPLES 1  // 실시간 모드: 1초 샘플마다 Cloud Run 전송 시도
+#define CLOUD_SEND_EVERY_N_SAMPLES 1  // 실시간 모드: 1초 샘플마다 전송
 #define CLOUD_HTTP_TIMEOUT_MS 12000  // 전송 안정화: 지능형과학실 API 응답 지연을 고려해 timeout 확대
 #define CLOUD_QUEUE_DEPTH 4  // 제어 명령과 일괄전송 요청 안정화를 위해 약간 여유
 #define BATCH_UPLOAD_CHUNK_SIZE 5  // WiFi 재연결 후 안정화: 더 작은 chunk + retry
@@ -468,8 +460,7 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 지능형 과학실 ON API 런타임 상태
 // HTTP/WiFi 작업은 별도 task에서 처리하고, 측정 loop는 큐에 넣기만 합니다.
 // =====================================================
-// Google Cloud Run 전송용 패킷입니다.
-// 지능형 과학실 ON API 설정 여부와 무관하게 Cloud Run으로 원시 측정값을 보냅니다.
+// 업로드 task로 넘기는 측정값 패킷입니다.
 struct CloudSamplePacket
 {
   int no;
@@ -492,8 +483,6 @@ struct CloudSamplePacket
 
 static QueueHandle_t cloudQueue = NULL;
 static uint32_t cloudQueuedDropped = 0;
-static unsigned long cloudLastSendOkMs = 0;
-static unsigned long cloudLastSendFailMs = 0;
 
 static char directIslUniqueCode[128] = "";
 static char directIslModumId[64] = "";
@@ -518,7 +507,6 @@ static volatile bool islApiConfigured = false;
 static char islStatusText[128] = "전송: 대기";
 static char islServiceKey[128] = ISL_SERVICE_KEY;
 static char islRuntimeSerialNumber[64] = "";   // 지능형 과학실 모듈/모둠 코드 → API serialNumber로 사용
-static int islCollectPeriod = 1;
 
 
 #ifndef SDMMC_FREQ_PROBING
@@ -591,7 +579,6 @@ static lv_obj_t *fileViewerScreen;
 static lv_obj_t *islScreen;
 static lv_obj_t *bleScreen;
 
-static lv_obj_t *labelHomeTime;
 static lv_obj_t *labelHomeSd;
 static lv_obj_t *labelHomeSensorMode;
 static lv_obj_t *labelHomeSensorStatus;
@@ -600,7 +587,6 @@ static lv_obj_t *labelHomeResetReason;
 static lv_obj_t *labelHomeWifi;
 static lv_obj_t *labelHomeIp;
 static lv_obj_t *labelHomeSignal;
-static lv_obj_t *labelHomePassword;
 
 static lv_obj_t *labelTempBig;
 static lv_obj_t *labelPressureBig;
@@ -616,17 +602,10 @@ static lv_obj_t *labelMeasureBle;
 static lv_obj_t *btnMeasureStart;
 static lv_obj_t *btnMeasureStop;
 static lv_obj_t *labelStatus;
-static lv_obj_t *labelTime;
 static lv_obj_t *labelSd;
 static lv_obj_t *labelCount;
 static lv_obj_t *labelRuntime;
 
-static lv_obj_t *labelTempScaleMax;
-static lv_obj_t *labelTempScaleMid;
-static lv_obj_t *labelTempScaleMin;
-static lv_obj_t *labelPressureScaleMax;
-static lv_obj_t *labelPressureScaleMid;
-static lv_obj_t *labelPressureScaleMin;
 static lv_obj_t *labelGraphStart;
 static lv_obj_t *labelGraphEnd;
 
@@ -687,7 +666,6 @@ static lv_obj_t *labelFileViewerPageInfo;
 #define PLOT_SELECT_ROWS 1
 // Do not rebuild plot checkbox list at every measurement tick.
 // Rebuilding checkboxes causes the checked mark to blink.
-#define PLOT_REFRESH_SELECTION_LIST_DURING_MEASURE 0
 static lv_point_t plotLinePoints[PLOT_DRAW_POINTS - 1][2];
 
 enum PlotVar
@@ -772,7 +750,6 @@ static lv_obj_t *labelSelectedSdFile;
 
 static lv_obj_t *labelHomeDateTime;
 static lv_obj_t *labelDateTime;
-static lv_obj_t *labelBattery;
 static lv_obj_t *labelWifiState;
 static lv_obj_t *labelWifiIp;
 static lv_obj_t *labelWifiSignal;
@@ -873,7 +850,6 @@ void updateIslModuleCodeFromUi();
 void setIslStatusText(const char *text);
 void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa);
 void queueCloudAction(const char *action);
-void queueCloudEvent(const char *eventType, const char *buttonName, const char *screenName);
 void copyCurrentModumIdTo(char *out, size_t outSize);
 void clearCloudQueue();
 bool cloudSendSamplePacket(const CloudSamplePacket &packet);
@@ -904,7 +880,6 @@ void updatePlotSelectionList();
 void resetTable();
 void updateTable();
 
-static void go_plot_event_cb(lv_event_t *e);
 static void go_csv_event_cb(lv_event_t *e);
 static void go_home_event_cb(lv_event_t *e);
 static void go_measure_event_cb(lv_event_t *e);
@@ -1089,23 +1064,16 @@ static void plot_select_invert_event_cb(lv_event_t *e);
 static void plot_select_older_event_cb(lv_event_t *e);
 static void plot_select_newer_event_cb(lv_event_t *e);
 static void plot_sample_toggle_event_cb(lv_event_t *e);
-static void settings_isl_save_event_cb(lv_event_t *e);
-static void settings_isl_start_event_cb(lv_event_t *e);
-static void settings_isl_stop_event_cb(lv_event_t *e);
 static void dashboard_isl_save_event_cb(lv_event_t *e);
 static void dashboard_isl_start_event_cb(lv_event_t *e);
 static void dashboard_isl_stop_event_cb(lv_event_t *e);
 static void dashboard_cloud_realtime_event_cb(lv_event_t *e);
 static void dashboard_cloud_batch_event_cb(lv_event_t *e);
 static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e);
-static void dashboard_csv_filename_save_event_cb(lv_event_t *e);
 static void dashboard_csv_mount_event_cb(lv_event_t *e);
 static void dashboard_csv_toggle_event_cb(lv_event_t *e);
 static void dashboard_csv_preview_event_cb(lv_event_t *e);
 static void csv_save_measurement_data_event_cb(lv_event_t *e);
-static void csv_start_save_event_cb(lv_event_t *e);
-static void csv_stop_save_event_cb(lv_event_t *e);
-static void csv_open_current_file_event_cb(lv_event_t *e);
 static void csv_viewer_prev_event_cb(lv_event_t *e);
 static void csv_viewer_next_event_cb(lv_event_t *e);
 static void sd_file_item_event_cb(lv_event_t *e);
@@ -1192,7 +1160,6 @@ int measurementCount = 0;
 #define CHART_POINTS 220   // 고정 크기: 측정 중 재할당 금지
 #define TABLE_VISIBLE_ROWS 20
 #define CHART_UI_REFRESH_MS 1200UL
-#define PLOT_UI_REFRESH_MS 2500UL
 
 int tablePageOffset = 0;
 
@@ -1210,7 +1177,6 @@ int sampleCount = 0;
 // 측정마다 point_count를 바꾸면 LVGL 내부 버퍼 재할당/메모리 단편화가 생길 수 있다.
 static volatile bool chartUiDirty = true;
 static unsigned long lastChartUiRefreshMs = 0;
-static unsigned long lastPlotUiRefreshMs = 0;
 
 int activeSensorMode = ACTIVE_SENSOR_DEFAULT;
 bool measurementBackupRestored = false;
@@ -1928,14 +1894,6 @@ static void softI2cRecoverBus()
     i2cDelay();
   }
   softI2cStop();
-}
-
-static bool softI2cProbeAddress(uint8_t address)
-{
-  softI2cStart();
-  const bool ack = softI2cWriteByte((address << 1) | 0);
-  softI2cStop();
-  return ack;
 }
 
 static bool softI2cWriteCommand16(uint8_t address, uint16_t command)
@@ -2806,18 +2764,6 @@ static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
   else snprintf(out, outSize, "--.--");
 }
 
-static void formatPrimaryPlaceholderText(char *out, size_t outSize)
-{
-  if (out == NULL || outSize == 0) return;
-
-  if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "CO2: ----ppm");
-  else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "조도: ----.-lux");
-  else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "정밀온도: --.---℃");
-  else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "거리: ----mm");
-  else if (activeSensorMode == SENSOR_MODE_DS18B20) snprintf(out, outSize, "수온: --.--℃");
-  else snprintf(out, outSize, "온도: --.--℃");
-}
-
 // The value label is width-to-content, so the unit has to be re-pinned every
 // time the number changes width.
 static void realignPrimaryUnit()
@@ -3496,12 +3442,12 @@ bool initSdCard()
 
   slot_config.width = SD_USE_1BIT ? 1 : 4;
 
-  slot_config.clk = GPIO_NUM_43;
-  slot_config.cmd = GPIO_NUM_44;
-  slot_config.d0  = GPIO_NUM_39;
-  slot_config.d1  = SD_USE_1BIT ? GPIO_NUM_NC : GPIO_NUM_40;
-  slot_config.d2  = SD_USE_1BIT ? GPIO_NUM_NC : GPIO_NUM_41;
-  slot_config.d3  = SD_USE_1BIT ? GPIO_NUM_NC : GPIO_NUM_42;
+  slot_config.clk = (gpio_num_t)SD_CLK;
+  slot_config.cmd = (gpio_num_t)SD_CMD;
+  slot_config.d0  = (gpio_num_t)SD_D0;
+  slot_config.d1  = SD_USE_1BIT ? GPIO_NUM_NC : (gpio_num_t)SD_D1;
+  slot_config.d2  = SD_USE_1BIT ? GPIO_NUM_NC : (gpio_num_t)SD_D2;
+  slot_config.d3  = SD_USE_1BIT ? GPIO_NUM_NC : (gpio_num_t)SD_D3;
 
   slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
@@ -6157,12 +6103,6 @@ static void go_home_event_cb(lv_event_t *e)
 }
 
 
-static void go_plot_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  setIslStatusText("Plot 기능 제거: 안정성 우선");
-}
-
 static void go_csv_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -6403,7 +6343,6 @@ static void start_event_cb(lv_event_t *e)
       setIslStatusText("일괄전송 중: 시작 무시");
       return;
     }
-    queueCloudEvent("button", "시작", "measure");
     if (!dpsReady)
     {
       if (activeSensorMode == SENSOR_MODE_SCD41)
@@ -6439,8 +6378,8 @@ static void start_event_cb(lv_event_t *e)
     measuring = true;
     wifiAutoRetryEnabled = false;
 
-    // 실시간 모드에서만 Cloud Run start를 보냅니다.
-    // 일괄전송 모드는 보드 내부에만 저장하고, [일괄전송] 버튼을 누를 때 Cloud Run/지능형과학실로 전송합니다.
+    // 실시간 모드에서만 세션 start를 보냅니다.
+    // 일괄전송 모드는 보드에만 쌓아두고 [일괄전송] 버튼을 누를 때 한 번에 보냅니다.
     updateIslModuleCodeFromUi();
     if (!activeSensorSupportsDirectIsl())
     {
@@ -6486,7 +6425,6 @@ static void stop_event_cb(lv_event_t *e)
       setIslStatusText("일괄전송 중: 정지 무시");
       return;
     }
-    queueCloudEvent("button", "정지", "measure");
     if (measureClockRunning)
     {
       measureAccumulatedMs += millis() - measureResumeMs;
@@ -6497,7 +6435,7 @@ static void stop_event_cb(lv_event_t *e)
     wifiAutoRetryEnabled = false;
     lastAutoWifiRetryMs = millis();
 
-    // 실시간 모드에서만 Cloud Run stop을 보냅니다.
+    // 실시간 모드에서만 세션 stop을 보냅니다.
     // 일괄전송 모드는 지능형과학실 세션을 건드리지 않고, [일괄전송] 버튼에서 전송을 시작합니다.
     updateIslModuleCodeFromUi();
     if (!activeSensorSupportsDirectIsl())
@@ -6537,13 +6475,12 @@ static void clear_event_cb(lv_event_t *e)
       setIslStatusText("일괄전송 중: 초기화 무시");
       return;
     }
-    queueCloudEvent("button", "초기화", "measure");
     measuring = false;
     updateIslModuleCodeFromUi();
     if (cloudModumConfigured() && activeSensorSupportsDirectIsl())
     {
       queueCloudAction("stop");
-      setIslStatusText("Cloud: stop 요청");
+      setIslStatusText("전송: stop 요청");
     }
     measurementCount = 0;
     sampleCount = 0;
@@ -6582,29 +6519,6 @@ static void clear_event_cb(lv_event_t *e)
   }
 }
 
-static void sd_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED)
-  {
-    sdReady = initSdCard();
-    if (sdReady)
-    {
-      csvLoggingEnabled = true;
-    }
-    updateSdStatusLabels();
-
-    if (sdReady)
-    {
-       lv_label_set_text(labelStatus, "SD준비");
-    }
-    else
-    {
-      lv_label_set_text(labelStatus, "SD실패");
-    }
-  }
-}
-
-static void go_wifi_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
 static void wifi_scan_event_cb(lv_event_t *e);
 static void wifi_connect_event_cb(lv_event_t *e);
@@ -6613,139 +6527,18 @@ static void wifi_forget_event_cb(lv_event_t *e);
 static void wifi_textarea_event_cb(lv_event_t *e);
 static void wifi_keyboard_event_cb(lv_event_t *e);
 
-static void settings_sd_mount_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  sdReady = initSdCard();
-
-  if (sdReady)
-  {
-    if (labelSettingsNote) lv_label_set_text(labelSettingsNote, "SD 카드가 마운트되었습니다.");
-  }
-  else
-  {
-    if (labelSettingsNote) lv_label_set_text(labelSettingsNote, "SD 카드 마운트 실패. 핀/카드/SDIO 충돌을 확인하세요.");
-  }
-
-  updateSdStatusLabels();
-}
-
-static void settings_sd_unmount_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  csvLoggingEnabled = false;
-  unmountSdCard();
-
-  if (labelSettingsNote) lv_label_set_text(labelSettingsNote, "SD 카드가 해제되었습니다.");
-  updateSdStatusLabels();
-}
-
-static void settings_csv_toggle_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  csvLoggingEnabled = !csvLoggingEnabled;
-  if (!csvLoggingEnabled) closeCsvFile();
-
-  if (csvLoggingEnabled && !sdReady)
-  {
-    sdReady = initSdCard();
-  }
-
-  if (labelSettingsNote)
-  {
-    if (csvLoggingEnabled && sdReady)
-    {
-      lv_label_set_text(labelSettingsNote, "CSV 자동 저장이 켜졌습니다.");
-    }
-    else if (csvLoggingEnabled)
-    {
-      lv_label_set_text(labelSettingsNote, "CSV를 켰지만 SD 카드가 준비되지 않았습니다.");
-    }
-    else
-    {
-      lv_label_set_text(labelSettingsNote, "CSV 자동 저장이 꺼졌습니다.");
-    }
-  }
-
-  updateSdStatusLabels();
-}
-
 static bool cloudModumConfigured()
 {
   return strlen(islRuntimeSerialNumber) > 0;
-}
-
-static void settings_isl_save_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateIslModuleCodeFromUi();
-
-  if (cloudModumConfigured()) setIslStatusText("Cloud: 모둠코드 저장됨");
-  else setIslStatusText("설정: 모둠코드 필요");
-
-  updateIslStatusLabels();
-}
-
-static void settings_isl_start_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateIslModuleCodeFromUi();
-
-  if (!activeSensorSupportsDirectIsl())
-  {
-    clearCloudQueue();
-    setIslStatusText("일괄전송: 현재 센서 ON 미지원");
-  }
-  else if (cloudModumConfigured())
-  {
-    resetDirectIslSessionCache("manual start");
-    clearCloudQueue();
-    queueCloudAction("start");
-  }
-  else
-  {
-    setIslStatusText("설정: 모둠코드 필요");
-  }
-
-  updateIslStatusLabels();
-}
-
-static void settings_isl_stop_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateIslModuleCodeFromUi();
-
-  if (!activeSensorSupportsDirectIsl())
-  {
-    clearCloudQueue();
-    setIslStatusText("현재 센서: 로컬 측정 모드 / ON 전송 미지원");
-  }
-  else if (cloudModumConfigured())
-  {
-    queueCloudAction("stop");
-  }
-  else
-  {
-    setIslStatusText("설정: 모둠코드 필요");
-  }
-
-  updateIslStatusLabels();
 }
 
 static void dashboard_isl_save_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-  queueCloudEvent("button", "모둠코드 저장", "home");
   updateIslModuleCodeFromUi();
 
-  if (cloudModumConfigured()) setIslStatusText("Cloud: 모둠코드 저장됨");
+  if (cloudModumConfigured()) setIslStatusText("전송: 모둠코드 저장됨");
   else setIslStatusText("설정: 모둠코드 필요");
 
   updateIslStatusLabels();
@@ -6808,7 +6601,6 @@ static void dashboard_cloud_realtime_event_cb(lv_event_t *e)
     return;
   }
 
-  queueCloudEvent("button", "실시간", "home");
   updateIslModuleCodeFromUi();
   cloudUploadMode = CLOUD_UPLOAD_REALTIME;
 
@@ -6829,12 +6621,12 @@ static void dashboard_cloud_realtime_event_cb(lv_event_t *e)
     }
     else
     {
-      setIslStatusText("Cloud: 실시간 전환 - 모둠코드 필요");
+      setIslStatusText("전송: 실시간 전환 - 모둠코드 필요");
     }
   }
   else
   {
-    setIslStatusText("Cloud: 실시간 전송 모드");
+    setIslStatusText("전송: 실시간 전송 모드");
   }
 
   updateCloudModeLabel();
@@ -6850,7 +6642,6 @@ static void dashboard_cloud_batch_event_cb(lv_event_t *e)
     return;
   }
 
-  queueCloudEvent("button", "일괄전송", "home");
   updateIslModuleCodeFromUi();
 
   bool wasRealtimeMeasuring = measuring && cloudUploadMode == CLOUD_UPLOAD_REALTIME;
@@ -6861,7 +6652,7 @@ static void dashboard_cloud_batch_event_cb(lv_event_t *e)
     // 핵심 수정:
     // 실시간 구간은 이미 지능형과학실/Google Sheets로 전송된 값이 있으므로
     // 일괄전송 전환 시점 이후의 새 샘플만 일괄전송 대상으로 삼는다.
-    // 여기서 stop을 보내면 Cloud Run 세션이 꼬일 수 있으므로 즉시 stop하지 않는다.
+    // 여기서 stop을 보내면 지능형과학실 세션이 꼬일 수 있으므로 즉시 stop하지 않는다.
     // 최종 stop은 [일괄] 전송 완료 후 한 번만 보낸다.
     batchUploadStartIndex = sampleCount;
     // 실시간 그래프 세션은 즉시 정리하고, 이후부터 보드 내부에만 저장한다.
@@ -7034,31 +6825,6 @@ static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
   updateCloudModeLabel();
   updateIslStatusLabels();
 }
-static void dashboard_csv_filename_save_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-
-  if (sdReady)
-  {
-    // 새 파일명으로 헤더 파일 생성 확인
-    struct stat st;
-    if (stat(csvPath, &st) != 0)
-    {
-      FILE *file = fopen(csvPath, "w");
-      if (file)
-      {
-        fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,raw1,raw2\n");
-        fclose(file);
-      }
-    }
-  }
-
-  updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
-}
-
 static void dashboard_csv_mount_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -7208,50 +6974,6 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e)
     lv_label_set_text(labelHomeCsvPreview, msg);
   }
 }
-
-static void csv_start_save_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-
-  if (!sdReady)
-  {
-    sdReady = initSdCard();
-  }
-
-  if (sdReady)
-  {
-    csvLoggingEnabled = true;
-
-    struct stat st;
-    if (stat(csvPath, &st) != 0)
-    {
-      FILE *file = fopen(csvPath, "w");
-      if (file)
-      {
-        fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,raw1,raw2\n");
-        fclose(file);
-      }
-    }
-  }
-
-  updateSdStatusLabels();
-  updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
-}
-
-static void csv_stop_save_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  csvLoggingEnabled = false;
-  closeCsvFile();
-  updateSdStatusLabels();
-  updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
-}
-
 
 bool endsWithIgnoreCase(const char *text, const char *suffix)
 {
@@ -7541,22 +7263,6 @@ static void sd_file_item_event_cb(lv_event_t *e)
   setSelectedSdTextFile(fileName);
   openSdTextFileByName(sdSelectedTextFile);
 }
-
-static void csv_open_current_file_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  if (strlen(sdSelectedTextFile) > 0)
-  {
-    openSdTextFileByName(sdSelectedTextFile);
-    return;
-  }
-
-  char clean[96];
-  sanitizeBasicFileName(homeCsvFileTa ? lv_textarea_get_text(homeCsvFileTa) : csvFileName, clean, sizeof(clean));
-  openSdTextFileByName(clean);
-}
-
 
 void refreshSdFileList()
 {
@@ -9162,7 +8868,7 @@ void updateIslModuleCodeFromUi()
     if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
   }
 
-  // 서비스키는 Cloud Run 환경변수에서 관리하므로 ESP32에서는 필수가 아닙니다.
+  // 서비스키는 지능형과학실 환경변수에서 관리하므로 ESP32에서는 필수가 아닙니다.
   // 기존 직접 API 테스트용 입력값은 보존합니다.
   if (islServiceKeyTa)
   {
@@ -9181,12 +8887,6 @@ void updateIslModuleCodeFromUi()
 void updateIslStatusLabels()
 {
   updateDashboardIslLabels();
-}
-
-static void go_wifi_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  requestScreenSwitch(settingsScreen);
 }
 
 #if HAS_IDF_WIFI
@@ -10608,48 +10308,6 @@ bool directIslStopProcess(const char *modumId)
 #endif
 }
 
-bool cloudSendEventLogPacket(const CloudSamplePacket &packet)
-{
-#if CLOUD_FUNCTION_ENABLED && CLOUD_BUTTON_LOG_ENABLED
-  if (!wifiConnected) return false;
-
-  String payload = "{";
-  payload += "\"device\":\"ESP32P4\",\"action\":\"event\",";
-  payload += "\"event_type\":\"";
-  payload += jsonEscapeString(packet.eventType);
-  payload += "\",\"button\":\"";
-  payload += jsonEscapeString(packet.buttonName);
-  payload += "\",\"screen\":\"";
-  payload += jsonEscapeString(packet.screenName);
-  payload += "\",\"upload_mode\":\"";
-  payload += jsonEscapeString(packet.uploadMode);
-  payload += "\",\"modumId\":\"";
-  payload += jsonEscapeString(packet.modumId);
-  payload += "\",\"measuring\":";
-  payload += measuring ? "true" : "false";
-  payload += ",\"sampleCount\":";
-  payload += String(packet.sampleCountSnapshot);
-  payload += ",\"measurementCount\":";
-  payload += String(packet.measurementCountSnapshot);
-  payload += ",\"wifi_rssi\":";
-  payload += String(packet.wifiRssi);
-  payload += ",\"cloudQueuedDropped\":";
-  payload += String((unsigned long)cloudQueuedDropped);
-  payload += ",\"collectDate\":\"";
-  payload += getCurrentDateTimeText();
-  payload += "\"}";
-
-  String response;
-  bool ok = httpPostJson(CLOUD_FUNCTION_URL, payload, &response);
-  if (ok) cloudLastSendOkMs = millis();
-  else cloudLastSendFailMs = millis();
-  return ok;
-#else
-  (void)packet;
-  return false;
-#endif
-}
-
 bool cloudSendBatchHistory()
 {
 #if REALTIME_DIRECT_ISL_ENABLED
@@ -10940,128 +10598,23 @@ bool cloudSendBatchHistory()
 #endif
 }
 
+// Routes a queued packet to 지능형 과학실.
+//
+// A 지능형과학실 relay used to sit behind this, forwarding to Google Sheets. It
+// was already unreachable for measurements — every start/stop/data/batch path
+// returned above it once REALTIME_DIRECT_ISL_ENABLED was on — and the only
+// traffic left for it was a button log switched off by a separate flag.
 bool cloudSendSamplePacket(const CloudSamplePacket &packet)
 {
-#if CLOUD_FUNCTION_ENABLED
+#if REALTIME_DIRECT_ISL_ENABLED
   if (!ensureWifiReadyForHttp("전송", 20000)) return false;
 
-  if (strcmp(packet.action, "event") == 0)
-  {
-    return cloudSendEventLogPacket(packet);
-  }
+  if (strcmp(packet.action, "batch") == 0) return cloudSendBatchHistory();
+  if (strcmp(packet.action, "start") == 0) return directIslPrepareSession(packet.modumId);
+  if (strcmp(packet.action, "stop") == 0) return directIslStopProcess(packet.modumId);
+  if (strlen(packet.action) == 0) return directIslSendSamplePacket(packet);
 
-  if (strcmp(packet.action, "batch") == 0)
-  {
-    return cloudSendBatchHistory();
-  }
-
-#if REALTIME_DIRECT_ISL_ENABLED
-  if (strcmp(packet.action, "start") == 0)
-  {
-    return directIslPrepareSession(packet.modumId);
-  }
-
-  if (strcmp(packet.action, "stop") == 0)
-  {
-    return directIslStopProcess(packet.modumId);
-  }
-
-  if (strlen(packet.action) == 0)
-  {
-    return directIslSendSamplePacket(packet);
-  }
-#endif
-
-  String payload;
-
-  // action=start/stop 은 Cloud Run이 모둠코드별 세션을 시작/종료하는 제어 명령입니다.
-  // ESP32-P4가 지능형과학실에 직접 접속하지 않고 Cloud Run으로만 제어합니다.
-  if (strlen(packet.action) > 0)
-  {
-    payload = "{";
-    payload += "\"device\":\"ESP32P4\",";
-    payload += "\"action\":\"";
-    payload += packet.action;
-    payload += "\",";
-    payload += "\"modumId\":\"";
-    payload += packet.modumId;
-    payload += "\"";
-    payload += "}";
-  }
-  else
-  {
-    char tempValue[24];
-    char pressureValue[24];
-    snprintf(tempValue, sizeof(tempValue), "%.4f", packet.tempC);
-
-    payload = "{";
-    payload += "\"device\":\"ESP32P4\",";
-    payload += "\"sensor\":\"";
-    payload += packet.sensorName;
-    payload += "\",";
-    payload += "\"modumId\":\"";
-    payload += packet.modumId;
-    payload += "\",";
-    payload += "\"no\":";
-    payload += String(packet.no);
-    payload += ",";
-    payload += "\"time_s\":";
-    payload += String((unsigned long)packet.timeS);
-    payload += ",";
-    payload += "\"temperature\":";
-    payload += tempValue;
-    payload += ",";
-
-    if (pressureValueValid(packet.pressureHpa))
-    {
-      snprintf(pressureValue, sizeof(pressureValue), "%.4f", packet.pressureHpa);
-      payload += "\"pressure\":";
-      payload += pressureValue;
-      payload += ",";
-    }
-    else
-    {
-      payload += "\"pressure\":null,";
-    }
-
-    payload += "\"unit_temp\":\"C\",";
-    payload += "\"unit_pressure\":\"hPa\",";
-    payload += "\"collectDate\":\"";
-    payload += packet.collectDate;
-    payload += "\"";
-    payload += "}";
-  }
-
-  String response;
-  bool ok = httpPostJson(CLOUD_FUNCTION_URL, payload, &response);
-
-  if (ok)
-  {
-    cloudLastSendOkMs = millis();
-    Serial.print("Cloud Run OK: ");
-    Serial.println(response);
-
-    if (strlen(packet.action) > 0)
-    {
-      char statusLine[128];
-      snprintf(statusLine, sizeof(statusLine), "Cloud: %s OK", packet.action);
-      setIslStatusText(statusLine);
-    }
-    else
-    {
-      setIslStatusText("Cloud: 데이터 전송 OK");
-    }
-  }
-  else
-  {
-    cloudLastSendFailMs = millis();
-    Serial.println("Cloud Run send failed");
-    Serial.print("Cloud payload: ");
-    Serial.println(payload);
-    setIslStatusText("Cloud: 전송 실패");
-  }
-
-  return ok;
+  return true;
 #else
   (void)packet;
   return false;
@@ -11084,7 +10637,7 @@ void copyCurrentModumIdTo(char *out, size_t outSize)
 
 void clearCloudQueue()
 {
-#if CLOUD_FUNCTION_ENABLED
+#if UPLOAD_QUEUE_ENABLED
   if (cloudQueue == NULL) return;
 
   CloudSamplePacket dropped;
@@ -11097,7 +10650,7 @@ void clearCloudQueue()
 
 void sendCloudPacketLatestOnly(const CloudSamplePacket &packet)
 {
-#if CLOUD_FUNCTION_ENABLED
+#if UPLOAD_QUEUE_ENABLED
   if (cloudQueue == NULL) return;
 
   // CLOUD_QUEUE_DEPTH=1 운영 기준: 오래된 패킷은 버리고 최신 패킷만 유지합니다.
@@ -11115,7 +10668,7 @@ void sendCloudPacketLatestOnly(const CloudSamplePacket &packet)
 
 void queueCloudAction(const char *action)
 {
-#if CLOUD_FUNCTION_ENABLED
+#if UPLOAD_QUEUE_ENABLED
   if (cloudQueue == NULL) return;
   if (action == NULL || strlen(action) == 0) return;
 
@@ -11153,33 +10706,9 @@ void queueCloudAction(const char *action)
 }
 
 
-void queueCloudEvent(const char *eventType, const char *buttonName, const char *screenName)
-{
-#if CLOUD_FUNCTION_ENABLED && CLOUD_BUTTON_LOG_ENABLED
-  if (cloudQueue == NULL) return;
-
-  CloudSamplePacket packet = {};
-  strncpy(packet.action, "event", sizeof(packet.action) - 1);
-  if (eventType) strncpy(packet.eventType, eventType, sizeof(packet.eventType) - 1);
-  if (buttonName) strncpy(packet.buttonName, buttonName, sizeof(packet.buttonName) - 1);
-  if (screenName) strncpy(packet.screenName, screenName, sizeof(packet.screenName) - 1);
-  strncpy(packet.uploadMode, cloudUploadMode == CLOUD_UPLOAD_BATCH ? "batch" : "realtime", sizeof(packet.uploadMode) - 1);
-  packet.sampleCountSnapshot = sampleCount;
-  packet.measurementCountSnapshot = measurementCount;
-  packet.wifiRssi = getWifiRssiValue();
-  copyCurrentModumIdTo(packet.modumId, sizeof(packet.modumId));
-
-  sendCloudPacketLatestOnly(packet);
-#else
-  (void)eventType;
-  (void)buttonName;
-  (void)screenName;
-#endif
-}
-
 void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
 {
-#if CLOUD_FUNCTION_ENABLED
+#if UPLOAD_QUEUE_ENABLED
   if (cloudQueue == NULL) return;
 
 
@@ -11202,7 +10731,7 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
     return;
   }
 
-  // Cloud Run은 HTTPS라 매 샘플마다 보내면 TLS 연결 비용이 큽니다.
+  // 지능형과학실은 HTTPS라 매 샘플마다 보내면 TLS 연결 비용이 큽니다.
   // CLOUD_SEND_EVERY_N_SAMPLES=1이면 1초 샘플마다 전송을 시도합니다.
   if (CLOUD_SEND_EVERY_N_SAMPLES > 1 && (no % CLOUD_SEND_EVERY_N_SAMPLES) != 0)
   {
@@ -11222,7 +10751,7 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
 
   if (strlen(packet.modumId) == 0)
   {
-    // 모둠코드가 없으면 Cloud Run 기본값으로 들어가므로 유동 모둠 운영에서는 위험합니다.
+    // 모둠코드가 없으면 지능형과학실 기본값으로 들어가므로 유동 모둠 운영에서는 위험합니다.
     // 의도치 않은 모둠으로 전송하지 않도록 전송을 막습니다.
     setIslStatusText("설정: 모둠코드 필요");
     return;
@@ -11349,7 +10878,6 @@ void wifiApiTask(void *parameter)
   (void)parameter;
 
   unsigned long lastWifiAttempt = 0;
-  unsigned long lastStatusPost = 0;
   bool bleStartAttempted = false;
 
   while (true)
