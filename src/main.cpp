@@ -274,6 +274,9 @@ static bool tmp117LastReadWasWaiting = false;
 // Quadrature state. Written from an interrupt, so volatile.
 static volatile int32_t encoderCount = 0;
 static volatile uint8_t encoderLastState = 0;
+// Counts every edge the ISR sees, including the invalid ones the
+// quadrature table scores as zero, so a bouncing input still shows up.
+static volatile uint32_t encoderEdgeCount = 0;
 static bool encoderReady = false;
 static int32_t encoderPrevCount = 0;
 static unsigned long encoderPrevMs = 0;
@@ -3523,6 +3526,7 @@ static void IRAM_ATTR encoderIsr()
   const uint8_t state = (uint8_t)((digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B));
   encoderCount += kQuadratureStep[(encoderLastState << 2) | state];
   encoderLastState = state;
+  encoderEdgeCount = encoderEdgeCount + 1;
 }
 
 bool encoderBegin()
@@ -3577,7 +3581,135 @@ bool readEncoder(float *angleDeg, float *rateDegPerS)
   }
 
   *rateDegPerS = encoderLastRateDegPerS;
+
+  Serial.printf(
+    "[ENCODER] A=%d B=%d edges=%lu count=%ld angle=%.1f\n",
+    digitalRead(ENCODER_PIN_A), digitalRead(ENCODER_PIN_B),
+    (unsigned long)encoderEdgeCount, (long)count, *angleDeg
+  );
+
   return true;
+}
+
+// Watches both channels for a moment and reports what they did. This is the
+// question worth answering first when the angle stays at zero: pins that never
+// move are a wiring or power fault, pins that move without the edge count
+// rising means the interrupt never attached, and both moving together means
+// the code is fine and only the counts-per-turn is wrong.
+// Pins this board leaves free and that are safe to switch to an input with a
+// pull-up. Deliberately no pin above 20: the ESP32-P4 runs its flash and PSRAM
+// on the high pads, and reconfiguring one of those would take the board down.
+// 2, 3, 7, 8, 14-19, 21-23 and 27 are left out because they are already
+// driving the sensor bus, the touch panel, the radio link or the backlight.
+static const uint8_t kEncoderCandidatePins[] = { 4, 5, 6, 9, 10, 11, 12, 13, 20 };
+
+// Which of the free pins move while the wheel turns. If the encoder is wired
+// somewhere other than GPIO4/5 this finds it, and if nothing moves anywhere
+// then the signal is not reaching the board at all.
+void encoderFindActivePins(char *out, size_t outSize)
+{
+  if (out == NULL || outSize == 0) return;
+
+  const int pinCount = (int)(sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0]));
+  int changes[sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0])] = { 0 };
+  int last[sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0])];
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    pinMode(kEncoderCandidatePins[i], INPUT_PULLUP);
+  }
+
+  delay(2);
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    last[i] = digitalRead(kEncoderCandidatePins[i]);
+  }
+
+  const unsigned long until = millis() + 3000;
+
+  while ((long)(millis() - until) < 0)
+  {
+    for (int i = 0; i < pinCount; i++)
+    {
+      const int now = digitalRead(kEncoderCandidatePins[i]);
+      if (now != last[i]) { changes[i]++; last[i] = now; }
+    }
+
+    delayMicroseconds(100);
+  }
+
+  out[0] = '\0';
+  int moved = 0;
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    Serial.printf("[ENCODER] GPIO%-2d level=%d changes=%d\n",
+                  kEncoderCandidatePins[i], last[i], changes[i]);
+
+    if (changes[i] < 2) continue;
+
+    char entry[32];
+    snprintf(entry, sizeof(entry), "%sGPIO%d(%d회)",
+             moved ? ", " : "", kEncoderCandidatePins[i], changes[i]);
+    strncat(out, entry, outSize - strlen(out) - 1);
+    moved++;
+  }
+
+  if (moved == 0)
+  {
+    snprintf(out, outSize,
+             "움직인 핀 없음 - 배선/3.3V 전원, 그리고 슬릿 원판이 센서 홈을 지나는지 확인");
+  }
+}
+
+void encoderPinReport(char *out, size_t outSize)
+{
+  if (out == NULL || outSize == 0) return;
+
+  const bool wasReady = encoderReady;
+
+  if (!wasReady)
+  {
+    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+  }
+
+  const uint32_t edgesBefore = encoderEdgeCount;
+  const int32_t countBefore = encoderCount;
+
+  int aChanges = 0;
+  int bChanges = 0;
+  int lastA = digitalRead(ENCODER_PIN_A);
+  int lastB = digitalRead(ENCODER_PIN_B);
+
+  // 600 ms is long enough to catch a hand turning the wheel and short enough
+  // not to stall the UI noticeably.
+  const unsigned long until = millis() + 600;
+
+  while ((long)(millis() - until) < 0)
+  {
+    const int a = digitalRead(ENCODER_PIN_A);
+    const int b = digitalRead(ENCODER_PIN_B);
+
+    if (a != lastA) { aChanges++; lastA = a; }
+    if (b != lastB) { bChanges++; lastB = b; }
+
+    delayMicroseconds(200);
+  }
+
+  snprintf(
+    out, outSize,
+    "엔코더 GPIO%d/%d A=%d B=%d 변화 %d/%d 인터럽트 %lu 카운트 %ld",
+    ENCODER_PIN_A, ENCODER_PIN_B, lastA, lastB, aChanges, bChanges,
+    (unsigned long)(encoderEdgeCount - edgesBefore),
+    (long)(encoderCount - countBefore)
+  );
+
+  Serial.print("[ENCODER] ");
+  Serial.println(out);
+
+  if (!wasReady) Serial.println("[ENCODER] not attached yet - select the 회전 tile first");
 }
 
 bool activeSensorBegin()
@@ -11612,11 +11744,24 @@ void loop()
     {
       pendingI2cScan = false;
 
+      // The scan blocks for a few seconds, so say what is happening and get
+      // it on the glass before starting.
+      const char *busyText = "검색 중... 엔코더 바퀴를 계속 돌려 주세요";
+      setIslStatusText(busyText);
+      if (labelSettingsNote) lv_label_set_text(labelSettingsNote, busyText);
+      lv_refr_now(NULL);
+
       char summary[160];
       const int found = scanSensorI2cBus(summary, sizeof(summary));
 
-      char line[200];
-      snprintf(line, sizeof(line), "I2C %d개: %s", found, summary);
+      // The encoder is not on the bus, so an address scan says nothing about
+      // the one sensor whose wiring cannot be confirmed that way. Watch every
+      // free pin instead and report whichever ones the wheel moves.
+      char activePins[160];
+      encoderFindActivePins(activePins, sizeof(activePins));
+
+      char line[420];
+      snprintf(line, sizeof(line), "I2C %d개: %s\n엔코더 신호: %s", found, summary, activePins);
       setIslStatusText(line);
 
       if (labelSettingsNote) lv_label_set_text(labelSettingsNote, line);
