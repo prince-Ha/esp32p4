@@ -159,6 +159,30 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 #define SENSOR_MODE_TSL2591   4
 #define SENSOR_MODE_TMP117    5
 #define SENSOR_MODE_VL53L1X   6
+#define SENSOR_MODE_INA228    7
+
+// =====================================================
+// INA228 전압·전류·전력 (raw Soft-I2C)
+// =====================================================
+#define INA228_ADDR                0x40
+#define INA228_REG_CONFIG          0x00
+#define INA228_REG_ADC_CONFIG      0x01
+#define INA228_REG_SHUNT_CAL       0x02
+#define INA228_REG_VBUS            0x05
+#define INA228_REG_CURRENT         0x07
+#define INA228_REG_POWER           0x08
+#define INA228_REG_MANUFACTURER_ID 0x3E
+#define INA228_MANUFACTURER_TI     0x5449
+
+// The shunt on the breakout board. Adafruit's INA228 carries 0.015 Ω rated to
+// 10 A, which is the common case; a board with a different resistor needs this
+// changed or every current and power reading is scaled wrong.
+#define INA228_SHUNT_OHMS   0.015f
+#define INA228_MAX_CURRENT  10.0f
+
+// Datasheet fixed scalings.
+#define INA228_VBUS_LSB_V   0.0001953125f
+#define INA228_POWER_LSB_K  3.2f
 #define ACTIVE_SENSOR_DEFAULT SENSOR_MODE_DPS310
 
 #define DS18B20_DQ_GPIO GPIO_NUM_2
@@ -224,6 +248,12 @@ static const uint8_t VL53L1X_DEFAULT_CONFIGURATION[] = {
 #define TMP117_LSB_C                0.0078125f
 
 static bool tmp117LastReadWasWaiting = false;
+
+// INA228 measures three things at once; current is the headline and the other
+// two ride along, the way SCD41's temperature and humidity do.
+static bool ina228Ready = false;
+static float ina228LastPowerW = NAN;
+static float ina228CurrentLsb = 0.0f;
 
 // =====================================================
 // Adafruit / Sensirion SCD41 CO2 sensor (Soft-I2C)
@@ -430,6 +460,15 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // SCD41 reports temperature and humidity alongside CO2. 습도 is HMDT in the
 // appendix; temperature reuses the TPR code the server already accepts. They
 // are separate sensor types, so each takes channel 01 (별첨3).
+// 별첨2: 전압 Voltage VOLT, 전류 Electric current ECRT, 전력 Electric power
+// EPOW. Distinct sensor types, so each takes channel 01 (별첨3).
+#define ISL_SENSOR_TYPE_VOLTAGE "VOLT"
+#define ISL_SENSOR_TYPE_CURRENT "ECRT"
+#define ISL_SENSOR_TYPE_POWER   "EPOW"
+#define ISL_UNIT_VOLTAGE "V"
+#define ISL_UNIT_CURRENT "A"
+#define ISL_UNIT_POWER   "W"
+
 #define ISL_SENSOR_TYPE_HUMIDITY "HMDT"
 #define ISL_CHANNEL_HUMIDITY "01"
 #define ISL_UNIT_HUMIDITY "%"
@@ -667,7 +706,7 @@ static lv_obj_t *labelFileViewerPageInfo;
 
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
-#define HOME_SENSOR_TILE_COUNT 6
+#define HOME_SENSOR_TILE_COUNT 7
 // The group code is edited in a modal sheet rather than in place: the keyboard
 // covers the lower third of the screen, so an inline field would either sit
 // under the keyboard or have to displace the sensor grid.
@@ -959,6 +998,13 @@ static void home_sensor_vl53_event_cb(lv_event_t *e)
   pendingSensorMode = SENSOR_MODE_VL53L1X;
 }
 
+static void home_sensor_ina228_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
+  pendingSensorMode = SENSOR_MODE_INA228;
+}
+
 void servicePendingSensorMode()
 {
   int mode = pendingSensorMode;
@@ -1012,6 +1058,7 @@ static void home_sensor_co2_event_cb(lv_event_t *e);
 static void home_sensor_light_event_cb(lv_event_t *e);
 static void home_sensor_tmp117_event_cb(lv_event_t *e);
 static void home_sensor_vl53_event_cb(lv_event_t *e);
+static void home_sensor_ina228_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
 void sanitizeBasicFileName(const char *input, char *out, size_t outSize);
@@ -2567,6 +2614,7 @@ const char *activeSensorName()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "SCD41 CO2";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "TSL2591 조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "TMP117 정밀온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "INA228 전압·전류";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "VL53L1X 거리";
   return "DPS310";
 }
@@ -2577,6 +2625,7 @@ const char *activeMeasurementTitle()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "이산화탄소";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀 온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전압 · 전류";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도 · 기압";
 }
@@ -2587,6 +2636,7 @@ const char *activePrimaryName()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "CO2";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전류";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도";
 }
@@ -2596,6 +2646,7 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "ppm";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "lux";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "A";
   return "℃";
 }
 
@@ -2622,6 +2673,7 @@ const char *islTemperatureNickname()
 {
   if (activeSensorMode == SENSOR_MODE_DS18B20) return "수온센서";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전류센서";
   return "온도센서";
 }
 
@@ -2638,6 +2690,7 @@ const char *sensorDetailText(int mode)
     case SENSOR_MODE_SCD41:   return "SCD41 · 1ppm · 0.1℃ · 0.1%";
     case SENSOR_MODE_TSL2591: return "TSL2591 · 0.1lx";
     case SENSOR_MODE_TMP117:  return "TMP117 · 0.001℃";
+    case SENSOR_MODE_INA228:  return "INA228 · 0.001A · 0.001V · 0.001W";
     case SENSOR_MODE_VL53L1X: return "VL53L1X · 1mm";
     default:                  return "";
   }
@@ -2647,6 +2700,7 @@ const char *sensorDetailText(int mode)
 int activeSensorValueCount()
 {
   if (activeSensorMode == SENSOR_MODE_SCD41) return 3;   // CO2, 온도, 습도
+  if (activeSensorMode == SENSOR_MODE_INA228) return 3;  // 전류, 전압, 전력
   if (activeSensorMode == SENSOR_MODE_DPS310) return 2;  // 온도, 기압
   return 1;
 }
@@ -2668,6 +2722,7 @@ bool activeSensorSupportsDirectIsl()
          activeSensorMode == SENSOR_MODE_TMP117 ||
          activeSensorMode == SENSOR_MODE_TSL2591 ||
          activeSensorMode == SENSOR_MODE_VL53L1X ||
+         activeSensorMode == SENSOR_MODE_INA228 ||
          (SCD41_DIRECT_ISL_ENABLED && activeSensorMode == SENSOR_MODE_SCD41);
 }
 
@@ -2713,6 +2768,11 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
     if (includeName) snprintf(out, outSize, "거리: %.0fmm", value);
     else snprintf(out, outSize, "%.0f", value);
   }
+  else if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    if (includeName) snprintf(out, outSize, "전류: %.3fA", value);
+    else snprintf(out, outSize, "%.3f", value);
+  }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     if (includeName) snprintf(out, outSize, "수온: %.2f℃", value);
@@ -2734,6 +2794,7 @@ static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
   if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "----");
   else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "----.-");
   else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "--.---");
+  else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
   else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "----");
   else snprintf(out, outSize, "--.--");
 }
@@ -2793,6 +2854,14 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
     return;
   }
 
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    if (index == 0) { *caption = "전류"; *unit = "A"; }
+    else if (index == 1) { *caption = "전압"; *unit = "V"; }
+    else if (index == 2) { *caption = "전력"; *unit = "W"; }
+    return;
+  }
+
   if (activeSensorMode == SENSOR_MODE_DPS310)
   {
     if (index == 0) { *caption = "온도"; *unit = "℃"; }
@@ -2818,6 +2887,7 @@ static void measureValuePlaceholder(int index, char *out, size_t outSize)
   }
 
   if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "--.-");
+  else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
   else snprintf(out, outSize, "----.-");
 }
 
@@ -3009,6 +3079,16 @@ static void refreshLatestMeasurementLabels()
     else snprintf(text, sizeof(text), "--.-");
     lv_label_set_text(labelValueNumber[2], text);
   }
+  else if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.3f", pressureHistory[idx]);
+    else snprintf(text, sizeof(text), "-.---");
+    lv_label_set_text(labelValueNumber[1], text);
+
+    if (!isnan(humidityHistory[idx])) snprintf(text, sizeof(text), "%.3f", humidityHistory[idx]);
+    else snprintf(text, sizeof(text), "-.---");
+    lv_label_set_text(labelValueNumber[2], text);
+  }
   else if (activeSensorHasPressure())
   {
     if (pressureValueValid(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
@@ -3195,6 +3275,114 @@ bool readDs18b20(float *temperatureC)
   return true;
 }
 
+// The INA228 has 16-bit configuration registers; the byte-wide helper cannot
+// reach them.
+static bool ina228WriteRegister16(uint8_t reg, uint16_t value)
+{
+  softI2cStart();
+
+  bool ok = softI2cWriteByte(INA228_ADDR << 1);
+  ok = ok && softI2cWriteByte(reg);
+  ok = ok && softI2cWriteByte((uint8_t)(value >> 8));
+  ok = ok && softI2cWriteByte((uint8_t)(value & 0xFF));
+
+  softI2cStop();
+  return ok;
+}
+
+// VBUS, CURRENT and POWER are 24-bit. Returns the raw register contents.
+static bool ina228ReadRegister24(uint8_t reg, uint32_t *out)
+{
+  uint8_t buf[3] = {0, 0, 0};
+  if (!softI2cReadRegisters(INA228_ADDR, reg, buf, 3)) return false;
+
+  *out = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+  return true;
+}
+
+bool ina228Begin()
+{
+  sdaHigh();
+  sclHigh();
+  delay(10);
+  softI2cRecoverBus();
+
+  ina228Ready = false;
+  ina228LastPowerW = NAN;
+
+  uint8_t idBuf[2] = {0, 0};
+  if (!softI2cReadRegisters(INA228_ADDR, INA228_REG_MANUFACTURER_ID, idBuf, 2))
+  {
+    Serial.println("[INA228] no response at 0x40");
+    return false;
+  }
+
+  const uint16_t manufacturer = ((uint16_t)idBuf[0] << 8) | idBuf[1];
+  if (manufacturer != INA228_MANUFACTURER_TI)
+  {
+    Serial.printf("[INA228] unexpected manufacturer id 0x%04X\n", manufacturer);
+    return false;
+  }
+
+  // Reset, then let the part come back up.
+  ina228WriteRegister16(INA228_REG_CONFIG, 0x8000);
+  delay(5);
+
+  // Continuous conversion of bus, shunt and temperature, 1052 µs each,
+  // averaged over 16 samples — steady enough to read once a second.
+  if (!ina228WriteRegister16(INA228_REG_ADC_CONFIG, 0xFB6A))
+  {
+    Serial.println("[INA228] ADC config write failed");
+    return false;
+  }
+
+  // CURRENT_LSB = max current / 2^19, and the calibration register scales the
+  // shunt voltage into that unit.
+  ina228CurrentLsb = INA228_MAX_CURRENT / 524288.0f;
+  const float shuntCal = 13107.2e6f * ina228CurrentLsb * INA228_SHUNT_OHMS;
+  const uint16_t shuntCalReg = (uint16_t)(shuntCal + 0.5f);
+
+  if (!ina228WriteRegister16(INA228_REG_SHUNT_CAL, shuntCalReg))
+  {
+    Serial.println("[INA228] shunt calibration write failed");
+    return false;
+  }
+
+  Serial.printf(
+    "[INA228] ready: shunt %.3f ohm, max %.1f A, cal %u\n",
+    INA228_SHUNT_OHMS, INA228_MAX_CURRENT, (unsigned)shuntCalReg
+  );
+
+  ina228Ready = true;
+  return true;
+}
+
+// Bus voltage in V, current in A, power in W.
+bool readIna228(float *voltageV, float *currentA, float *powerW)
+{
+  if (!ina228Ready || voltageV == NULL || currentA == NULL || powerW == NULL) return false;
+
+  uint32_t rawVbus = 0;
+  uint32_t rawCurrent = 0;
+  uint32_t rawPower = 0;
+
+  if (!ina228ReadRegister24(INA228_REG_VBUS, &rawVbus)) return false;
+  if (!ina228ReadRegister24(INA228_REG_CURRENT, &rawCurrent)) return false;
+  if (!ina228ReadRegister24(INA228_REG_POWER, &rawPower)) return false;
+
+  // VBUS and CURRENT carry their value in the upper 20 bits.
+  *voltageV = (float)(rawVbus >> 4) * INA228_VBUS_LSB_V;
+
+  int32_t current20 = (int32_t)(rawCurrent >> 4);
+  if (current20 & 0x00080000) current20 -= 0x00100000;   // sign-extend from 20 bits
+  *currentA = (float)current20 * ina228CurrentLsb;
+
+  *powerW = (float)rawPower * INA228_POWER_LSB_K * ina228CurrentLsb;
+
+  ina228LastPowerW = *powerW;
+  return true;
+}
+
 bool activeSensorBegin()
 {
   if (activeSensorMode == SENSOR_MODE_DS18B20)
@@ -3223,6 +3411,11 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_VL53L1X)
   {
     return vl53l1xBegin();
+  }
+
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    return ina228Begin();
   }
 
   return dps310Begin();
@@ -3269,6 +3462,15 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
     return true;
   }
 
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    float busVoltage = NAN;
+    float powerW = NAN;
+    if (!readIna228(&busVoltage, primaryValue, &powerW)) return false;
+    *secondaryValue = busVoltage;   // power rides along in ina228LastPowerW
+    return true;
+  }
+
   return readDps310(primaryValue, secondaryValue);
 }
 
@@ -3279,6 +3481,7 @@ void setActiveSensorMode(int mode)
       mode != SENSOR_MODE_SCD41 &&
       mode != SENSOR_MODE_TSL2591 &&
       mode != SENSOR_MODE_TMP117 &&
+      mode != SENSOR_MODE_INA228 &&
       mode != SENSOR_MODE_VL53L1X)
   {
     return;
@@ -3367,6 +3570,10 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_VL53L1X)
   {
     setIslStatusText(dpsReady ? "거리: VL53L1X 준비" : "VL53L1X 인식 실패: 0x29 / 배선 확인");
+  }
+  else if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    setIslStatusText(dpsReady ? "전압·전류·전력: INA228 준비" : "INA228 인식 실패: 0x40 / 배선 확인");
   }
 }
 
@@ -4829,6 +5036,15 @@ void clearChart()
   }
 }
 
+// Sensors that report three quantities keep the third in a global, because
+// readActiveSensor() only returns two.
+static float thirdValueForActiveSensor()
+{
+  if (activeSensorMode == SENSOR_MODE_SCD41) return scd41LastHumidityPct;
+  if (activeSensorMode == SENSOR_MODE_INA228) return ina228LastPowerW;
+  return NAN;
+}
+
 void addSample(uint32_t timeS, float tempC, float pressureHpa)
 {
   String collectText = getCurrentDateTimeText();
@@ -4840,7 +5056,7 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     noHistory[sampleCount] = currentNo;
     tempHistory[sampleCount] = tempC;
     pressureHistory[sampleCount] = pressureHpa;
-    humidityHistory[sampleCount] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
+    humidityHistory[sampleCount] = thirdValueForActiveSensor();
     timeHistory[sampleCount] = timeS;
     sampleEnabled[sampleCount] = true;
     sampleCount++;
@@ -4862,7 +5078,7 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     noHistory[MAX_SAMPLES - 1] = currentNo;
     tempHistory[MAX_SAMPLES - 1] = tempC;
     pressureHistory[MAX_SAMPLES - 1] = pressureHpa;
-    humidityHistory[MAX_SAMPLES - 1] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
+    humidityHistory[MAX_SAMPLES - 1] = thirdValueForActiveSensor();
     timeHistory[MAX_SAMPLES - 1] = timeS;
     sampleEnabled[MAX_SAMPLES - 1] = true;
   }
@@ -6725,13 +6941,16 @@ void createHomeUi()
   // =====================================================
   makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
 
-  // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
-  const int tileW = 316;
+  // Seven tiles on a 4x2 grid. Narrower than the old 3x2 at 231 px, but still
+  // twice the width of a fingertip, and it keeps the grid to two rows so the
+  // group code and 측정 시작 stay where they were.
+  const int tileW = 231;
   const int tileH = 112;
   const int tileGapX = 14;
   const int tileGapY = 14;
   const int tileLeft = 28;
   const int tileTop = 128;
+  const int tileCols = 4;
 
   struct SensorTileSpec
   {
@@ -6743,19 +6962,20 @@ void createHomeUi()
 
   // Named by the quantity measured, not the part number: a student reads
   // "이산화탄소", not "SCD41".
-  const SensorTileSpec tiles[6] = {
+  const SensorTileSpec tiles[HOME_SENSOR_TILE_COUNT] = {
     { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
     { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
     { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
     { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
     { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
-    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb }
+    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb },
+    { "전압 · 전류", "V · A · W", SENSOR_MODE_INA228, home_sensor_ina228_event_cb }
   };
 
   for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
   {
-    const int col = i % 3;
-    const int row = i / 3;
+    const int col = i % tileCols;
+    const int row = i / tileCols;
 
     homeSensorTileModes[i] = tiles[i].mode;
     homeSensorTiles[i] = makeSensorTile(
@@ -9185,6 +9405,45 @@ bool directIslSendSensorTypeIfNeeded()
   }
 
   // =====================================================
+  // INA228: three quantities from one reading, like SCD41.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":3,\"items\":[";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\"}";
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_INA228", 2, 700))
+    {
+      setIslStatusText("전압·전류 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+      setIslStatusText("전압·전류 센서등록 OK: VOLT/ECRT/EPOW");
+      return true;
+    }
+
+    Serial.print("INA228 sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("전압·전류 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
   // VL53L1X 거리: try the appendix code, then plausible alternatives.
   // =====================================================
   if (activeSensorMode == SENSOR_MODE_VL53L1X)
@@ -9413,6 +9672,36 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+    }
+    else if (activeSensorMode == SENSOR_MODE_INA228)
+    {
+      payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+      payload += primaryValue;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"" ISL_UNIT_CURRENT "\"}";
+
+      if (!isnan(packet.pressureHpa))
+      {
+        char busV[24];
+        snprintf(busV, sizeof(busV), "%.4f", packet.pressureHpa);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += busV;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_VOLTAGE "\"}";
+      }
+
+      if (!isnan(packet.humidityPct))
+      {
+        char watts[24];
+        snprintf(watts, sizeof(watts), "%.4f", packet.humidityPct);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += watts;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_POWER "\"}";
+      }
     }
     else if (activeSensorMode == SENSOR_MODE_VL53L1X)
     {
@@ -9711,6 +10000,36 @@ bool cloudSendBatchHistory()
         payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+      }
+      else if (activeSensorMode == SENSOR_MODE_INA228)
+      {
+        payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += tempValue;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_CURRENT "\"}";
+
+        if (!isnan(pressureHistory[i]))
+        {
+          char busV[24];
+          snprintf(busV, sizeof(busV), "%.4f", pressureHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += busV;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_VOLTAGE "\"}";
+        }
+
+        if (!isnan(humidityHistory[i]))
+        {
+          char watts[24];
+          snprintf(watts, sizeof(watts), "%.4f", humidityHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += watts;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_POWER "\"}";
+        }
       }
       else if (activeSensorMode == SENSOR_MODE_VL53L1X)
       {
