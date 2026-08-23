@@ -574,7 +574,6 @@ void activateScreenNow(lv_obj_t *screen);
 static lv_obj_t *homeScreen;
 static lv_obj_t *measureScreen;
 static lv_obj_t *settingsScreen;
-static lv_obj_t *plotScreen;
 static lv_obj_t *csvScreen;
 static lv_obj_t *fileViewerScreen;
 static lv_obj_t *islScreen;
@@ -625,16 +624,8 @@ static lv_obj_t *labelCsvRowRange;
 static char sdLastError[64] = "";
 
 // =====================================================
-// Plot screen objects
+// Bluetooth, ISL and file viewer screen objects
 // =====================================================
-static lv_obj_t *plotChartArea;
-static lv_obj_t *labelPlotTitle;
-static lv_obj_t *labelPlotInfo;
-static lv_obj_t *labelPlotXRange;
-static lv_obj_t *labelPlotYRange;
-static lv_obj_t *labelBarPlotTime;
-static lv_obj_t *labelBarPlotWifi;
-static lv_obj_t *labelBarPlotSd;
 static lv_obj_t *bleList;
 static lv_obj_t *labelBleState;
 static lv_obj_t *labelBarBleTime;
@@ -661,59 +652,6 @@ static lv_obj_t *labelFileViewerTitle;
 static lv_obj_t *fileViewerTextArea;
 static lv_obj_t *labelFileViewerPageInfo;
 
-// Points the plot can draw. lv_line keeps a pointer to the array rather than
-// copying it, so this has to stay alive for as long as the line is on screen.
-#define PLOT_DRAW_POINTS 240
-#define PLOT_SCATTER_MAX 120
-// Do not rebuild plot checkbox list at every measurement tick.
-// Rebuilding checkboxes causes the checked mark to blink.
-static lv_point_t plotPoints[PLOT_DRAW_POINTS];
-
-enum PlotVar
-{
-  PLOT_VAR_TIME,
-  PLOT_VAR_TEMP,
-  PLOT_VAR_PRESSURE
-};
-
-enum PlotKind
-{
-  PLOT_KIND_LINE,
-  PLOT_KIND_SCATTER
-};
-
-PlotVar plotXVar = PLOT_VAR_TIME;
-PlotVar plotYVar = PLOT_VAR_TEMP;
-PlotKind plotKind = PLOT_KIND_LINE;
-
-enum PlotAggregateMode
-{
-  PLOT_AGG_RAW,
-  PLOT_AGG_5S,
-  PLOT_AGG_10S,
-  PLOT_AGG_30S,
-  PLOT_AGG_60S
-};
-
-PlotAggregateMode plotAggregateMode = PLOT_AGG_RAW;
-int plotSelectOffset = 0;
-
-enum PlotRangeMode
-{
-  PLOT_RANGE_ALL,
-  PLOT_RANGE_LAST_20,
-  PLOT_RANGE_LAST_60,
-  PLOT_RANGE_LAST_120
-};
-
-PlotRangeMode plotRangeMode = PLOT_RANGE_LAST_60;
-int plotRangeOffset = 0;
-
-// Plot time filter checkboxes
-bool plotFilterTime0_30 = true;
-bool plotFilterTime30_60 = true;
-bool plotFilterTime60_120 = true;
-bool plotFilterTime120Plus = true;
 
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
@@ -734,7 +672,6 @@ static lv_obj_t *wifiKeyboard;
 static lv_obj_t *wifiList;
 static lv_obj_t *homeKeyboard;
 static lv_obj_t *csvKeyboard;
-static lv_obj_t *plotKeyboard;
 static lv_obj_t *islKeyboard;
 static lv_obj_t *labelUiCopyStatus;
 static char uiCopiedText[256] = "";
@@ -870,18 +807,15 @@ bool c6WifiConnectBackground(const char *ssid, const char *password);
 static bool cloudModumConfigured();
 
 
-void createPlotUi();
 void createCsvUi();
 void createFileViewerUi();
 void createIslUi();
 void createBleUi();
 void refreshBleScreen();
-void updatePlotChart();
 void resetTable();
 void updateTable();
 
 static void go_csv_event_cb(lv_event_t *e);
-static void go_plot_event_cb(lv_event_t *e);
 static void go_home_event_cb(lv_event_t *e);
 static void go_measure_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
@@ -1040,24 +974,6 @@ static void board_restart_event_cb(lv_event_t *e)
   esp_restart();
 }
 
-static void plot_line_event_cb(lv_event_t *e);
-static void plot_scatter_event_cb(lv_event_t *e);
-static void plot_x_time_event_cb(lv_event_t *e);
-static void plot_x_temp_event_cb(lv_event_t *e);
-static void plot_x_pressure_event_cb(lv_event_t *e);
-static void plot_y_temp_event_cb(lv_event_t *e);
-static void plot_y_pressure_event_cb(lv_event_t *e);
-static void plot_range_all_event_cb(lv_event_t *e);
-static void plot_range_20_event_cb(lv_event_t *e);
-static void plot_range_60_event_cb(lv_event_t *e);
-static void plot_range_120_event_cb(lv_event_t *e);
-static void plot_range_older_event_cb(lv_event_t *e);
-static void plot_range_newer_event_cb(lv_event_t *e);
-static void plot_agg_raw_event_cb(lv_event_t *e);
-static void plot_agg_5s_event_cb(lv_event_t *e);
-static void plot_agg_10s_event_cb(lv_event_t *e);
-static void plot_agg_30s_event_cb(lv_event_t *e);
-static void plot_agg_60s_event_cb(lv_event_t *e);
 static void dashboard_isl_save_event_cb(lv_event_t *e);
 static void dashboard_isl_start_event_cb(lv_event_t *e);
 static void dashboard_isl_stop_event_cb(lv_event_t *e);
@@ -3997,14 +3913,13 @@ lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
 // them in the Hangul face, so each tab reads without relying on the glyph.
 void createTabBar(lv_obj_t *parent, int activeIndex)
 {
-  static const char *tabIcons[5] = {
-    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_IMAGE, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
+  static const char *tabIcons[4] = {
+    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
   };
-  static const char *tabNames[5] = { "홈", "측정", "그래프", "기록", "설정" };
+  static const char *tabNames[4] = { "홈", "측정", "기록", "설정" };
 
-  lv_event_cb_t tabCallbacks[5] = {
-    go_home_event_cb, go_measure_event_cb, go_plot_event_cb,
-    go_csv_event_cb, go_settings_event_cb
+  lv_event_cb_t tabCallbacks[4] = {
+    go_home_event_cb, go_measure_event_cb, go_csv_event_cb, go_settings_event_cb
   };
 
   lv_obj_t *bar = lv_obj_create(parent);
@@ -4028,9 +3943,9 @@ void createTabBar(lv_obj_t *parent, int activeIndex)
   lv_obj_set_style_radius(hairline, 0, 0);
   lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
 
-  const int tabWidth = LCD_H_RES / 5;
+  const int tabWidth = LCD_H_RES / 4;
 
-  for (int i = 0; i < 5; i++)
+  for (int i = 0; i < 4; i++)
   {
     const bool active = (i == activeIndex);
     const uint32_t tint = active ? UI_ACCENT : UI_TEXT_3;
@@ -4121,32 +4036,6 @@ lv_obj_t *makeArrowButton(lv_obj_t *parent, const char *text, int x, int y, int 
   return btn;
 }
 
-lv_obj_t *makePlotSelectButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb)
-{
-  lv_obj_t *btn = lv_btn_create(parent);
-  lv_obj_set_size(btn, w, h);
-  lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
-
-  lv_obj_set_style_radius(btn, 9, 0);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0xEFF6FF), 0);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0xDBEAFE), LV_STATE_PRESSED);
-  lv_obj_set_style_border_width(btn, 1, 0);
-  lv_obj_set_style_border_color(btn, lv_color_hex(0xBFDBFE), 0);
-  lv_obj_set_style_shadow_width(btn, 0, 0);
-  lv_obj_set_style_pad_all(btn, 0, 0);
-  lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
-
-  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t *label = lv_label_create(btn);
-  lv_label_set_text(label, text);
-  lv_obj_set_style_text_font(label, FONT_TABLE, 0);
-  lv_obj_set_style_text_color(label, lv_color_hex(0x1D4ED8), 0);
-  lv_obj_center(label);
-
-  return btn;
-}
-
 void createStatusBar(
   lv_obj_t *parent,
   const char *title,
@@ -4222,7 +4111,6 @@ void updateStatusBars()
   if (labelBarIslTime) lv_label_set_text(labelBarIslTime, shortTime.c_str());
   if (labelBarCsvTime) lv_label_set_text(labelBarCsvTime, shortTime.c_str());
   if (labelBarFileViewerTime) lv_label_set_text(labelBarFileViewerTime, shortTime.c_str());
-  if (labelBarPlotTime) lv_label_set_text(labelBarPlotTime, shortTime.c_str());
 
   setStatusIconState(labelBarHomeWifi, wifiConnected);
   setStatusIconState(labelBarMeasureWifi, wifiConnected);
@@ -4230,7 +4118,6 @@ void updateStatusBars()
   setStatusIconState(labelBarIslWifi, wifiConnected);
   setStatusIconState(labelBarCsvWifi, wifiConnected);
   setStatusIconState(labelBarFileViewerWifi, wifiConnected);
-  setStatusIconState(labelBarPlotWifi, wifiConnected);
 
   const bool sdActive = sdReady && csvLoggingEnabled;
   setStatusIconState(labelBarHomeSd, sdActive);
@@ -4239,7 +4126,6 @@ void updateStatusBars()
   setStatusIconState(labelBarIslSd, sdActive);
   setStatusIconState(labelBarCsvSd, sdActive);
   setStatusIconState(labelBarFileViewerSd, sdActive);
-  setStatusIconState(labelBarPlotSd, sdActive);
 }
 
 lv_obj_t *makeInfoLabel(lv_obj_t *parent, const char *text, int w)
@@ -4563,11 +4449,7 @@ static void dashboard_textarea_event_cb(lv_event_t *e)
 
   lv_obj_t *keyboard = NULL;
 
-  if (lv_scr_act() == plotScreen)
-  {
-    keyboard = plotKeyboard;
-  }
-  else if (lv_scr_act() == islScreen)
+  if (lv_scr_act() == islScreen)
   {
     keyboard = islKeyboard;
   }
@@ -5352,73 +5234,6 @@ void updateChartAutoScale()
 }
 
 
-float getPlotValue(PlotVar var, int idx)
-{
-  if (var == PLOT_VAR_TIME) return (float)timeHistory[idx];
-  if (var == PLOT_VAR_TEMP) return tempHistory[idx];
-  if (!pressureValueValid(pressureHistory[idx])) return 0.0f;
-  return pressureHistory[idx];
-}
-
-const char *getPlotVarName(PlotVar var)
-{
-  if (var == PLOT_VAR_TIME) return "시간";
-  if (var == PLOT_VAR_TEMP) return activePrimaryName();
-  if (activeSensorHasPressure()) return activeSecondaryName();
-  return "값2";
-}
-
-const char *getPlotRangeName()
-{
-  if (plotRangeMode == PLOT_RANGE_ALL) return "전체";
-  if (plotRangeMode == PLOT_RANGE_LAST_20) return "20개";
-  if (plotRangeMode == PLOT_RANGE_LAST_60) return "60개";
-  return "120개";
-}
-
-int getPlotRangeCount()
-{
-  if (plotRangeMode == PLOT_RANGE_ALL) return 0;
-  if (plotRangeMode == PLOT_RANGE_LAST_20) return 20;
-  if (plotRangeMode == PLOT_RANGE_LAST_60) return 60;
-  return 120;
-}
-
-uint32_t getPlotColorForY()
-{
-  if (plotYVar == PLOT_VAR_TEMP) return 0x0EA5E9;
-  return 0xF97316;
-}
-
-void formatPlotTick(PlotVar var, float value, char *buf, size_t len)
-{
-  if (var == PLOT_VAR_TIME)
-  {
-    snprintf(buf, len, "%lu", (unsigned long)(value + 0.5f));
-  }
-  else if (var == PLOT_VAR_TEMP)
-  {
-    snprintf(buf, len, "%.1f", value);
-  }
-  else
-  {
-    snprintf(buf, len, "%.1f", value);
-  }
-}
-
-void makePlotRect(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color)
-{
-  lv_obj_t *rect = lv_obj_create(parent);
-  lv_obj_set_size(rect, w, h);
-  lv_obj_align(rect, LV_ALIGN_TOP_LEFT, x, y);
-  lv_obj_set_style_bg_color(rect, lv_color_hex(color), 0);
-  lv_obj_set_style_bg_opa(rect, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(rect, 0, 0);
-  lv_obj_set_style_radius(rect, 0, 0);
-  lv_obj_set_style_pad_all(rect, 0, 0);
-  lv_obj_clear_flag(rect, LV_OBJ_FLAG_SCROLLABLE);
-}
-
 void makePlotTickLabel(lv_obj_t *parent, const char *text, int x, int y, int w, lv_text_align_t align)
 {
   lv_obj_t *label = lv_label_create(parent);
@@ -5437,366 +5252,6 @@ bool isPlotSampleEnabled(int idx)
   if (idx < 0 || idx >= sampleCount) return false;
   return sampleEnabled[idx];
 }
-
-int countEnabledPlotSamples(int startIdx, int endExclusive)
-{
-  int count = 0;
-
-  for (int i = startIdx; i < endExclusive; i++)
-  {
-    if (isPlotSampleEnabled(i)) count++;
-  }
-
-  return count;
-}
-
-int findNthEnabledPlotIndex(int startIdx, int endExclusive, int nth)
-{
-  int seen = 0;
-
-  for (int i = startIdx; i < endExclusive; i++)
-  {
-    if (!isPlotSampleEnabled(i)) continue;
-
-    if (seen == nth) return i;
-    seen++;
-  }
-
-  return startIdx;
-}
-
-int getPlotAggregateSeconds()
-{
-  if (plotAggregateMode == PLOT_AGG_5S) return 5;
-  if (plotAggregateMode == PLOT_AGG_10S) return 10;
-  if (plotAggregateMode == PLOT_AGG_30S) return 30;
-  if (plotAggregateMode == PLOT_AGG_60S) return 60;
-  return 0;
-}
-
-const char *getPlotAggregateName()
-{
-  if (plotAggregateMode == PLOT_AGG_5S) return "5초 평균";
-  if (plotAggregateMode == PLOT_AGG_10S) return "10초 평균";
-  if (plotAggregateMode == PLOT_AGG_30S) return "30초 평균";
-  if (plotAggregateMode == PLOT_AGG_60S) return "1분 평균";
-  return "Raw";
-}
-
-void getPlotWindow(int *startIdx, int *endExclusive)
-{
-  if (sampleCount <= 0)
-  {
-    *startIdx = 0;
-    *endExclusive = 0;
-    return;
-  }
-
-  int requestedCount = getPlotRangeCount();
-  int windowCount = sampleCount;
-
-  if (requestedCount > 0 && requestedCount < sampleCount)
-  {
-    windowCount = requestedCount;
-  }
-
-  int maxOffset = sampleCount - windowCount;
-  if (maxOffset < 0) maxOffset = 0;
-
-  if (plotRangeOffset > maxOffset) plotRangeOffset = maxOffset;
-  if (plotRangeOffset < 0) plotRangeOffset = 0;
-
-  int end = sampleCount - plotRangeOffset;
-  if (end > sampleCount) end = sampleCount;
-  if (end < 0) end = 0;
-
-  int start = end - windowCount;
-  if (start < 0) start = 0;
-
-  *startIdx = start;
-  *endExclusive = end;
-}
-
-
-static void makePlotDot(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, int size, uint32_t color)
-{
-  lv_obj_t *dot = lv_obj_create(parent);
-  lv_obj_set_size(dot, size, size);
-  lv_obj_align(dot, LV_ALIGN_TOP_LEFT, x - size / 2, y - size / 2);
-  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(dot, lv_color_hex(color), 0);
-  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(dot, 0, 0);
-  lv_obj_set_style_shadow_width(dot, 0, 0);
-  lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
-}
-
-void updatePlotChart()
-{
-  if (plotChartArea == NULL) return;
-
-  lv_obj_clean(plotChartArea);
-
-  const int areaW = 620;
-  const int areaH = 310;
-  const int leftPad = 62;
-  const int rightPad = 16;
-  const int topPad = 12;
-  const int bottomPad = 38;
-  const int plotX0 = leftPad;
-  const int plotY0 = topPad;
-  const int plotW = areaW - leftPad - rightPad;
-  const int plotH = areaH - topPad - bottomPad;
-
-  for (int i = 0; i <= 5; i++)
-  {
-    int x = plotX0 + (plotW * i) / 5;
-    int y = plotY0 + (plotH * i) / 5;
-    makePlotRect(plotChartArea, x, plotY0, 1, plotH, 0xE5E7EB);
-    makePlotRect(plotChartArea, plotX0, y, plotW, 1, 0xE5E7EB);
-  }
-
-  makePlotRect(plotChartArea, plotX0, plotY0, 2, plotH, 0x64748B);
-  makePlotRect(plotChartArea, plotX0, plotY0 + plotH - 2, plotW, 2, 0x64748B);
-
-  if (sampleCount <= 0)
-  {
-    if (labelPlotTitle) lv_label_set_text(labelPlotTitle, "Plot: 데이터 없음");
-    if (labelPlotInfo) lv_label_set_text(labelPlotInfo, "측정 데이터를 먼저 수집하세요.");
-    if (labelPlotXRange) lv_label_set_text(labelPlotXRange, "X: --");
-    if (labelPlotYRange) lv_label_set_text(labelPlotYRange, "Y: --");
-    return;
-  }
-
-  int startIdx = 0;
-  int endExclusive = 0;
-  getPlotWindow(&startIdx, &endExclusive);
-
-  int enabledCount = countEnabledPlotSamples(startIdx, endExclusive);
-
-  if (enabledCount <= 0)
-  {
-    if (labelPlotTitle) lv_label_set_text(labelPlotTitle, "Plot: 선택 데이터 없음");
-    if (labelPlotInfo) lv_label_set_text(labelPlotInfo, "오른쪽 목록에서 표시할 데이터를 체크하세요.");
-    if (labelPlotXRange) lv_label_set_text(labelPlotXRange, "X: --");
-    if (labelPlotYRange) lv_label_set_text(labelPlotYRange, "Y: --");
-    return;
-  }
-
-  // Static: 240 floats each would put nearly 2 kB on the UI task stack, and
-  // this is only ever called from the one task that draws.
-  static float xValues[PLOT_DRAW_POINTS];
-  static float yValues[PLOT_DRAW_POINTS];
-  int drawCount = 0;
-  int aggregateSeconds = getPlotAggregateSeconds();
-
-  if (aggregateSeconds <= 0)
-  {
-    drawCount = enabledCount;
-    if (drawCount > PLOT_DRAW_POINTS) drawCount = PLOT_DRAW_POINTS;
-
-    for (int i = 0; i < drawCount; i++)
-    {
-      int selectedOrdinal;
-
-      if (drawCount <= 1)
-      {
-        selectedOrdinal = 0;
-      }
-      else
-      {
-        selectedOrdinal = ((long)i * (enabledCount - 1)) / (drawCount - 1);
-      }
-
-      int idx = findNthEnabledPlotIndex(startIdx, endExclusive, selectedOrdinal);
-      xValues[i] = getPlotValue(plotXVar, idx);
-      yValues[i] = getPlotValue(plotYVar, idx);
-    }
-  }
-  else
-  {
-    int currentBin = -1;
-    float sumX = 0.0f;
-    float sumY = 0.0f;
-    int binCount = 0;
-
-    for (int idx = startIdx; idx < endExclusive; idx++)
-    {
-      if (!isPlotSampleEnabled(idx)) continue;
-
-      int bin = (int)(timeHistory[idx] / aggregateSeconds);
-
-      if (currentBin < 0)
-      {
-        currentBin = bin;
-      }
-
-      if (bin != currentBin)
-      {
-        if (binCount > 0 && drawCount < PLOT_DRAW_POINTS)
-        {
-          xValues[drawCount] = sumX / binCount;
-          yValues[drawCount] = sumY / binCount;
-          drawCount++;
-        }
-
-        currentBin = bin;
-        sumX = 0.0f;
-        sumY = 0.0f;
-        binCount = 0;
-      }
-
-      sumX += getPlotValue(plotXVar, idx);
-      sumY += getPlotValue(plotYVar, idx);
-      binCount++;
-    }
-
-    if (binCount > 0 && drawCount < PLOT_DRAW_POINTS)
-    {
-      xValues[drawCount] = sumX / binCount;
-      yValues[drawCount] = sumY / binCount;
-      drawCount++;
-    }
-  }
-
-  if (drawCount <= 0)
-  {
-    if (labelPlotTitle) lv_label_set_text(labelPlotTitle, "Plot: 집계 데이터 없음");
-    if (labelPlotInfo) lv_label_set_text(labelPlotInfo, "집계 간격을 줄이거나 데이터를 더 수집하세요.");
-    return;
-  }
-
-  float xMin = xValues[0];
-  float xMax = xValues[0];
-  float yMin = yValues[0];
-  float yMax = yValues[0];
-
-  for (int i = 0; i < drawCount; i++)
-  {
-    if (xValues[i] < xMin) xMin = xValues[i];
-    if (xValues[i] > xMax) xMax = xValues[i];
-    if (yValues[i] < yMin) yMin = yValues[i];
-    if (yValues[i] > yMax) yMax = yValues[i];
-  }
-
-  if (xMax - xMin < 0.5f)
-  {
-    xMax += 0.25f;
-    xMin -= 0.25f;
-  }
-
-  if (yMax - yMin < 0.5f)
-  {
-    yMax += 0.25f;
-    yMin -= 0.25f;
-  }
-
-  char tickText[32];
-
-  for (int i = 0; i <= 5; i++)
-  {
-    float xv = xMin + (xMax - xMin) * i / 5.0f;
-    int x = plotX0 + (plotW * i) / 5;
-    formatPlotTick(plotXVar, xv, tickText, sizeof(tickText));
-    makePlotRect(plotChartArea, x, plotY0 + plotH - 5, 1, 9, 0x64748B);
-    makePlotTickLabel(plotChartArea, tickText, x - 34, plotY0 + plotH + 8, 68, LV_TEXT_ALIGN_CENTER);
-  }
-
-  for (int i = 0; i <= 5; i++)
-  {
-    float yv = yMin + (yMax - yMin) * i / 5.0f;
-    int y = plotY0 + plotH - (plotH * i) / 5;
-    formatPlotTick(plotYVar, yv, tickText, sizeof(tickText));
-    makePlotRect(plotChartArea, plotX0 - 5, y, 9, 1, 0x64748B);
-    makePlotTickLabel(plotChartArea, tickText, 2, y - 8, 55, LV_TEXT_ALIGN_RIGHT);
-  }
-
-  char title[80];
-  snprintf(
-    title,
-    sizeof(title),
-    "%s: %s-%s",
-    plotKind == PLOT_KIND_LINE ? "Line" : "Scatter",
-    getPlotVarName(plotXVar),
-    getPlotVarName(plotYVar)
-  );
-  if (labelPlotTitle) lv_label_set_text(labelPlotTitle, title);
-
-  char info[120];
-  snprintf(
-    info,
-    sizeof(info),
-    "%s / 원자료 %d개 선택 / 표시 %d점",
-    getPlotAggregateName(),
-    enabledCount,
-    drawCount
-  );
-  if (labelPlotInfo) lv_label_set_text(labelPlotInfo, info);
-
-  char rangeText[96];
-  snprintf(rangeText, sizeof(rangeText), "X %s: %.2f ~ %.2f", getPlotVarName(plotXVar), xMin, xMax);
-  if (labelPlotXRange) lv_label_set_text(labelPlotXRange, rangeText);
-
-  snprintf(rangeText, sizeof(rangeText), "Y %s: %.2f ~ %.2f", getPlotVarName(plotYVar), yMin, yMax);
-  if (labelPlotYRange) lv_label_set_text(labelPlotYRange, rangeText);
-
-  const uint32_t seriesColor = getPlotColorForY();
-
-  if (drawCount > PLOT_DRAW_POINTS) drawCount = PLOT_DRAW_POINTS;
-
-  // Project every sample into the plot area once.
-  for (int i = 0; i < drawCount; i++)
-  {
-    int px = plotX0 + (int)((xValues[i] - xMin) * (plotW - 1) / (xMax - xMin));
-    int py = plotY0 + plotH - 1 - (int)((yValues[i] - yMin) * (plotH - 1) / (yMax - yMin));
-
-    if (px < plotX0) px = plotX0;
-    if (px >= plotX0 + plotW) px = plotX0 + plotW - 1;
-    if (py < plotY0) py = plotY0;
-    if (py >= plotY0 + plotH) py = plotY0 + plotH - 1;
-
-    plotPoints[i].x = (lv_coord_t)px;
-    plotPoints[i].y = (lv_coord_t)py;
-  }
-
-  if (plotKind == PLOT_KIND_LINE)
-  {
-    // One polyline, not one object per segment. The old drawing built a line
-    // and a dot for every point — around 440 LVGL objects created and
-    // destroyed on each refresh — which churns the same heap a TLS handshake
-    // needs a contiguous block from.
-    if (drawCount >= 2)
-    {
-      lv_obj_t *line = lv_line_create(plotChartArea);
-      lv_line_set_points(line, plotPoints, drawCount);
-      lv_obj_set_style_line_width(line, 2, 0);
-      lv_obj_set_style_line_color(line, lv_color_hex(seriesColor), 0);
-      lv_obj_set_style_line_opa(line, LV_OPA_COVER, 0);
-      lv_obj_set_style_line_rounded(line, true, 0);
-      lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-    }
-
-    // A single reading has no line to draw, so mark it.
-    if (drawCount == 1) makePlotDot(plotChartArea, plotPoints[0].x, plotPoints[0].y, 5, seriesColor);
-
-    // The most recent point, so "now" is findable without counting along.
-    if (drawCount >= 2)
-    {
-      makePlotDot(plotChartArea, plotPoints[drawCount - 1].x, plotPoints[drawCount - 1].y, 7, seriesColor);
-    }
-  }
-  else
-  {
-    // Scatter needs a mark per point, so cap how many get drawn.
-    const int step = (drawCount + PLOT_SCATTER_MAX - 1) / PLOT_SCATTER_MAX;
-
-    for (int i = 0; i < drawCount; i += (step > 0 ? step : 1))
-    {
-      makePlotDot(plotChartArea, plotPoints[i].x, plotPoints[i].y, 7, seriesColor);
-    }
-  }
-}
-
 
 // =====================================================
 // Screen transition helper
@@ -5817,11 +5272,6 @@ void hideAllFloatingUi()
   {
     lv_keyboard_set_textarea(csvKeyboard, NULL);
     lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-  }
-  if (plotKeyboard)
-  {
-    lv_keyboard_set_textarea(plotKeyboard, NULL);
-    lv_obj_add_flag(plotKeyboard, LV_OBJ_FLAG_HIDDEN);
   }
   if (islKeyboard)
   {
@@ -5860,7 +5310,6 @@ static lv_obj_t *currentLoadedScreen = NULL;
 // when switching between pre-created LVGL screens.
 static lv_obj_t *homeScreenBase = NULL;
 static lv_obj_t *measureScreenBase = NULL;
-static lv_obj_t *plotScreenBase = NULL;
 static lv_obj_t *csvScreenBase = NULL;
 static lv_obj_t *settingsScreenBase = NULL;
 static lv_obj_t *fileViewerScreenBase = NULL;
@@ -5875,7 +5324,6 @@ uint32_t screenBgColor(lv_obj_t *screen)
   // converted.
   if (screen == homeScreen) return UI_BG;
   if (screen == measureScreen) return UI_BG;
-  if (screen == plotScreen) return UI_BG;
   if (screen == csvScreen) return UI_BG;
   if (screen == settingsScreen) return UI_BG;
   if (screen == fileViewerScreen) return UI_BG;
@@ -5888,7 +5336,6 @@ lv_obj_t **screenBaseSlot(lv_obj_t *screen)
 {
   if (screen == homeScreen) return &homeScreenBase;
   if (screen == measureScreen) return &measureScreenBase;
-  if (screen == plotScreen) return &plotScreenBase;
   if (screen == csvScreen) return &csvScreenBase;
   if (screen == settingsScreen) return &settingsScreenBase;
   if (screen == fileViewerScreen) return &fileViewerScreenBase;
@@ -6039,165 +5486,10 @@ static void go_csv_event_cb(lv_event_t *e)
   requestScreenSwitch(csvScreen);
 }
 
-static void go_plot_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  // The plot is only redrawn on entry; it reads the same history the
-  // measurement screen does and nothing changes it while you are looking.
-  updatePlotChart();
-  requestScreenSwitch(plotScreen);
-}
-
 static void go_isl_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   requestScreenSwitch(islScreen);
-}
-
-static void plot_line_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotKind = PLOT_KIND_LINE;
-  updatePlotChart();
-}
-
-static void plot_scatter_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotKind = PLOT_KIND_SCATTER;
-  updatePlotChart();
-}
-
-static void plot_x_time_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotXVar = PLOT_VAR_TIME;
-  updatePlotChart();
-}
-
-static void plot_x_temp_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotXVar = PLOT_VAR_TEMP;
-  updatePlotChart();
-}
-
-static void plot_x_pressure_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotXVar = PLOT_VAR_PRESSURE;
-  updatePlotChart();
-}
-
-static void plot_y_temp_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotYVar = PLOT_VAR_TEMP;
-  updatePlotChart();
-}
-
-static void plot_y_pressure_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotYVar = PLOT_VAR_PRESSURE;
-  updatePlotChart();
-}
-
-static void plot_range_all_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotRangeMode = PLOT_RANGE_ALL;
-  plotRangeOffset = 0;
-  updatePlotChart();
-}
-
-static void plot_range_20_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotRangeMode = PLOT_RANGE_LAST_20;
-  plotRangeOffset = 0;
-  updatePlotChart();
-}
-
-static void plot_range_60_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotRangeMode = PLOT_RANGE_LAST_60;
-  plotRangeOffset = 0;
-  updatePlotChart();
-}
-
-static void plot_range_120_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotRangeMode = PLOT_RANGE_LAST_120;
-  plotRangeOffset = 0;
-  updatePlotChart();
-}
-
-static void plot_range_older_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  int windowCount = getPlotRangeCount();
-  if (windowCount <= 0) windowCount = PLOT_DRAW_POINTS;
-
-  plotRangeOffset += windowCount;
-
-  int maxOffset = sampleCount - windowCount;
-  if (maxOffset < 0) maxOffset = 0;
-  if (plotRangeOffset > maxOffset) plotRangeOffset = maxOffset;
-
-  updatePlotChart();
-}
-
-static void plot_range_newer_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  int windowCount = getPlotRangeCount();
-  if (windowCount <= 0) windowCount = PLOT_DRAW_POINTS;
-
-  plotRangeOffset -= windowCount;
-  if (plotRangeOffset < 0) plotRangeOffset = 0;
-
-  updatePlotChart();
-}
-
-static void plot_agg_raw_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotAggregateMode = PLOT_AGG_RAW;
-  updatePlotChart();
-}
-
-static void plot_agg_5s_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotAggregateMode = PLOT_AGG_5S;
-  updatePlotChart();
-}
-
-static void plot_agg_10s_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotAggregateMode = PLOT_AGG_10S;
-  updatePlotChart();
-}
-
-static void plot_agg_30s_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotAggregateMode = PLOT_AGG_30S;
-  updatePlotChart();
-}
-
-static void plot_agg_60s_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  plotAggregateMode = PLOT_AGG_60S;
-  updatePlotChart();
 }
 
 static void start_event_cb(lv_event_t *e)
@@ -6363,8 +5655,6 @@ static void clear_event_cb(lv_event_t *e)
     measureClockRunning = false;
     dataClockStarted = false;
     dataFirstSampleMs = 0;
-    plotSelectOffset = 0;
-    plotRangeOffset = 0;
     for (int i = 0; i < MAX_SAMPLES; i++)
     {
       sampleEnabled[i] = true;
@@ -6380,7 +5670,6 @@ static void clear_event_cb(lv_event_t *e)
 
     resetTable();
     clearChart();
-    updatePlotChart();
   }
 }
 
@@ -7661,98 +6950,7 @@ void createMeasureUi()
 
 
 // =====================================================
-// Plot UI
 // =====================================================
-void createPlotUi()
-{
-  plotScreen = lv_obj_create(NULL);
-  lv_obj_set_size(plotScreen, LCD_H_RES, LCD_V_RES);
-  lv_obj_set_style_text_font(plotScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(plotScreen, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(plotScreen, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(plotScreen, LV_OBJ_FLAG_SCROLLABLE);
-
-  createStatusBar(
-    plotScreen,
-    "",
-    &labelBarPlotTime,
-    &labelBarPlotWifi,
-    &labelBarPlotSd
-  );
-
-  makeHeading(plotScreen, "그래프", 28, 58, UI_TEXT);
-
-  labelPlotInfo = makeSmallLabel(plotScreen, "", 28, 92, UI_TEXT_3);
-  lv_obj_set_width(labelPlotInfo, 640);
-  lv_label_set_long_mode(labelPlotInfo, LV_LABEL_LONG_CLIP);
-
-  // The title is kept for the update path but has no place of its own: the
-  // heading names the screen and labelPlotInfo carries the detail.
-  labelPlotTitle = NULL;
-
-  // =====================================================
-  // Chart
-  // =====================================================
-  lv_obj_t *chartCard = makePanel(plotScreen, 28, 120, 648, 396);
-
-  plotChartArea = lv_obj_create(chartCard);
-  lv_obj_set_size(plotChartArea, 620, 360);
-  lv_obj_align(plotChartArea, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_set_style_bg_opa(plotChartArea, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(plotChartArea, 0, 0);
-  lv_obj_set_style_radius(plotChartArea, 0, 0);
-  lv_obj_set_style_pad_all(plotChartArea, 0, 0);
-  lv_obj_clear_flag(plotChartArea, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_scrollbar_mode(plotChartArea, LV_SCROLLBAR_MODE_OFF);
-
-  labelPlotXRange = makeSmallLabel(plotScreen, "X: --", 28, 522, UI_TEXT_3);
-  lv_obj_set_width(labelPlotXRange, 320);
-  lv_label_set_long_mode(labelPlotXRange, LV_LABEL_LONG_CLIP);
-
-  labelPlotYRange = makeSmallLabel(plotScreen, "Y: --", 356, 522, UI_TEXT_3);
-  lv_obj_set_width(labelPlotYRange, 320);
-  lv_label_set_long_mode(labelPlotYRange, LV_LABEL_LONG_CLIP);
-
-  // =====================================================
-  // Controls, grouped by what they change
-  // =====================================================
-  lv_obj_t *panel = makePanel(plotScreen, 692, 120, 304, 434);
-  // Rows run to y=424, so the panel is sized for them below.
-
-  makeSmallLabel(panel, "모양", 16, 14, UI_TEXT_3);
-  makePlotSelectButton(panel, "꺾은선", 16, 36, 132, 38, plot_line_event_cb);
-  makePlotSelectButton(panel, "점", 156, 36, 132, 38, plot_scatter_event_cb);
-
-  makeSmallLabel(panel, "가로축", 16, 86, UI_TEXT_3);
-  makePlotSelectButton(panel, "시간", 16, 108, 88, 38, plot_x_time_event_cb);
-  makePlotSelectButton(panel, "값1", 112, 108, 88, 38, plot_x_temp_event_cb);
-  makePlotSelectButton(panel, "값2", 208, 108, 80, 38, plot_x_pressure_event_cb);
-
-  makeSmallLabel(panel, "세로축", 16, 158, UI_TEXT_3);
-  makePlotSelectButton(panel, "값1", 16, 180, 132, 38, plot_y_temp_event_cb);
-  makePlotSelectButton(panel, "값2", 156, 180, 132, 38, plot_y_pressure_event_cb);
-
-  makeSmallLabel(panel, "묶는 간격", 16, 230, UI_TEXT_3);
-  makePlotSelectButton(panel, "원자료", 16, 252, 88, 34, plot_agg_raw_event_cb);
-  makePlotSelectButton(panel, "5초", 112, 252, 84, 34, plot_agg_5s_event_cb);
-  makePlotSelectButton(panel, "10초", 204, 252, 84, 34, plot_agg_10s_event_cb);
-  makePlotSelectButton(panel, "30초", 16, 294, 88, 34, plot_agg_30s_event_cb);
-  makePlotSelectButton(panel, "60초", 112, 294, 84, 34, plot_agg_60s_event_cb);
-
-  makeSmallLabel(panel, "보는 구간", 16, 336, UI_TEXT_3);
-  makePlotSelectButton(panel, "전체", 16, 356, 76, 34, plot_range_all_event_cb);
-  makePlotSelectButton(panel, "20", 100, 356, 56, 34, plot_range_20_event_cb);
-  makePlotSelectButton(panel, "60", 164, 356, 56, 34, plot_range_60_event_cb);
-  makePlotSelectButton(panel, "120", 228, 356, 60, 34, plot_range_120_event_cb);
-  makeArrowButton(panel, "<", 16, 394, 132, 30, plot_range_older_event_cb);
-  makeArrowButton(panel, ">", 156, 394, 132, 30, plot_range_newer_event_cb);
-
-  createTabBar(plotScreen, 2);
-
-  updatePlotChart();
-}
-
-
 // =====================================================
 // ISL UI
 // =====================================================
@@ -7849,7 +7047,7 @@ void createIslUi()
   lv_obj_set_style_text_font(islKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(islKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(islScreen, 4);
+  createTabBar(islScreen, 3);
 
   updateCloudModeLabel();
   updateIslStatusLabels();
@@ -7905,7 +7103,7 @@ void createFileViewerUi()
   lv_obj_set_width(labelFileViewerPageInfo, 968);
   lv_label_set_long_mode(labelFileViewerPageInfo, LV_LABEL_LONG_CLIP);
 
-  createTabBar(fileViewerScreen, 3);
+  createTabBar(fileViewerScreen, 2);
 }
 
 // =====================================================
@@ -8038,7 +7236,7 @@ void createCsvUi()
   lv_obj_set_style_text_font(csvKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(csvKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(csvScreen, 3);
+  createTabBar(csvScreen, 2);
 
   resetTable();
   updateTable();
@@ -8270,7 +7468,7 @@ void createBleUi()
     bleEnabled ? "블루투스: 켜짐" : "블루투스: 꺼짐 — 켜면 다음 시작부터 검색할 수 있습니다."
   );
 
-  createTabBar(bleScreen, 4);
+  createTabBar(bleScreen, 3);
 }
 
 void createSettingsUi()
@@ -8383,7 +7581,7 @@ void createSettingsUi()
   lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(settingsScreen, 4);
+  createTabBar(settingsScreen, 3);
 
   updateWifiRuntimeLabels();
 }
@@ -11535,11 +10733,9 @@ void setup()
   createMeasureUi();
   createSettingsUi();
   createBleUi();
-  createPlotUi();
   createCsvUi();
   createFileViewerUi();
   createIslUi();
-  // The plot screen stays uncreated: it is not reachable from the tab bar and
   // its drawing buffers were cut down to stubs.
 
   // Allocate every main screen base during setup, not on the first user tap.
@@ -11548,7 +10744,6 @@ void setup()
   ensureOpaqueScreenBase(settingsScreen);
   ensureOpaqueScreenBase(islScreen);
   ensureOpaqueScreenBase(bleScreen);
-  ensureOpaqueScreenBase(plotScreen);
   ensureOpaqueScreenBase(csvScreen);
   ensureOpaqueScreenBase(fileViewerScreen);
 
