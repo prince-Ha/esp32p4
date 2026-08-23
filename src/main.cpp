@@ -109,6 +109,7 @@ LV_FONT_DECLARE(korean_14);
 // Digits only, for the measurement readout. A full Hangul face at this size
 // would cost megabytes; the value itself never needs one.
 LV_FONT_DECLARE(digits_64);
+LV_FONT_DECLARE(digits_48);
 
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
@@ -119,6 +120,8 @@ LV_FONT_DECLARE(digits_64);
 #define FONT_KR_HEAD &korean_24_bold
 #define FONT_KR_SMALL &korean_14
 #define FONT_VALUE &digits_64
+// Used when a sensor reports two or three quantities that share the row.
+#define FONT_VALUE_SMALL &digits_48
 
 #define FONT_KR_NORMAL FONT_KR
 // =====================================================
@@ -329,6 +332,9 @@ static bool tmp117LastReadWasWaiting = false;
 #define UI_TEXT        0x14181F
 #define UI_TEXT_2      0x4A5566
 #define UI_TEXT_3      0x79849A
+// A step lighter again, for the part number and resolution under a tile
+// name: present when looked for, silent otherwise.
+#define UI_TEXT_4      0xA6AEBB
 #define UI_ACCENT      0x0B6BCB
 #define UI_ACCENT_SOFT 0xF2F7FE
 #define UI_ACCENT_TINT 0xE9F1FC
@@ -595,7 +601,13 @@ static lv_obj_t *labelHumidityBig;
 // Measure screen: the value is split across three labels so the digits can use
 // a digits-only face while the name and unit stay in the Hangul face.
 static lv_obj_t *labelMeasureSensorName;
-static lv_obj_t *labelMeasurePrimaryUnit;
+
+// Up to three readings share the row: DPS310 gives 온도 and 기압, SCD41 gives
+// CO2, 온도 and 습도. Each column is a caption, a number and a unit.
+#define MEASURE_VALUE_MAX 3
+static lv_obj_t *labelValueCaption[MEASURE_VALUE_MAX];
+static lv_obj_t *labelValueNumber[MEASURE_VALUE_MAX];
+static lv_obj_t *labelValueUnit[MEASURE_VALUE_MAX];
 static lv_obj_t *labelMeasureIslState;
 static lv_obj_t *labelMeasureModum;
 static lv_obj_t *labelMeasureBle;
@@ -840,6 +852,7 @@ void updateChartAutoScale();
 void clearChart();
 
 void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
+const char *sensorDetailText(int mode);
 
 // Move the "선택됨" state onto the tile for `mode`.
 void refreshHomeSensorTilesFor(int mode)
@@ -2606,6 +2619,32 @@ const char *islTemperatureNickname()
   return "온도센서";
 }
 
+// The part behind each tile and the resolution it is displayed at. The
+// figures are what the firmware actually prints, taken from
+// formatPrimaryValueText(), not datasheet accuracy — a student comparing two
+// readings cares which digits are real on screen.
+const char *sensorDetailText(int mode)
+{
+  switch (mode)
+  {
+    case SENSOR_MODE_DPS310:  return "DPS310 · 0.01℃ · 0.1hPa";
+    case SENSOR_MODE_DS18B20: return "DS18B20 · 0.01℃";
+    case SENSOR_MODE_SCD41:   return "SCD41 · 1ppm · 0.1℃ · 0.1%";
+    case SENSOR_MODE_TSL2591: return "TSL2591 · 0.1lx";
+    case SENSOR_MODE_TMP117:  return "TMP117 · 0.001℃";
+    case SENSOR_MODE_VL53L1X: return "VL53L1X · 1mm";
+    default:                  return "";
+  }
+}
+
+// How many quantities the active sensor reports at once.
+int activeSensorValueCount()
+{
+  if (activeSensorMode == SENSOR_MODE_SCD41) return 3;   // CO2, 온도, 습도
+  if (activeSensorMode == SENSOR_MODE_DPS310) return 2;  // 온도, 기압
+  return 1;
+}
+
 bool activeSensorSupportsDirectIsl()
 {
   // 지능형과학실 ON:
@@ -2693,12 +2732,102 @@ static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
   else snprintf(out, outSize, "--.--");
 }
 
-// The value label is width-to-content, so the unit has to be re-pinned every
-// time the number changes width.
-static void realignPrimaryUnit()
+// Arrange the readings for however many the active sensor reports: one gets
+// the full width at 64 px, two or three share the row at 48 px. Called when
+// the sensor changes, and again after each update because the labels are
+// width-to-content and the units sit against their right edge.
+static void refreshMeasureValueLayout()
 {
-  if (labelTempBig == NULL || labelMeasurePrimaryUnit == NULL) return;
-  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+  if (labelValueNumber[0] == NULL) return;
+
+  const int count = activeSensorValueCount();
+  const int colLeftX = 24;
+  const int colLeftW = 700;
+  const int contentTop = 58;
+  const int columnW = colLeftW / (count > 0 ? count : 1);
+
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    const bool used = (i < count);
+
+    if (!used)
+    {
+      lv_obj_add_flag(labelValueCaption[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(labelValueNumber[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(labelValueUnit[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    lv_obj_clear_flag(labelValueCaption[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(labelValueNumber[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(labelValueUnit[i], LV_OBJ_FLAG_HIDDEN);
+
+    const int x = colLeftX + i * columnW;
+
+    lv_obj_set_style_text_font(labelValueNumber[i], count == 1 ? FONT_VALUE : FONT_VALUE_SMALL, 0);
+
+    lv_obj_set_width(labelValueCaption[i], columnW - 12);
+    lv_obj_align(labelValueCaption[i], LV_ALIGN_TOP_LEFT, x, contentTop + 34);
+    lv_obj_align(labelValueNumber[i], LV_ALIGN_TOP_LEFT, x, contentTop + 56);
+    lv_obj_align_to(labelValueUnit[i], labelValueNumber[i], LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -8);
+  }
+}
+
+// What each column is showing, for the active sensor.
+static void measureValueMeta(int index, const char **caption, const char **unit)
+{
+  *caption = "";
+  *unit = "";
+
+  if (activeSensorMode == SENSOR_MODE_SCD41)
+  {
+    if (index == 0) { *caption = "이산화탄소"; *unit = "ppm"; }
+    else if (index == 1) { *caption = "온도"; *unit = "℃"; }
+    else if (index == 2) { *caption = "습도"; *unit = "%"; }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_DPS310)
+  {
+    if (index == 0) { *caption = "온도"; *unit = "℃"; }
+    else if (index == 1) { *caption = "기압"; *unit = "hPa"; }
+    return;
+  }
+
+  if (index == 0)
+  {
+    *caption = activePrimaryName();
+    *unit = activePrimaryUnit();
+  }
+}
+
+// Placeholder digits at the width each value will occupy, so the layout does
+// not jump when the first reading lands.
+static void measureValuePlaceholder(int index, char *out, size_t outSize)
+{
+  if (index == 0)
+  {
+    formatPrimaryPlaceholderNumber(out, outSize);
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "--.-");
+  else snprintf(out, outSize, "----.-");
+}
+
+void refreshMeasureValueCaptions()
+{
+  if (labelValueCaption[0] == NULL) return;
+
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    const char *caption = "";
+    const char *unit = "";
+    measureValueMeta(i, &caption, &unit);
+
+    lv_label_set_text(labelValueCaption[i], caption);
+    lv_label_set_text(labelValueUnit[i], unit);
+  }
 }
 
 void updateActiveSensorUiLabels()
@@ -2710,49 +2839,17 @@ void updateActiveSensorUiLabels()
     lv_label_set_text(labelMeasureSensorName, activeMeasurementTitle());
   }
 
-  if (labelMeasurePrimaryUnit)
-  {
-    lv_label_set_text(labelMeasurePrimaryUnit, activePrimaryUnit());
-  }
+  refreshMeasureValueCaptions();
 
-  if (labelTempBig)
+  if (labelValueNumber[0])
   {
-    formatPrimaryPlaceholderNumber(text, sizeof(text));
-    lv_label_set_text(labelTempBig, text);
-    realignPrimaryUnit();
-  }
+    for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+    {
+      measureValuePlaceholder(i, text, sizeof(text));
+      lv_label_set_text(labelValueNumber[i], text);
+    }
 
-  if (labelPressureBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-    {
-      lv_label_set_text(labelPressureBig, "온도: --.-℃");
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else if (activeSensorHasPressure())
-    {
-      lv_label_set_text(labelPressureBig, "압력: ----.-hPa");
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelPressureBig, "");
-      lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
-
-  if (labelHumidityBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-    {
-      lv_label_set_text(labelHumidityBig, "습도: --.-%");
-      lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelHumidityBig, "");
-      lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
+    refreshMeasureValueLayout();
   }
 
   if (labelMeasureTempAxisTitle)
@@ -2870,89 +2967,50 @@ void refreshMeasureControls()
 
 static void refreshLatestMeasurementLabels()
 {
-  if (labelTempBig == NULL) return;
+  if (labelValueNumber[0] == NULL) return;
+
   char text[96];
 
   if (sampleCount <= 0)
   {
-    formatPrimaryPlaceholderNumber(text, sizeof(text));
-    lv_label_set_text(labelTempBig, text);
-
-    if (labelPressureBig)
+    for (int i = 0; i < MEASURE_VALUE_MAX; i++)
     {
-      if (activeSensorMode == SENSOR_MODE_SCD41)
-      {
-        lv_label_set_text(labelPressureBig, "온도: --.-℃");
-        lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-      }
-      else if (activeSensorHasPressure())
-      {
-        lv_label_set_text(labelPressureBig, "압력: ----.-hPa");
-        lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-      }
-      else
-      {
-        lv_label_set_text(labelPressureBig, "");
-        lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-      }
+      measureValuePlaceholder(i, text, sizeof(text));
+      lv_label_set_text(labelValueNumber[i], text);
     }
 
-    if (labelHumidityBig)
-    {
-      if (activeSensorMode == SENSOR_MODE_SCD41)
-      {
-        lv_label_set_text(labelHumidityBig, "습도: --.-%");
-        lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-      }
-      else
-      {
-        lv_label_set_text(labelHumidityBig, "");
-        lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-      }
-    }
+    refreshMeasureValueLayout();
     return;
   }
 
   const int idx = sampleCount - 1;
+
+  // Column 0 is always the sensor's headline quantity.
   formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
-  lv_label_set_text(labelTempBig, text);
-  realignPrimaryUnit();
+  lv_label_set_text(labelValueNumber[0], text);
 
-  if (labelPressureBig)
+  // Columns 1 and 2 carry whatever else the part measured in the same reading:
+  // 기압 for DPS310, 온도 and 습도 for SCD41. Each is a bare number under its
+  // own caption, at the same size as the first — a sensor that measures two
+  // things has two readings, not one reading and a footnote.
+  if (activeSensorMode == SENSOR_MODE_SCD41)
   {
-    if (activeSensorMode == SENSOR_MODE_SCD41 && !isnan(pressureHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "온도: %.1f℃", pressureHistory[idx]);
-      lv_label_set_text(labelPressureBig, text);
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else if (activeSensorHasPressure() && pressureValueValid(pressureHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "압력: %.1fhPa", pressureHistory[idx]);
-      lv_label_set_text(labelPressureBig, text);
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelPressureBig, "");
-      lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
+    else snprintf(text, sizeof(text), "--.-");
+    lv_label_set_text(labelValueNumber[1], text);
+
+    if (!isnan(humidityHistory[idx])) snprintf(text, sizeof(text), "%.1f", humidityHistory[idx]);
+    else snprintf(text, sizeof(text), "--.-");
+    lv_label_set_text(labelValueNumber[2], text);
+  }
+  else if (activeSensorHasPressure())
+  {
+    if (pressureValueValid(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
+    else snprintf(text, sizeof(text), "----.-");
+    lv_label_set_text(labelValueNumber[1], text);
   }
 
-  if (labelHumidityBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41 && !isnan(humidityHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "습도: %.1f%%", humidityHistory[idx]);
-      lv_label_set_text(labelHumidityBig, text);
-      lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelHumidityBig, "");
-      lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
+  refreshMeasureValueLayout();
 }
 
 
@@ -3870,8 +3928,8 @@ void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
 // large enough that a fingertip cannot reach two of them at once. The caller
 // keeps `markOut` so the selected state can be moved later.
 lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
-                         int x, int y, int w, int h, bool selected,
-                         lv_event_cb_t cb, lv_obj_t **markOut)
+                         const char *detail, int x, int y, int w, int h,
+                         bool selected, lv_event_cb_t cb, lv_obj_t **markOut)
 {
   lv_obj_t *tile = lv_btn_create(parent);
   lv_obj_set_size(tile, w, h);
@@ -3889,6 +3947,14 @@ lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
   lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
   lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
   lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 18, 16);
+
+  lv_obj_t *detailLabel = lv_label_create(tile);
+  lv_label_set_text(detailLabel, detail ? detail : "");
+  lv_obj_set_style_text_color(detailLabel, lv_color_hex(UI_TEXT_4), 0);
+  lv_obj_set_style_text_font(detailLabel, FONT_KR_SMALL, 0);
+  lv_obj_set_width(detailLabel, w - 36);
+  lv_label_set_long_mode(detailLabel, LV_LABEL_LONG_CLIP);
+  lv_obj_align(detailLabel, LV_ALIGN_TOP_LEFT, 18, 50);
 
   lv_obj_t *unitLabel = lv_label_create(tile);
   lv_label_set_text(unitLabel, unit);
@@ -6690,6 +6756,7 @@ void createHomeUi()
       homeScreen,
       tiles[i].name,
       tiles[i].unit,
+      sensorDetailText(tiles[i].mode),
       tileLeft + col * (tileW + tileGapX),
       tileTop + row * (tileH + tileGapY),
       tileW,
@@ -6792,27 +6859,26 @@ void createMeasureUi()
   lv_label_set_long_mode(labelStatus, LV_LABEL_LONG_CLIP);
   lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, colLeftX + colLeftW - 300, contentTop + 8);
 
-  // ---- the reading ----
-  labelTempBig = lv_label_create(measureScreen);
-  lv_label_set_text(labelTempBig, "--.-");
-  lv_obj_set_style_text_color(labelTempBig, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_text_font(labelTempBig, FONT_VALUE, 0);
-  lv_obj_align(labelTempBig, LV_ALIGN_TOP_LEFT, colLeftX, contentTop + 34);
+  // ---- the readings ----
+  // Three columns are always built; refreshMeasureValueLayout() sizes and
+  // hides them to match whatever the active sensor reports.
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    labelValueCaption[i] = makeSmallLabel(measureScreen, "", colLeftX, contentTop + 34, UI_TEXT_3);
+    lv_label_set_long_mode(labelValueCaption[i], LV_LABEL_LONG_CLIP);
 
-  // Pinned to the value's own right edge rather than a fixed x, so it hugs
-  // the number whether it reads "28.2" or "1013.24".
-  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", 0, 0, UI_TEXT_3);
-  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+    labelValueNumber[i] = lv_label_create(measureScreen);
+    lv_label_set_text(labelValueNumber[i], "--");
+    lv_obj_set_style_text_color(labelValueNumber[i], lv_color_hex(UI_TEXT), 0);
+    lv_obj_set_style_text_font(labelValueNumber[i], FONT_VALUE, 0);
 
-  // Secondary quantity, when the active sensor reports one.
-  labelPressureBig = makeLabel(measureScreen, "기압 ----.-- hPa", colLeftX, contentTop + 122, UI_TEXT_2);
-  lv_obj_set_width(labelPressureBig, 340);
-  lv_label_set_long_mode(labelPressureBig, LV_LABEL_LONG_CLIP);
+    labelValueUnit[i] = makeHeading(measureScreen, "", 0, 0, UI_TEXT_3);
+  }
 
-  labelHumidityBig = makeLabel(measureScreen, "", colLeftX + 356, contentTop + 122, UI_TEXT_2);
-  lv_obj_set_width(labelHumidityBig, 340);
-  lv_label_set_long_mode(labelHumidityBig, LV_LABEL_LONG_CLIP);
-  lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
+  // The older update paths still write through these names.
+  labelTempBig = labelValueNumber[0];
+  labelPressureBig = labelValueNumber[1];
+  labelHumidityBig = labelValueNumber[2];
 
   // =====================================================
   // Chart
