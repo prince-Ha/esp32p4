@@ -160,6 +160,26 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 #define SENSOR_MODE_TMP117    5
 #define SENSOR_MODE_VL53L1X   6
 #define SENSOR_MODE_INA228    7
+#define SENSOR_MODE_ENCODER   8
+
+// =====================================================
+// Grove 광학 로터리 엔코더 (TCUT1600X01)
+//
+// Not an I2C part: the module's two phototransistors drive a quadrature A/B
+// pair on plain digital pins, so it will never appear in the I2C scan. Both
+// edges of both channels are counted, giving four counts per slot.
+//
+// Power it from 3.3 V. The module accepts 3.3 V or 5 V, but at 5 V its outputs
+// are 5 V and the P4's pins are not 5 V tolerant.
+// =====================================================
+#define ENCODER_PIN_A 4
+#define ENCODER_PIN_B 5
+
+// Counts for one full turn of the disk. A photo-interrupter counts slots in
+// whatever disk is fitted, so this depends on the wheel, not the module: a
+// 20-slot disk at four counts per slot is 80. Turn the wheel exactly once and
+// read the angle — 360° means this is right, half that means it is doubled.
+#define ENCODER_COUNTS_PER_REV 80
 
 // =====================================================
 // INA228 전압·전류·전력 (raw Soft-I2C)
@@ -251,6 +271,14 @@ static bool tmp117LastReadWasWaiting = false;
 
 // INA228 measures three things at once; current is the headline and the other
 // two ride along, the way SCD41's temperature and humidity do.
+// Quadrature state. Written from an interrupt, so volatile.
+static volatile int32_t encoderCount = 0;
+static volatile uint8_t encoderLastState = 0;
+static bool encoderReady = false;
+static int32_t encoderPrevCount = 0;
+static unsigned long encoderPrevMs = 0;
+static float encoderLastRateDegPerS = NAN;
+
 static bool ina228Ready = false;
 static float ina228LastPowerW = NAN;
 static float ina228CurrentLsb = 0.0f;
@@ -409,6 +437,10 @@ const int I2C_DELAY_US = 5;
 static char csvFileName[64] = CSV_DEFAULT_FILE;
 static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 
+// primary, secondary, third - the most any one sensor reports.
+#define CSV_VALUE_COLUMNS 3
+#define CSV_HEADER_LINE "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,third_value,third_unit"
+
 // Rows buffered before the CSV handle is flushed to the card. At the 1 Hz
 // sample rate this caps data loss on a power cut at CSV_FLUSH_EVERY_ROWS
 // seconds without paying for an fsync every sample.
@@ -462,6 +494,12 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // are separate sensor types, so each takes channel 01 (별첨3).
 // 별첨2: 전압 Voltage VOLT, 전류 Electric current ECRT, 전력 Electric power
 // EPOW. Distinct sensor types, so each takes channel 01 (별첨3).
+// 별첨2: 각도 Angle ANGL, 각속도 Angular velocity ANGV.
+#define ISL_SENSOR_TYPE_ANGLE    "ANGL"
+#define ISL_SENSOR_TYPE_ANGVEL   "ANGV"
+#define ISL_UNIT_ANGLE  "deg"
+#define ISL_UNIT_ANGVEL "deg/s"
+
 #define ISL_SENSOR_TYPE_VOLTAGE "VOLT"
 #define ISL_SENSOR_TYPE_CURRENT "ECRT"
 #define ISL_SENSOR_TYPE_POWER   "EPOW"
@@ -708,7 +746,7 @@ static lv_obj_t *labelFileViewerPageInfo;
 
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
-#define HOME_SENSOR_TILE_COUNT 7
+#define HOME_SENSOR_TILE_COUNT 8
 // The group code is edited in a modal sheet rather than in place: the keyboard
 // covers the lower third of the screen, so an inline field would either sit
 // under the keyboard or have to displace the sensor grid.
@@ -871,6 +909,7 @@ void createFileViewerUi();
 void createIslUi();
 void createBleUi();
 void refreshBleScreen();
+void applyTableValueHeaders();
 void resetTable();
 void updateTable();
 
@@ -1007,6 +1046,13 @@ static void home_sensor_ina228_event_cb(lv_event_t *e)
   pendingSensorMode = SENSOR_MODE_INA228;
 }
 
+static void home_sensor_encoder_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
+  pendingSensorMode = SENSOR_MODE_ENCODER;
+}
+
 void servicePendingSensorMode()
 {
   int mode = pendingSensorMode;
@@ -1061,6 +1107,7 @@ static void home_sensor_light_event_cb(lv_event_t *e);
 static void home_sensor_tmp117_event_cb(lv_event_t *e);
 static void home_sensor_vl53_event_cb(lv_event_t *e);
 static void home_sensor_ina228_event_cb(lv_event_t *e);
+static void home_sensor_encoder_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
 void sanitizeBasicFileName(const char *input, char *out, size_t outSize);
@@ -2617,6 +2664,7 @@ const char *activeSensorName()
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "TSL2591 조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "TMP117 정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "INA228 전압·전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전 엔코더";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "VL53L1X 거리";
   return "DPS310";
 }
@@ -2628,6 +2676,7 @@ const char *activeMeasurementTitle()
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀 온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전압 · 전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도 · 기압";
 }
@@ -2639,6 +2688,7 @@ const char *activePrimaryName()
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "각도";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도";
 }
@@ -2649,6 +2699,7 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "lux";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
   if (activeSensorMode == SENSOR_MODE_INA228) return "A";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "°";
   return "℃";
 }
 
@@ -2676,6 +2727,7 @@ const char *islTemperatureNickname()
   if (activeSensorMode == SENSOR_MODE_DS18B20) return "수온센서";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류센서";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전센서";
   return "온도센서";
 }
 
@@ -2693,6 +2745,7 @@ const char *sensorDetailText(int mode)
     case SENSOR_MODE_TSL2591: return "TSL2591 · 0.1lx";
     case SENSOR_MODE_TMP117:  return "TMP117 · 0.001℃";
     case SENSOR_MODE_INA228:  return "INA228 · 0.001A · 0.001V · 0.001W";
+    case SENSOR_MODE_ENCODER: return "TCUT1600X01 · 4.5° · GPIO4/5";
     case SENSOR_MODE_VL53L1X: return "VL53L1X · 1mm";
     default:                  return "";
   }
@@ -2703,6 +2756,7 @@ int activeSensorValueCount()
 {
   if (activeSensorMode == SENSOR_MODE_SCD41) return 3;   // CO2, 온도, 습도
   if (activeSensorMode == SENSOR_MODE_INA228) return 3;  // 전류, 전압, 전력
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return 2;  // 각도, 각속도
   if (activeSensorMode == SENSOR_MODE_DPS310) return 2;  // 온도, 기압
   return 1;
 }
@@ -2725,6 +2779,7 @@ bool activeSensorSupportsDirectIsl()
          activeSensorMode == SENSOR_MODE_TSL2591 ||
          activeSensorMode == SENSOR_MODE_VL53L1X ||
          activeSensorMode == SENSOR_MODE_INA228 ||
+         activeSensorMode == SENSOR_MODE_ENCODER ||
          (SCD41_DIRECT_ISL_ENABLED && activeSensorMode == SENSOR_MODE_SCD41);
 }
 
@@ -2775,6 +2830,11 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
     if (includeName) snprintf(out, outSize, "전류: %.3fA", value);
     else snprintf(out, outSize, "%.3f", value);
   }
+  else if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    if (includeName) snprintf(out, outSize, "각도: %.1f°", value);
+    else snprintf(out, outSize, "%.1f", value);
+  }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     if (includeName) snprintf(out, outSize, "수온: %.2f℃", value);
@@ -2797,6 +2857,7 @@ static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
   else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "----.-");
   else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "--.---");
   else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
+  else if (activeSensorMode == SENSOR_MODE_ENCODER) snprintf(out, outSize, "---.-");
   else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "----");
   else snprintf(out, outSize, "--.--");
 }
@@ -2856,6 +2917,13 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
     return;
   }
 
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    if (index == 0) { *caption = "각도"; *unit = "°"; }
+    else if (index == 1) { *caption = "각속도"; *unit = "°/s"; }
+    return;
+  }
+
   if (activeSensorMode == SENSOR_MODE_INA228)
   {
     if (index == 0) { *caption = "전류"; *unit = "A"; }
@@ -2890,6 +2958,7 @@ static void measureValuePlaceholder(int index, char *out, size_t outSize)
 
   if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "--.-");
   else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
+  else if (activeSensorMode == SENSOR_MODE_ENCODER) snprintf(out, outSize, "---.-");
   else snprintf(out, outSize, "----.-");
 }
 
@@ -2951,21 +3020,7 @@ void updateActiveSensorUiLabels()
     }
   }
 
-  if (tableData)
-  {
-    snprintf(text, sizeof(text), "%s(%s)", activePrimaryName(), activePrimaryUnit());
-    lv_table_set_cell_value(tableData, 0, 2, text);
-
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-      lv_table_set_cell_value(tableData, 0, 3, "T/RH");
-    else if (activeSensorHasPressure())
-    {
-      snprintf(text, sizeof(text), "%s(%s)", activeSecondaryName(), activeSecondaryUnit());
-      lv_table_set_cell_value(tableData, 0, 3, text);
-    }
-    else
-      lv_table_set_cell_value(tableData, 0, 3, "-");
-  }
+  applyTableValueHeaders();
 }
 
 // Show exactly one of 시작 / 정지, and keep the send-status rail truthful about
@@ -3090,6 +3145,12 @@ static void refreshLatestMeasurementLabels()
     if (!isnan(humidityHistory[idx])) snprintf(text, sizeof(text), "%.3f", humidityHistory[idx]);
     else snprintf(text, sizeof(text), "-.---");
     lv_label_set_text(labelValueNumber[2], text);
+  }
+  else if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
+    else snprintf(text, sizeof(text), "---.-");
+    lv_label_set_text(labelValueNumber[1], text);
   }
   else if (activeSensorHasPressure())
   {
@@ -3447,6 +3508,78 @@ int scanSensorI2cBus(char *summary, size_t summaryLen)
   return found;
 }
 
+// Standard quadrature table: index by the previous two-bit state followed by
+// the current one, and the value is the direction. 0 covers both the invalid
+// double transitions and no movement.
+static const int8_t kQuadratureStep[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+static void IRAM_ATTR encoderIsr()
+{
+  const uint8_t state = (uint8_t)((digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B));
+  encoderCount += kQuadratureStep[(encoderLastState << 2) | state];
+  encoderLastState = state;
+}
+
+bool encoderBegin()
+{
+  pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+  pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+
+  encoderCount = 0;
+  encoderPrevCount = 0;
+  encoderPrevMs = millis();
+  encoderLastRateDegPerS = NAN;
+  encoderLastState = (uint8_t)((digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B));
+
+  if (!encoderReady)
+  {
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), encoderIsr, CHANGE);
+    encoderReady = true;
+  }
+
+  Serial.printf(
+    "[ENCODER] ready on GPIO%d/%d, %d counts per turn\n",
+    ENCODER_PIN_A, ENCODER_PIN_B, ENCODER_COUNTS_PER_REV
+  );
+
+  // Nothing to probe: an idle encoder is indistinguishable from an absent one
+  // until it is turned, so report ready and let the reading show the truth.
+  return true;
+}
+
+// Angle in degrees since the run started, and how fast it is turning.
+bool readEncoder(float *angleDeg, float *rateDegPerS)
+{
+  if (!encoderReady || angleDeg == NULL || rateDegPerS == NULL) return false;
+
+  noInterrupts();
+  const int32_t count = encoderCount;
+  interrupts();
+
+  const unsigned long now = millis();
+  const float degPerCount = 360.0f / (float)ENCODER_COUNTS_PER_REV;
+
+  *angleDeg = (float)count * degPerCount;
+
+  const unsigned long elapsed = now - encoderPrevMs;
+  if (elapsed >= 200)
+  {
+    const float deltaDeg = (float)(count - encoderPrevCount) * degPerCount;
+    encoderLastRateDegPerS = deltaDeg * 1000.0f / (float)elapsed;
+    encoderPrevCount = count;
+    encoderPrevMs = now;
+  }
+
+  *rateDegPerS = encoderLastRateDegPerS;
+  return true;
+}
+
 bool activeSensorBegin()
 {
   if (activeSensorMode == SENSOR_MODE_DS18B20)
@@ -3480,6 +3613,11 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_INA228)
   {
     return ina228Begin();
+  }
+
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    return encoderBegin();
   }
 
   return dps310Begin();
@@ -3535,6 +3673,14 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
     return true;
   }
 
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    float rateDegPerS = NAN;
+    if (!readEncoder(primaryValue, &rateDegPerS)) return false;
+    *secondaryValue = rateDegPerS;
+    return true;
+  }
+
   return readDps310(primaryValue, secondaryValue);
 }
 
@@ -3546,6 +3692,7 @@ void setActiveSensorMode(int mode)
       mode != SENSOR_MODE_TSL2591 &&
       mode != SENSOR_MODE_TMP117 &&
       mode != SENSOR_MODE_INA228 &&
+      mode != SENSOR_MODE_ENCODER &&
       mode != SENSOR_MODE_VL53L1X)
   {
     return;
@@ -3638,6 +3785,10 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_INA228)
   {
     setIslStatusText(dpsReady ? "전압·전류·전력: INA228 준비" : "INA228 인식 실패: 0x40 / 배선 확인");
+  }
+  else if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    setIslStatusText("회전: 엔코더 준비 / GPIO4·5, 3.3V 연결");
   }
 }
 
@@ -3751,7 +3902,7 @@ bool initSdCard()
       return false;
     }
 
-    fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,raw1,raw2\n");
+    fprintf(file, CSV_HEADER_LINE ",raw1,raw2\n");
     fclose(file);
 
     Serial.println("CSV file created");
@@ -3808,6 +3959,46 @@ static void reportCsvWriteFailure()
   updateSdStatusLabels();
 }
 
+// Every reading a sensor produces, laid out as value,unit pairs for one row.
+// Only the DPS310 used to reach the second column, so the SCD41's humidity and
+// the INA228's voltage and power were measured, shown on screen and uploaded
+// to the platform, but never landed on the card. Columns a sensor does not
+// produce stay empty so a file that mixes sensors still lines up.
+static void formatCsvValueColumns(
+  float primaryValue, float secondaryValue, float thirdValue,
+  char *out, size_t outSize
+)
+{
+  const float values[CSV_VALUE_COLUMNS] = { primaryValue, secondaryValue, thirdValue };
+  const int count = activeSensorValueCount();
+
+  out[0] = '\0';
+
+  for (int i = 0; i < CSV_VALUE_COLUMNS; i++)
+  {
+    char cell[64];
+    const bool usable =
+      i < count && !isnan(values[i]) &&
+      (i != 1 || !activeSensorHasPressure() || pressureValueValid(values[i]));
+
+    if (usable)
+    {
+      const char *caption = "";
+      const char *unit = "";
+      measureValueMeta(i, &caption, &unit);
+      snprintf(cell, sizeof(cell), "%s%.4f,%s", i ? "," : "", values[i], unit);
+    }
+    else
+    {
+      snprintf(cell, sizeof(cell), "%s,", i ? "," : "");
+    }
+
+    strncat(out, cell, outSize - strlen(out) - 1);
+  }
+}
+
+static float thirdValueForActiveSensor();
+
 void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
 {
   if (!csvLoggingEnabled) return;
@@ -3826,38 +4017,20 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
     csvRowsSinceFlush = 0;
   }
 
-  int written;
+  char columns[160];
+  formatCsvValueColumns(primaryValue, secondaryValue, thirdValueForActiveSensor(),
+                        columns, sizeof(columns));
 
-  if (activeSensorHasPressure() && pressureValueValid(secondaryValue))
-  {
-    written = fprintf(
-      csvFile,
-      "%d,%lu,%s,%.4f,%s,%.4f,%s,%ld,%ld\n",
-      measurementCount,
-      (unsigned long)timeS,
-      activeSensorName(),
-      primaryValue,
-      activePrimaryUnit(),
-      secondaryValue,
-      activeSecondaryUnit(),
-      (long)lastRawTemp,
-      (long)lastRawPressure
-    );
-  }
-  else
-  {
-    written = fprintf(
-      csvFile,
-      "%d,%lu,%s,%.4f,%s,,,%ld,%ld\n",
-      measurementCount,
-      (unsigned long)timeS,
-      activeSensorName(),
-      primaryValue,
-      activePrimaryUnit(),
-      (long)lastRawTemp,
-      (long)lastRawPressure
-    );
-  }
+  const int written = fprintf(
+    csvFile,
+    "%d,%lu,%s,%s,%ld,%ld\n",
+    measurementCount,
+    (unsigned long)timeS,
+    activeSensorName(),
+    columns,
+    (long)lastRawTemp,
+    (long)lastRawPressure
+  );
 
   if (written < 0)
   {
@@ -4897,6 +5070,44 @@ static void csv_keyboard_event_cb(lv_event_t *e)
 // =====================================================
 
 
+// Both the table rebuild and the sensor-change refresh used to spell these
+// headings out, and they disagreed: whichever ran last won. One writer.
+void applyTableValueHeaders()
+{
+  if (tableData == NULL) return;
+
+  char header[40];
+
+  snprintf(header, sizeof(header), "%s(%s)", activePrimaryName(), activePrimaryUnit());
+  lv_table_set_cell_value(tableData, 0, 2, header);
+
+  const int valueCount = activeSensorValueCount();
+
+  if (valueCount >= 3)
+  {
+    const char *caption2 = "";
+    const char *caption3 = "";
+    const char *unit2 = "";
+    const char *unit3 = "";
+    measureValueMeta(1, &caption2, &unit2);
+    measureValueMeta(2, &caption3, &unit3);
+    snprintf(header, sizeof(header), "%s/%s", caption2, caption3);
+    lv_table_set_cell_value(tableData, 0, 3, header);
+  }
+  else if (valueCount == 2)
+  {
+    const char *caption2 = "";
+    const char *unit2 = "";
+    measureValueMeta(1, &caption2, &unit2);
+    snprintf(header, sizeof(header), "%s(%s)", caption2, unit2);
+    lv_table_set_cell_value(tableData, 0, 3, header);
+  }
+  else
+  {
+    lv_table_set_cell_value(tableData, 0, 3, "-");
+  }
+}
+
 void resetTable()
 {
   tablePageOffset = 0;
@@ -4905,27 +5116,10 @@ void resetTable()
   // screen no longer does.
   if (tableData == NULL) return;
 
-  char header[32];
-
   lv_table_set_cell_value(tableData, 0, 0, "No");
   lv_table_set_cell_value(tableData, 0, 1, "시간(s)");
 
-  snprintf(header, sizeof(header), "%s(%s)", activePrimaryName(), activePrimaryUnit());
-  lv_table_set_cell_value(tableData, 0, 2, header);
-
-  if (activeSensorMode == SENSOR_MODE_SCD41)
-  {
-    lv_table_set_cell_value(tableData, 0, 3, "T/RH");
-  }
-  else if (activeSensorHasPressure())
-  {
-    snprintf(header, sizeof(header), "%s(%s)", activeSecondaryName(), activeSecondaryUnit());
-    lv_table_set_cell_value(tableData, 0, 3, header);
-  }
-  else
-  {
-    lv_table_set_cell_value(tableData, 0, 3, "-");
-  }
+  applyTableValueHeaders();
 
   for (int r = 1; r <= TABLE_VISIBLE_ROWS; r++)
   {
@@ -4996,15 +5190,22 @@ void updateTable()
       formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
       lv_table_set_cell_value(tableData, r, 2, text);
 
-      if (activeSensorMode == SENSOR_MODE_SCD41 &&
-          !isnan(pressureHistory[idx]) && !isnan(humidityHistory[idx]))
+      // %g so one column can hold a bus voltage, a pressure and an angle
+      // without either dropping the INA228's milliamps or padding hPa with
+      // decimals it does not have.
+      const int extraValues = activeSensorValueCount();
+      const bool secondUsable =
+        extraValues >= 2 && !isnan(pressureHistory[idx]) &&
+        (!activeSensorHasPressure() || pressureValueValid(pressureHistory[idx]));
+
+      if (extraValues >= 3 && secondUsable && !isnan(humidityHistory[idx]))
       {
-        snprintf(text, sizeof(text), "%.1f/%.0f", pressureHistory[idx], humidityHistory[idx]);
+        snprintf(text, sizeof(text), "%.4g/%.4g", pressureHistory[idx], humidityHistory[idx]);
         lv_table_set_cell_value(tableData, r, 3, text);
       }
-      else if (activeSensorHasPressure() && pressureValueValid(pressureHistory[idx]))
+      else if (secondUsable)
       {
-        snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
+        snprintf(text, sizeof(text), "%.4g", pressureHistory[idx]);
         lv_table_set_cell_value(tableData, r, 3, text);
       }
       else
@@ -6416,36 +6617,23 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e)
     return;
   }
 
-  fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit\n");
+  fprintf(file, CSV_HEADER_LINE "\n");
 
   for (int i = 0; i < sampleCount; i++)
   {
-    if (activeSensorHasPressure() && pressureValueValid(pressureHistory[i]))
-    {
-      fprintf(
-        file,
-        "%d,%lu,%s,%.4f,%s,%.4f,%s\n",
-        noHistory[i] > 0 ? noHistory[i] : (i + 1),
-        (unsigned long)timeHistory[i],
-        activeSensorName(),
-        tempHistory[i],
-        activePrimaryUnit(),
-        pressureHistory[i],
-        activeSecondaryUnit()
-      );
-    }
-    else
-    {
-      fprintf(
-        file,
-        "%d,%lu,%s,%.4f,%s,,,\n",
-        noHistory[i] > 0 ? noHistory[i] : (i + 1),
-        (unsigned long)timeHistory[i],
-        activeSensorName(),
-        tempHistory[i],
-        activePrimaryUnit()
-      );
-    }
+    char columns[160];
+    formatCsvValueColumns(tempHistory[i], pressureHistory[i], humidityHistory[i],
+                          columns, sizeof(columns));
+
+    fprintf(
+      file,
+      "%d,%lu,%s,%s\n",
+      noHistory[i] > 0 ? noHistory[i] : (i + 1),
+      (unsigned long)timeHistory[i],
+      activeSensorName(),
+      columns
+    );
+
   }
 
   fclose(file);
@@ -7033,7 +7221,8 @@ void createHomeUi()
     { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
     { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
     { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb },
-    { "전압 · 전류", "V · A · W", SENSOR_MODE_INA228, home_sensor_ina228_event_cb }
+    { "전압 · 전류", "V · A · W", SENSOR_MODE_INA228, home_sensor_ina228_event_cb },
+    { "회전",        "° · °/s",   SENSOR_MODE_ENCODER, home_sensor_encoder_event_cb }
   };
 
   for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
@@ -9478,6 +9667,44 @@ bool directIslSendSensorTypeIfNeeded()
   }
 
   // =====================================================
+  // 회전 엔코더: 각도와 각속도.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":2,\"items\":[";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\"}";
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_ENCODER", 2, 700))
+    {
+      setIslStatusText("회전 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+      setIslStatusText("회전 센서등록 OK: ANGL/ANGV");
+      return true;
+    }
+
+    Serial.print("Encoder sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("회전 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
   // INA228: three quantities from one reading, like SCD41.
   // =====================================================
   if (activeSensorMode == SENSOR_MODE_INA228)
@@ -9745,6 +9972,25 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+    }
+    else if (activeSensorMode == SENSOR_MODE_ENCODER)
+    {
+      payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+      payload += primaryValue;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGLE "\"}";
+
+      if (!isnan(packet.pressureHpa))
+      {
+        char rate[24];
+        snprintf(rate, sizeof(rate), "%.4f", packet.pressureHpa);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += rate;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGVEL "\"}";
+      }
     }
     else if (activeSensorMode == SENSOR_MODE_INA228)
     {
@@ -10073,6 +10319,25 @@ bool cloudSendBatchHistory()
         payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+      }
+      else if (activeSensorMode == SENSOR_MODE_ENCODER)
+      {
+        payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += tempValue;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGLE "\"}";
+
+        if (!isnan(pressureHistory[i]))
+        {
+          char rate[24];
+          snprintf(rate, sizeof(rate), "%.4f", pressureHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += rate;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGVEL "\"}";
+        }
       }
       else if (activeSensorMode == SENSOR_MODE_INA228)
       {
