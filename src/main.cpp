@@ -3456,6 +3456,7 @@ bool readIna228(float *voltageV, float *currentA, float *powerW)
 }
 
 void encoderEnd();
+void encoderZero();
 
 // Addresses the firmware already knows how to talk to, so a scan can say
 // which of what it found is a sensor the board supports.
@@ -3567,6 +3568,18 @@ bool encoderBegin()
   // Nothing to probe: an idle encoder is indistinguishable from an absent one
   // until it is turned, so report ready and let the reading show the truth.
   return true;
+}
+
+// Back to zero degrees without disturbing the interrupts.
+void encoderZero()
+{
+  noInterrupts();
+  encoderCount = 0;
+  interrupts();
+
+  encoderPrevCount = 0;
+  encoderPrevMs = millis();
+  encoderLastRateDegPerS = NAN;
 }
 
 // Hands the two pins back so the soft-I2C driver can drive them again.
@@ -6178,6 +6191,14 @@ static void start_event_cb(lv_event_t *e)
           setIslStatusText("SCD41 0x62 없음: 안정적 전원·SDA2·SCL3 확인");
         return;
       }
+    }
+
+    // The angle is cumulative, so a fresh run has to start from zero the way
+    // the clock and the sample count do - otherwise the first reading carries
+    // over however far the wheel was turned while setting the experiment up.
+    if (activeSensorMode == SENSOR_MODE_ENCODER && measurementCount == 0 && sampleCount == 0)
+    {
+      encoderZero();
     }
 
     if (measurementCount == 0 && sampleCount == 0)
