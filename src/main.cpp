@@ -713,10 +713,16 @@ static lv_obj_t *labelSettingsIsl;
 static lv_obj_t *islModuleTa;
 static lv_obj_t *sdFileList;
 
-#define SD_FILE_LIST_MAX 1
+// Files the list can hold. This was 1, left over from a build that cut every
+// buffer it could: the loop stopped after the first directory entry, and on a
+// card whose first entry is a hidden system folder no CSV ever appeared.
+// 32 x 96 bytes is 3 kB, which the reclaimed internal RAM affords.
+#define SD_FILE_LIST_MAX 32
 static char sdListedFiles[SD_FILE_LIST_MAX][96];
 static int sdListedFileCount = 0;
-#define CSV_FILE_VIEW_PAGE_BYTES 256  // File viewer disabled
+// Bytes shown per page in the file viewer. Also cut to a stub; 256 bytes is
+// about three CSV rows.
+#define CSV_FILE_VIEW_PAGE_BYTES 2048
 static char csvFileViewBuffer[CSV_FILE_VIEW_PAGE_BYTES + 1024];
 static char sdSelectedTextFile[96] = "";
 static long csvFileViewOffset = 0;
