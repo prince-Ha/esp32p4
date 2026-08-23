@@ -683,6 +683,8 @@ static lv_obj_t *labelBarBleTime;
 static lv_obj_t *labelBarBleWifi;
 static lv_obj_t *labelBarBleSd;
 static volatile bool pendingBleScan = false;
+// Scanning bit-bangs the bus, so it runs from the loop, not a callback.
+static volatile bool pendingI2cScan = false;
 
 // Bluetooth is off unless asked for. NimBLE holds DMA-capable internal RAM,
 // and that is the same pool the AES accelerator draws from for a TLS
@@ -3381,6 +3383,68 @@ bool readIna228(float *voltageV, float *currentA, float *powerW)
 
   ina228LastPowerW = *powerW;
   return true;
+}
+
+// Addresses the firmware already knows how to talk to, so a scan can say
+// which of what it found is a sensor the board supports.
+static const char *knownI2cDeviceName(uint8_t addr)
+{
+  switch (addr)
+  {
+    case 0x29: return "VL53L1X 거리";
+    case 0x40: return "INA228 전압·전류";
+    case 0x48: return "TMP117 정밀온도";
+    case 0x62: return "SCD41 이산화탄소";
+    case 0x76: case 0x77: return "DPS310 온도·기압";
+    default: return NULL;
+  }
+}
+
+// Walks the 7-bit address space and reports every device that acknowledges.
+// Adding a sensor starts here: a part whose address does not appear is a
+// wiring or power problem, and no amount of driver work will help.
+int scanSensorI2cBus(char *summary, size_t summaryLen)
+{
+  sdaHigh();
+  sclHigh();
+  delay(5);
+  softI2cRecoverBus();
+
+  int found = 0;
+  if (summary && summaryLen) summary[0] = '\0';
+
+  Serial.println("[I2C] scanning sensor bus (GPIO2/3)");
+
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++)
+  {
+    softI2cStart();
+    const bool ack = softI2cWriteByte((uint8_t)(addr << 1));
+    softI2cStop();
+
+    if (!ack) continue;
+
+    found++;
+    const char *known = knownI2cDeviceName(addr);
+
+    Serial.printf("[I2C] 0x%02X  %s\n", addr, known ? known : "(모르는 장치)");
+
+    if (summary && summaryLen)
+    {
+      char entry[64];
+      snprintf(entry, sizeof(entry), "%s0x%02X %s",
+               summary[0] ? " · " : "", addr, known ? known : "?");
+      strncat(summary, entry, summaryLen - strlen(summary) - 1);
+    }
+  }
+
+  Serial.printf("[I2C] %d device(s)\n", found);
+
+  if (found == 0 && summary && summaryLen)
+  {
+    snprintf(summary, summaryLen, "응답한 장치 없음 - 전원과 SDA/SCL 배선 확인");
+  }
+
+  return found;
 }
 
 bool activeSensorBegin()
@@ -7569,6 +7633,14 @@ static void ble_enable_event_cb(lv_event_t *e)
   }
 }
 
+static void i2c_scan_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (measuring) { setIslStatusText("측정 정지 후 센서 검색"); return; }
+
+  pendingI2cScan = true;
+}
+
 static void ble_scan_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -7837,9 +7909,10 @@ void createSettingsUi()
   lv_label_set_long_mode(labelWifiMode, LV_LABEL_LONG_CLIP);
 
   // Device-level entries that are not WiFi.
-  makeQuietButton(wifiCard, "블루투스 센서", 20, 330, 200, 46, go_ble_event_cb);
-  makeQuietButton(wifiCard, "전송 설정", 230, 330, 170, 46, go_isl_event_cb);
-  makeQuietButton(wifiCard, "다시 시작", 410, 330, 150, 46, board_restart_event_cb);
+  makeQuietButton(wifiCard, "센서 검색", 20, 330, 150, 46, i2c_scan_event_cb);
+  makeQuietButton(wifiCard, "블루투스 센서", 180, 330, 180, 46, go_ble_event_cb);
+  makeQuietButton(wifiCard, "전송 설정", 370, 330, 130, 46, go_isl_event_cb);
+  makeQuietButton(wifiCard, "다시 시작", 510, 330, 110, 46, board_restart_event_cb);
 
   labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 384, UI_TEXT_3);
   lv_obj_set_width(labelSettingsNote, 580);
@@ -11268,6 +11341,20 @@ void loop()
     {
       pendingBleScan = false;
       bleScanStart(6000);
+    }
+
+    if (pendingI2cScan)
+    {
+      pendingI2cScan = false;
+
+      char summary[160];
+      const int found = scanSensorI2cBus(summary, sizeof(summary));
+
+      char line[200];
+      snprintf(line, sizeof(line), "I2C %d개: %s", found, summary);
+      setIslStatusText(line);
+
+      if (labelSettingsNote) lv_label_set_text(labelSettingsNote, line);
     }
   }
 
