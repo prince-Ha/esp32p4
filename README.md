@@ -21,7 +21,7 @@ font rendering support.
   | 정밀 온도 | TMP117 | °C | I2C 0x48 |
   | 거리 | VL53L1X | mm | I2C 0x29 |
   | 전압 · 전류 | INA228 | A, V, W | I2C 0x40 |
-  | 회전 | Grove 광학 로터리 엔코더 | °, °/s | GPIO4/GPIO5 |
+  | 회전 | Grove 광학 로터리 엔코더 | °, °/s | 센서포트 A/B |
 
   설정 → **센서 검색** walks the I2C bus and lists what actually answers,
   which is the first thing to try when a sensor reads nothing.
@@ -55,16 +55,22 @@ not match the parts on your bench.
 
 ### Grove 광학 로터리 엔코더 wiring
 
-Quadrature A/B on plain digital pins, so it never appears in the I2C scan.
+The board has one fixed sensor connector, so the encoder's A and B outputs land
+on the same two signal lines every other sensor uses: **A on SDA (GPIO2)** and
+**B on SCL (GPIO3)**, the way the DS18B20 already shares GPIO2. Only one sensor
+mode runs at a time, and switching away from 회전 detaches the interrupts so
+the soft-I2C driver can drive those pins again.
+
+Because it is a quadrature device rather than an I2C one, it never answers an
+address, so 센서 검색 reports it separately: press it and keep the wheel
+turning, and it names whichever pins actually moved.
+
 Power it from **3.3 V** - the module accepts 5 V, but then its outputs are 5 V
 and the P4's pins are not 5 V tolerant.
 
-| Grove | Board |
-|---|---|
-| A | GPIO4 |
-| B | GPIO5 |
-| VCC | 3.3V |
-| GND | GND |
+It is a TCUT1600X01 photo-interrupter, so it only produces edges when a slotted
+disk passes through its gate. A wheel with no slits, or a module with nothing
+in the gap, reads a steady zero no matter how fast it spins.
 
 ## Getting started
 

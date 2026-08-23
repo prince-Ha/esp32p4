@@ -166,14 +166,20 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 // Grove 광학 로터리 엔코더 (TCUT1600X01)
 //
 // Not an I2C part: the module's two phototransistors drive a quadrature A/B
-// pair on plain digital pins, so it will never appear in the I2C scan. Both
-// edges of both channels are counted, giving four counts per slot.
+// pair, so it will never appear in the I2C scan. Both edges of both channels
+// are counted, giving four counts per slot.
+//
+// The board has one fixed sensor connector, so A and B land on the same two
+// signal lines every other sensor uses - SOFT_SDA and SOFT_SCL - the way the
+// DS18B20 already shares SOFT_SDA. Only one sensor mode runs at a time, but
+// the interrupts must come off those pins before anything bit-bangs I2C on
+// them again, or every clock edge of every transaction fires the ISR.
 //
 // Power it from 3.3 V. The module accepts 3.3 V or 5 V, but at 5 V its outputs
 // are 5 V and the P4's pins are not 5 V tolerant.
 // =====================================================
-#define ENCODER_PIN_A 4
-#define ENCODER_PIN_B 5
+#define ENCODER_PIN_A SOFT_SDA
+#define ENCODER_PIN_B SOFT_SCL
 
 // Counts for one full turn of the disk. A photo-interrupter counts slots in
 // whatever disk is fitted, so this depends on the wheel, not the module: a
@@ -2748,7 +2754,7 @@ const char *sensorDetailText(int mode)
     case SENSOR_MODE_TSL2591: return "TSL2591 · 0.1lx";
     case SENSOR_MODE_TMP117:  return "TMP117 · 0.001℃";
     case SENSOR_MODE_INA228:  return "INA228 · 0.001A · 0.001V · 0.001W";
-    case SENSOR_MODE_ENCODER: return "TCUT1600X01 · 4.5° · GPIO4/5";
+    case SENSOR_MODE_ENCODER: return "TCUT1600X01 · 4.5°";
     case SENSOR_MODE_VL53L1X: return "VL53L1X · 1mm";
     default:                  return "";
   }
@@ -3449,6 +3455,8 @@ bool readIna228(float *voltageV, float *currentA, float *powerW)
   return true;
 }
 
+void encoderEnd();
+
 // Addresses the firmware already knows how to talk to, so a scan can say
 // which of what it found is a sensor the board supports.
 static const char *knownI2cDeviceName(uint8_t addr)
@@ -3469,6 +3477,10 @@ static const char *knownI2cDeviceName(uint8_t addr)
 // wiring or power problem, and no amount of driver work will help.
 int scanSensorI2cBus(char *summary, size_t summaryLen)
 {
+  // Driving the bus with the encoder's interrupts still attached would fire
+  // the ISR on every clock edge of every address probe.
+  encoderEnd();
+
   sdaHigh();
   sclHigh();
   delay(5);
@@ -3557,6 +3569,18 @@ bool encoderBegin()
   return true;
 }
 
+// Hands the two pins back so the soft-I2C driver can drive them again.
+void encoderEnd()
+{
+  if (!encoderReady) return;
+
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A));
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B));
+  encoderReady = false;
+
+  Serial.println("[ENCODER] detached");
+}
+
 // Angle in degrees since the run started, and how fast it is turning.
 bool readEncoder(float *angleDeg, float *rateDegPerS)
 {
@@ -3591,17 +3615,12 @@ bool readEncoder(float *angleDeg, float *rateDegPerS)
   return true;
 }
 
-// Watches both channels for a moment and reports what they did. This is the
-// question worth answering first when the angle stays at zero: pins that never
-// move are a wiring or power fault, pins that move without the edge count
-// rising means the interrupt never attached, and both moving together means
-// the code is fine and only the counts-per-turn is wrong.
 // Pins this board leaves free and that are safe to switch to an input with a
 // pull-up. Deliberately no pin above 20: the ESP32-P4 runs its flash and PSRAM
 // on the high pads, and reconfiguring one of those would take the board down.
 // 2, 3, 7, 8, 14-19, 21-23 and 27 are left out because they are already
 // driving the sensor bus, the touch panel, the radio link or the backlight.
-static const uint8_t kEncoderCandidatePins[] = { 4, 5, 6, 9, 10, 11, 12, 13, 20 };
+static const uint8_t kEncoderCandidatePins[] = { SOFT_SDA, SOFT_SCL, 4, 5, 6, 9, 10, 11, 12, 13, 20 };
 
 // Which of the free pins move while the wheel turns. If the encoder is wired
 // somewhere other than GPIO4/5 this finds it, and if nothing moves anywhere
@@ -3663,57 +3682,20 @@ void encoderFindActivePins(char *out, size_t outSize)
   }
 }
 
-void encoderPinReport(char *out, size_t outSize)
-{
-  if (out == NULL || outSize == 0) return;
-
-  const bool wasReady = encoderReady;
-
-  if (!wasReady)
-  {
-    pinMode(ENCODER_PIN_A, INPUT_PULLUP);
-    pinMode(ENCODER_PIN_B, INPUT_PULLUP);
-  }
-
-  const uint32_t edgesBefore = encoderEdgeCount;
-  const int32_t countBefore = encoderCount;
-
-  int aChanges = 0;
-  int bChanges = 0;
-  int lastA = digitalRead(ENCODER_PIN_A);
-  int lastB = digitalRead(ENCODER_PIN_B);
-
-  // 600 ms is long enough to catch a hand turning the wheel and short enough
-  // not to stall the UI noticeably.
-  const unsigned long until = millis() + 600;
-
-  while ((long)(millis() - until) < 0)
-  {
-    const int a = digitalRead(ENCODER_PIN_A);
-    const int b = digitalRead(ENCODER_PIN_B);
-
-    if (a != lastA) { aChanges++; lastA = a; }
-    if (b != lastB) { bChanges++; lastB = b; }
-
-    delayMicroseconds(200);
-  }
-
-  snprintf(
-    out, outSize,
-    "엔코더 GPIO%d/%d A=%d B=%d 변화 %d/%d 인터럽트 %lu 카운트 %ld",
-    ENCODER_PIN_A, ENCODER_PIN_B, lastA, lastB, aChanges, bChanges,
-    (unsigned long)(encoderEdgeCount - edgesBefore),
-    (long)(encoderCount - countBefore)
-  );
-
-  Serial.print("[ENCODER] ");
-  Serial.println(out);
-
-  if (!wasReady) Serial.println("[ENCODER] not attached yet - select the 회전 tile first");
-}
-
 bool activeSensorBegin()
 {
+  // The encoder holds SOFT_SDA/SOFT_SCL as interrupt inputs, so every other
+  // mode has to take them back before it touches the bus.
+  if (activeSensorMode != SENSOR_MODE_ENCODER)
+  {
+    encoderEnd();
+  }
+
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    return encoderBegin();
+  }
+
   if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     return ds18b20Begin();
@@ -3745,11 +3727,6 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_INA228)
   {
     return ina228Begin();
-  }
-
-  if (activeSensorMode == SENSOR_MODE_ENCODER)
-  {
-    return encoderBegin();
   }
 
   return dps310Begin();
@@ -3920,7 +3897,7 @@ void setActiveSensorMode(int mode)
   }
   else if (activeSensorMode == SENSOR_MODE_ENCODER)
   {
-    setIslStatusText("회전: 엔코더 준비 / GPIO4·5, 3.3V 연결");
+    setIslStatusText("회전: 엔코더 준비 / 센서포트, 3.3V 연결");
   }
 }
 
@@ -11759,6 +11736,9 @@ void loop()
       // free pin instead and report whichever ones the wheel moves.
       char activePins[160];
       encoderFindActivePins(activePins, sizeof(activePins));
+
+      // Both the scan and the sweep left the shared pins as bare inputs.
+      dpsReady = activeSensorBegin();
 
       char line[420];
       snprintf(line, sizeof(line), "I2C %d개: %s\n엔코더 신호: %s", found, summary, activePins);
