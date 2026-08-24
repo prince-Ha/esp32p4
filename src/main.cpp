@@ -863,6 +863,7 @@ static volatile bool pendingBleScan = false;
 // A tapped row asks for a connection; the radio work happens in the loop.
 static volatile int pendingBleConnectIndex = -1;
 static volatile bool pendingBleDisconnect = false;
+static volatile int pendingBleDropSlot = -1;
 
 // Rows are rebuilt on every refresh, so the addresses they connect to live
 // here and the row only carries an index.
@@ -8268,103 +8269,148 @@ static void go_device_event_cb(lv_event_t *e)
   requestScreenSwitch(deviceScreen);
 }
 
+// One card per connected node, so a room with three of them reads at a glance,
+// and a plain list underneath of everything else the scan saw.
+//
+// The layout is fixed rather than flowed: LVGL clips a label to the width it
+// is given, and the previous version stacked four full-width status lines and
+// then overlapped the buttons with the hint text, which is what made this
+// screen look broken.
+static lv_obj_t *bleNodeCards[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardName[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardState[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardValue[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardUse[BLE_LINK_MAX_NODES];
+
+static void ble_slot_use_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (!bleLinkSlotIsSubscribed(slot)) return;
+
+  activeBleSlot = slot;
+  bleNodeRefreshMetadata();
+
+  if (activeSensorMode == SENSOR_MODE_BLE) updateActiveSensorUiLabels();
+  else pendingSensorMode = SENSOR_MODE_BLE;
+
+  refreshBleScreen();
+}
+
+static void ble_slot_drop_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  pendingBleDropSlot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+}
+
+// Everything the node is reporting, on one line: "온도 26.9C · 기압 1003.6hPa".
+static void bleSlotValueSummary(int slot, char *out, size_t outSize)
+{
+  out[0] = 0;
+
+  const int count = bleLinkValueCount(slot);
+
+  for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    float value = NAN;
+    char quantity[24] = "";
+    char unit[24] = "";
+
+    if (!bleLinkValueAt(slot, i, &value, quantity, unit, NULL)) break;
+
+    char entry[48];
+    snprintf(entry, sizeof(entry), "%s%s %.4g%s", out[0] ? "  ·  " : "",
+             quantity, value, unit);
+    strncat(out, entry, outSize - strlen(out) - 1);
+  }
+
+  if (out[0] == 0) snprintf(out, outSize, "값 대기 중");
+}
+
 void refreshBleScreen()
 {
   if (bleList == NULL) return;
 
+  // ---- the connected nodes -------------------------------------------------
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    if (bleNodeCards[slot] == NULL) continue;
+
+    const bool live = bleLinkSlotIsSubscribed(slot);
+    const bool busy = bleLinkSlotIsBusy(slot);
+    const bool active = live && slot == activeBleSlot;
+
+    if (!live && !busy)
+    {
+      lv_obj_add_flag(bleNodeCards[slot], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    lv_obj_clear_flag(bleNodeCards[slot], LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_set_style_bg_color(bleNodeCards[slot],
+                              lv_color_hex(active ? UI_ACCENT_TINT : UI_SURFACE), 0);
+    lv_obj_set_style_border_width(bleNodeCards[slot], active ? 2 : 0, 0);
+    lv_obj_set_style_border_color(bleNodeCards[slot], lv_color_hex(UI_ACCENT), 0);
+
+    lv_label_set_text(bleNodeCardName[slot], bleLinkSlotName(slot));
+    lv_label_set_text(bleNodeCardState[slot],
+                      active ? "측정 중" : bleLinkSlotState(slot));
+    lv_obj_set_style_text_color(bleNodeCardState[slot],
+                                lv_color_hex(active ? UI_ACCENT : UI_TEXT_3), 0);
+
+    char values[96];
+    bleSlotValueSummary(slot, values, sizeof(values));
+    lv_label_set_text(bleNodeCardValue[slot], values);
+
+    if (active) lv_obj_add_flag(bleNodeCardUse[slot], LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_clear_flag(bleNodeCardUse[slot], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- the summary line ----------------------------------------------------
   if (labelBleLink)
   {
-    char text[160];
-
+    char text[120];
     const int linked = bleLinkNodeCount();
 
-    if (linked == 0)
+    if (!bleEnabled)
     {
-      snprintf(text, sizeof(text), "연결된 노드 없음 · %s", bleLinkSlotState(activeBleSlot));
+      snprintf(text, sizeof(text), "블루투스가 꺼져 있습니다");
+    }
+    else if (linked == 0)
+    {
+      snprintf(text, sizeof(text), "연결된 노드 없음 · 아래 목록에서 센서를 누르세요");
     }
     else
     {
-      // One line covering every slot, so a room with three nodes can be read
-      // at a glance rather than one node at a time.
-      int used = snprintf(text, sizeof(text), "노드 %d/%d", linked, BLE_LINK_MAX_NODES);
-
-      for (int slot = 0; slot < BLE_LINK_MAX_NODES && used < (int)sizeof(text); slot++)
-      {
-        if (!bleLinkSlotIsSubscribed(slot)) continue;
-
-        float value = NAN;
-        char quantity[24] = "";
-        char unit[24] = "";
-
-        if (bleLinkValueAt(slot, 0, &value, quantity, unit, NULL))
-        {
-          used += snprintf(text + used, sizeof(text) - used, "  ·  %s%s %s %.4g%s",
-                           slot == activeBleSlot ? "▶" : "", bleLinkSlotName(slot),
-                           quantity, value, unit);
-        }
-        else
-        {
-          used += snprintf(text + used, sizeof(text) - used, "  ·  %s%s 값 대기",
-                           slot == activeBleSlot ? "▶" : "", bleLinkSlotName(slot));
-        }
-      }
+      snprintf(text, sizeof(text), "노드 %d/%d 연결됨", linked, BLE_LINK_MAX_NODES);
     }
 
     lv_label_set_text(labelBleLink, text);
   }
 
-  if (labelBleState)
-  {
-    if (!bleEnabled)
-    {
-      lv_label_set_text(labelBleState, "블루투스가 꺼져 있습니다.");
-    }
-    else if (bleScanIsRunning())
-    {
-      lv_label_set_text(labelBleState, "검색 중...");
-    }
-    else
-    {
-      char text[96];
-      const int candidates = bleScanCandidateCount();
-      snprintf(
-        text,
-        sizeof(text),
-        "센서 후보 %d개 · 이름 없는 기기 %d개 · 내 이름 %s",
-        candidates,
-        bleScanResultCount() - candidates,
-        bleAdvertisedName()
-      );
-      lv_label_set_text(labelBleState, text);
-    }
-  }
-
-  // Rebuild only when the count changed, so the list does not flicker while a
-  // scan is filling in.
-  static int lastShownCount = -1;
-  static bool lastScanning = false;
-  const int count = bleScanResultCount();
-  const bool scanning = bleScanIsRunning();
-
-  if (count == lastShownCount && scanning == lastScanning) return;
-  lastShownCount = count;
-  lastScanning = scanning;
-
+  // ---- the scan list -------------------------------------------------------
   lv_obj_clean(bleList);
 
-  if (count == 0)
+  const bool scanning = bleScanIsRunning();
+  const int count = bleScanResultCount();
+
+  if (labelBleState)
   {
-    lv_obj_t *empty = lv_label_create(bleList);
-    lv_label_set_text(empty, scanning ? "검색 중입니다." : "찾은 기기가 없습니다. 센서 전원을 켜고 다시 검색하세요.");
-    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_3), 0);
-    return;
+    char text[80];
+
+    if (scanning) snprintf(text, sizeof(text), "검색 중...");
+    else if (count == 0) snprintf(text, sizeof(text), "검색된 기기 없음");
+    else snprintf(text, sizeof(text), "검색된 기기 %d개", count);
+
+    lv_label_set_text(labelBleState, text);
   }
 
-  // Anonymous devices are collapsed into one line: thirteen rows of random
-  // addresses hide the one row that matters.
-  int anonymous = 0;
   int rowCount = 0;
+  int anonymous = 0;
+  int listed = 0;
 
   for (int i = 0; i < count; i++)
   {
@@ -8373,19 +8419,14 @@ void refreshBleScreen()
 
     if (!bleScanResultIsCandidate(&r)) { anonymous++; continue; }
 
-    lv_obj_t *row = lv_obj_create(bleList);
-    lv_obj_set_size(row, 908, 52);
+    const int slot = bleLinkSlotForAddress(r.address);
+    const bool live = slot >= 0 && bleLinkSlotIsSubscribed(slot);
 
-    // The row is the connect button: a separate one per row would not fit
-    // beside the address and the signal strength.
-    if (rowCount < BLE_SCAN_MAX_RESULTS)
-    {
-      snprintf(bleRowAddress[rowCount], sizeof(bleRowAddress[rowCount]), "%s", r.address);
-      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-      lv_obj_add_event_cb(row, ble_row_event_cb, LV_EVENT_CLICKED,
-                          (void *)(intptr_t)rowCount);
-      rowCount++;
-    }
+    // A node already shown as a card above does not need a second entry.
+    if (live) continue;
+
+    lv_obj_t *row = lv_obj_create(bleList);
+    lv_obj_set_size(row, 936, 56);
     lv_obj_set_style_bg_color(row, lv_color_hex(UI_SURFACE), 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(row, 10, 0);
@@ -8394,63 +8435,69 @@ void refreshBleScreen()
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+    if (rowCount < BLE_SCAN_MAX_RESULTS)
+    {
+      snprintf(bleRowAddress[rowCount], sizeof(bleRowAddress[rowCount]), "%s", r.address);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, ble_row_event_cb, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)rowCount);
+      rowCount++;
+    }
+
     lv_obj_t *name = lv_label_create(row);
     lv_label_set_text(name, r.name[0] ? r.name : "(이름 없음)");
     lv_obj_set_style_text_font(name, FONT_KR, 0);
     lv_obj_set_style_text_color(name, lv_color_hex(r.name[0] ? UI_TEXT : UI_TEXT_3), 0);
-    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 14, 6);
+    lv_obj_set_width(name, 520);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 16, 8);
 
-    // The service UUID is the field that identifies an unknown sensor, so it
-    // is shown rather than hidden behind a detail view.
+    const bool isSensorNode = strstr(r.services, "6e5f0001") != NULL;
+
     lv_obj_t *detail = lv_label_create(row);
-    char text[96];
-    snprintf(text, sizeof(text), "%s  ·  %s", r.address,
-             r.services[0] ? r.services : "서비스 광고 없음");
-    lv_label_set_text(detail, text);
+    lv_label_set_text(detail, isSensorNode ? "이 보드용 센서 노드" : r.address);
     lv_obj_set_style_text_font(detail, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(detail, lv_color_hex(UI_TEXT_3), 0);
-    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 14, 28);
-
-    const bool isLinked =
-      bleLinkSlotForAddress(r.address) >= 0 &&
-      bleLinkSlotIsSubscribed(bleLinkSlotForAddress(r.address));
-
-    if (isLinked)
-    {
-      lv_obj_set_style_bg_color(row, lv_color_hex(UI_ACCENT_TINT), 0);
-      lv_obj_set_style_border_color(row, lv_color_hex(UI_ACCENT), 0);
-      lv_obj_set_style_border_width(row, 2, 0);
-    }
+    lv_obj_set_style_text_color(detail,
+                                lv_color_hex(isSensorNode ? UI_OK : UI_TEXT_3), 0);
+    lv_obj_set_width(detail, 520);
+    lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 16, 32);
 
     lv_obj_t *rssi = lv_label_create(row);
-    snprintf(text, sizeof(text), "%s%d dBm", isLinked ? "연결됨  ·  " : "", r.rssi);
+    char text[40];
+    snprintf(text, sizeof(text), "%s%d dBm",
+             (slot >= 0 && bleLinkSlotIsBusy(slot)) ? "연결 중  ·  " : "", r.rssi);
     lv_label_set_text(rssi, text);
     lv_obj_set_style_text_font(rssi, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(rssi, lv_color_hex(UI_TEXT_2), 0);
-    lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -14, 0);
+    lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -16, 0);
+
+    listed++;
   }
 
-  if (anonymous > 0)
+  if (listed == 0 && !scanning)
+  {
+    lv_obj_t *empty = lv_label_create(bleList);
+    lv_label_set_text(
+      empty,
+      count == 0
+        ? "센서 노드의 전원을 켜고 [다시 검색]을 누르세요."
+        : "연결할 수 있는 센서를 찾지 못했습니다. 이름도 서비스도 알리지 않는 주변 기기는 숨겼습니다."
+    );
+    lv_obj_set_width(empty, 900);
+    lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_3), 0);
+  }
+
+  if (anonymous > 0 && listed > 0)
   {
     lv_obj_t *note = lv_label_create(bleList);
     char text[96];
-    snprintf(
-      text,
-      sizeof(text),
-      "이름도 서비스도 알리지 않는 기기 %d개는 숨겼습니다. 주변 휴대폰·노트북입니다.",
-      anonymous
-    );
+    snprintf(text, sizeof(text), "주변 휴대폰·노트북 %d개는 숨겼습니다.", anonymous);
     lv_label_set_text(note, text);
     lv_obj_set_style_text_font(note, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(note, lv_color_hex(UI_TEXT_3), 0);
-  }
-
-  if (count > 0 && anonymous == count)
-  {
-    lv_obj_t *empty = lv_label_create(bleList);
-    lv_label_set_text(empty, "연결할 수 있는 센서를 찾지 못했습니다. 센서 전원을 켜고 가까이에서 다시 검색하세요.");
-    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_2), 0);
   }
 }
 
@@ -8471,26 +8518,57 @@ void createBleUi()
     &labelBarBleSd
   );
 
-  makeHeading(bleScreen, "블루투스 센서", 28, 58, UI_TEXT);
+  makeHeading(bleScreen, "블루투스", 28, 58, UI_TEXT);
 
-  labelBleState = makeSmallLabel(bleScreen, "검색 전", 28, 94, UI_TEXT_3);
-  lv_obj_set_width(labelBleState, 600);
-  lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_CLIP);
+  labelBleLink = makeSmallLabel(bleScreen, "연결된 노드 없음", 28, 92, UI_TEXT_2);
+  lv_obj_set_width(labelBleLink, 580);
+  lv_label_set_long_mode(labelBleLink, LV_LABEL_LONG_DOT);
 
-  makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
   makeQuietButton(bleScreen, "켜기/끄기", 648, 60, 168, 44, ble_enable_event_cb);
+  makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
 
-  labelBleLink = makeSmallLabel(bleScreen, "연결 안 됨", 28, 116, UI_TEXT_2);
-  lv_obj_set_width(labelBleLink, 968);
-  lv_label_set_long_mode(labelBleLink, LV_LABEL_LONG_CLIP);
+  // ---- one card per connected node ------------------------------------------
+  const int cardW = 312;
+  const int cardGap = 16;
 
-  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 138, UI_TEXT_2);
-  lv_obj_set_width(labelBleEnabledState, 968);
-  lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_CLIP);
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    lv_obj_t *card = makePanel(bleScreen, 28 + slot * (cardW + cardGap), 120, cardW, 140);
+    bleNodeCards[slot] = card;
+
+    bleNodeCardName[slot] = makeLabel(card, "", 16, 12, UI_TEXT);
+    lv_obj_set_width(bleNodeCardName[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardName[slot], LV_LABEL_LONG_DOT);
+
+    bleNodeCardState[slot] = makeSmallLabel(card, "", 16, 42, UI_TEXT_3);
+    lv_obj_set_width(bleNodeCardState[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardState[slot], LV_LABEL_LONG_DOT);
+
+    bleNodeCardValue[slot] = makeSmallLabel(card, "", 16, 66, UI_TEXT_2);
+    lv_obj_set_width(bleNodeCardValue[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardValue[slot], LV_LABEL_LONG_DOT);
+
+    // The slot travels on the button itself: the helpers attach the handler,
+    // so adding a second one here would fire it twice, the first time with a
+    // null user_data that reads back as slot 0.
+    bleNodeCardUse[slot] = makePrimaryButton(card, "이 센서로 측정", 16, 94,
+                                             170, 36, UI_ACCENT, ble_slot_use_event_cb);
+    lv_obj_set_user_data(bleNodeCardUse[slot], (void *)(intptr_t)slot);
+
+    lv_obj_t *drop = makeQuietButton(card, "해제", 196, 94, 100, 36, ble_slot_drop_event_cb);
+    lv_obj_set_user_data(drop, (void *)(intptr_t)slot);
+
+    lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- everything else the scan saw -----------------------------------------
+  labelBleState = makeSmallLabel(bleScreen, "검색 전", 28, 274, UI_TEXT_3);
+  lv_obj_set_width(labelBleState, 500);
+  lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_DOT);
 
   bleList = lv_obj_create(bleScreen);
-  lv_obj_set_size(bleList, 968, 300);
-  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 166);
+  lv_obj_set_size(bleList, 968, 202);
+  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 300);
   lv_obj_set_style_bg_color(bleList, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(bleList, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bleList, 0, 0);
@@ -8500,20 +8578,14 @@ void createBleUi()
   lv_obj_set_flex_flow(bleList, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_scrollbar_mode(bleList, LV_SCROLLBAR_MODE_AUTO);
 
-  makeQuietButton(bleScreen, "연결 해제", 628, 474, 170, 44, ble_disconnect_event_cb);
-  makePrimaryButton(bleScreen, "이 센서로 측정", 808, 474, 188, 44, UI_ACCENT, ble_use_sensor_event_cb);
-
-  makeSmallLabel(
-    bleScreen,
-    "목록에서 센서를 누르면 연결합니다. 연결된 뒤 [이 센서로 측정]을 누르면 측정 화면으로 넘어갑니다.",
-    28,
-    486,
-    UI_TEXT_3
-  );
+  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 512, UI_TEXT_3);
+  lv_obj_set_width(labelBleEnabledState, 968);
+  lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_DOT);
 
   lv_label_set_text(
     labelBleEnabledState,
-    bleEnabled ? "블루투스: 켜짐" : "블루투스: 꺼짐 — 켜면 다음 시작부터 검색할 수 있습니다."
+    bleEnabled ? "목록에서 센서를 누르면 연결합니다."
+               : "블루투스가 꺼져 있습니다. 켜면 다음 시작부터 검색할 수 있습니다."
   );
 
   createTabBar(bleScreen, TAB_BLE);
@@ -12323,6 +12395,14 @@ void loop()
     {
       pendingBleDisconnect = false;
       bleLinkDisconnect();
+      refreshBleScreen();
+    }
+
+    if (pendingBleDropSlot >= 0)
+    {
+      const int slot = pendingBleDropSlot;
+      pendingBleDropSlot = -1;
+      bleLinkDisconnectSlot(slot);
       refreshBleScreen();
     }
 
