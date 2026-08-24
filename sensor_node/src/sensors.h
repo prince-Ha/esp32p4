@@ -32,8 +32,14 @@ typedef enum
   NODE_SENSOR_SCD41,
   NODE_SENSOR_TSL2591,
   NODE_SENSOR_VL53L1X,
-  NODE_SENSOR_INA228
+  NODE_SENSOR_INA228,
+  NODE_SENSOR_DS18B20
 } NodeSensorKind;
+
+// The DS18B20 is a 1-Wire part, so no I2C scan will ever find it. Its data
+// line goes here; the other two wires are 3.3 V and GND, and the line needs a
+// 4.7 kΩ pull-up to 3.3 V unless the module already carries one.
+#define ONE_WIRE_PIN 4
 
 // Walks the bus, identifies what is there and initialises it. Safe to call
 // repeatedly: a sensor plugged in after boot is picked up on a later call.

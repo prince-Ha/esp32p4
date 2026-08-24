@@ -675,6 +675,195 @@ static int ina228Read(NodeValue *out, int maxValues)
   return 3;
 }
 
+// ------------------------------------------------------------ DS18B20 ------
+//
+// 1-Wire, ported from the P4 with its timings unchanged. Every slot is timed
+// in microseconds with interrupts off, because a late edge is read as the
+// wrong bit.
+//
+// Conversion takes up to 750 ms at 12-bit resolution, which is most of the
+// node's one-second cycle, so a reading is started on one pass and collected
+// on the next rather than blocking the loop.
+
+#define DS18B20_CONVERT_MS 1000
+
+static bool dsConversionStarted = false;
+static unsigned long dsConversionStartMs = 0;
+
+static inline void dsOwRelease()
+{
+  pinMode(ONE_WIRE_PIN, INPUT_PULLUP);
+}
+
+static inline void dsOwLow()
+{
+  digitalWrite(ONE_WIRE_PIN, LOW);
+  pinMode(ONE_WIRE_PIN, OUTPUT);
+}
+
+static inline int dsOwReadLevel()
+{
+  return digitalRead(ONE_WIRE_PIN);
+}
+
+static bool dsOwReset()
+{
+  bool presence;
+  noInterrupts();
+  dsOwLow();
+  delayMicroseconds(520);
+  dsOwRelease();
+  delayMicroseconds(80);
+  presence = (dsOwReadLevel() == 0);
+  delayMicroseconds(450);
+  interrupts();
+  return presence;
+}
+
+static void dsOwWriteBit(uint8_t bitValue)
+{
+  noInterrupts();
+  if (bitValue)
+  {
+    dsOwLow();
+    delayMicroseconds(8);
+    dsOwRelease();
+    delayMicroseconds(80);
+  }
+  else
+  {
+    dsOwLow();
+    delayMicroseconds(80);
+    dsOwRelease();
+    delayMicroseconds(12);
+  }
+  interrupts();
+}
+
+static uint8_t dsOwReadBit()
+{
+  uint8_t bitValue;
+  noInterrupts();
+  dsOwLow();
+  delayMicroseconds(4);
+  dsOwRelease();
+  delayMicroseconds(15);
+  bitValue = dsOwReadLevel();
+  delayMicroseconds(65);
+  interrupts();
+  return bitValue;
+}
+
+static void dsOwWriteByte(uint8_t data)
+{
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    dsOwWriteBit(data & 0x01);
+    data >>= 1;
+  }
+}
+
+static uint8_t dsOwReadByte()
+{
+  uint8_t data = 0;
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    if (dsOwReadBit()) data |= (1 << i);
+  }
+  return data;
+}
+
+static uint8_t dsCrc8Dallas(const uint8_t *data, uint8_t len)
+{
+  uint8_t crc = 0;
+
+  while (len--)
+  {
+    uint8_t inByte = *data++;
+    for (uint8_t i = 0; i < 8; i++)
+    {
+      const uint8_t mix = (crc ^ inByte) & 0x01;
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      inByte >>= 1;
+    }
+  }
+
+  return crc;
+}
+
+static bool dsStartConversion()
+{
+  if (!dsOwReset()) return false;
+
+  dsOwWriteByte(0xCC);   // Skip ROM: one part on the line
+  dsOwWriteByte(0x44);   // Convert T
+
+  dsConversionStarted = true;
+  dsConversionStartMs = millis();
+  return true;
+}
+
+static bool ds18b20Begin()
+{
+  dsOwRelease();
+  delay(10);
+  dsConversionStarted = false;
+
+  // A DS18B20 answers a reset by pulling the line down itself. Nothing there
+  // leaves it held high by the pull-up.
+  if (!dsOwReset()) return false;
+
+  Serial.printf("[DS18B20] present on GPIO%d\n", ONE_WIRE_PIN);
+  return dsStartConversion();
+}
+
+static int ds18b20Read(NodeValue *out, int maxValues)
+{
+  if (maxValues < 1) return 0;
+
+  if (!dsConversionStarted)
+  {
+    dsStartConversion();
+    return 0;
+  }
+
+  if (millis() - dsConversionStartMs < DS18B20_CONVERT_MS) return 0;
+
+  if (!dsOwReset())
+  {
+    dsConversionStarted = false;
+    return 0;
+  }
+
+  dsOwWriteByte(0xCC);
+  dsOwWriteByte(0xBE);   // Read scratchpad
+
+  uint8_t data[9];
+  for (uint8_t i = 0; i < 9; i++) data[i] = dsOwReadByte();
+
+  if (dsCrc8Dallas(data, 8) != data[8])
+  {
+    dsStartConversion();
+    return 0;
+  }
+
+  const float t = (float)(int16_t)((data[1] << 8) | data[0]) / 16.0f;
+
+  if (t < -55.0f || t > 125.0f)
+  {
+    dsStartConversion();
+    return 0;
+  }
+
+  out[0].value = t;
+  out[0].name = "수온";
+  out[0].unit = "C";
+
+  dsStartConversion();
+  return 1;
+}
+
 // ------------------------------------------------------------ dispatch -----
 
 bool nodeSensorDetect()
@@ -728,6 +917,16 @@ bool nodeSensorDetect()
     return true;
   }
 
+  // Nothing on I2C. The DS18B20 is 1-Wire and answers a reset pulse instead of
+  // an address, so it is looked for separately rather than being missed.
+  if (ds18b20Begin())
+  {
+    detectedKind = NODE_SENSOR_DS18B20;
+    detectedAddress = 0x00;
+    Serial.printf("[SENSOR] using %s on GPIO%d\n", nodeSensorName(), ONE_WIRE_PIN);
+    return true;
+  }
+
   return false;
 }
 
@@ -746,6 +945,7 @@ const char *nodeSensorName()
     case NODE_SENSOR_TSL2591: return "TSL2591 조도";
     case NODE_SENSOR_VL53L1X: return "VL53L1X 거리";
     case NODE_SENSOR_INA228:  return "INA228 전압·전류";
+    case NODE_SENSOR_DS18B20: return "DS18B20 수온";
     default: return "없음";
   }
 }
@@ -764,6 +964,7 @@ int nodeSensorRead(NodeValue *out, int maxValues)
     case NODE_SENSOR_TSL2591: count = tsl2591Read(out, maxValues); break;
     case NODE_SENSOR_VL53L1X: count = vl53Read(out, maxValues); break;
     case NODE_SENSOR_INA228:  count = ina228Read(out, maxValues); break;
+    case NODE_SENSOR_DS18B20: count = ds18b20Read(out, maxValues); break;
     default: break;
   }
 
@@ -774,11 +975,22 @@ int nodeSensorRead(NodeValue *out, int maxValues)
   }
 
   // Zero is not the same as gone. An SCD41 warming up returns nothing for
-  // five seconds and is still very much on the bus, so ask the address
-  // directly: a part that still acknowledges is simply not ready.
-  Wire.beginTransmission(detectedAddress);
+  // five seconds and is still very much on the bus, and a DS18B20 says nothing
+  // for the first second of every conversion. Ask the part directly: one that
+  // still answers is simply not ready.
+  bool stillThere = false;
 
-  if (Wire.endTransmission() == 0)
+  if (detectedKind == NODE_SENSOR_DS18B20)
+  {
+    stillThere = dsOwReset();
+  }
+  else
+  {
+    Wire.beginTransmission(detectedAddress);
+    stillThere = Wire.endTransmission() == 0;
+  }
+
+  if (stillThere)
   {
     missingReads = 0;
     return 0;
@@ -789,8 +1001,7 @@ int nodeSensorRead(NodeValue *out, int maxValues)
   // the same as changing it before boot.
   if (++missingReads >= 3)
   {
-    Serial.printf("[SENSOR] %s stopped answering at 0x%02X; looking again\n",
-                  nodeSensorName(), detectedAddress);
+    Serial.printf("[SENSOR] %s stopped answering; looking again\n", nodeSensorName());
     missingReads = 0;
     detectedKind = NODE_SENSOR_NONE;
     detectedAddress = 0x00;
