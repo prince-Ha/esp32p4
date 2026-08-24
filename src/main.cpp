@@ -162,6 +162,16 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 #define SENSOR_MODE_INA228    7
 #define SENSOR_MODE_ENCODER   8
 
+// A sensor on another board, reached over BLE. It has no tile on the home
+// grid because it is not wired to this board: it is chosen on the 블루투스
+// screen, where it was connected.
+#define SENSOR_MODE_BLE       9
+
+// A node publishes once a second. Past this the link is up but the node has
+// gone quiet, and showing its last number as if it were current would be a
+// lie, so the reading is refused instead.
+#define BLE_READING_MAX_AGE_MS 5000
+
 // =====================================================
 // Grove 광학 로터리 엔코더 (TCUT1600X01)
 //
@@ -287,6 +297,11 @@ static bool encoderReady = false;
 static int32_t encoderPrevCount = 0;
 static unsigned long encoderPrevMs = 0;
 static float encoderLastRateDegPerS = NAN;
+
+// Filled in from each notification: a node names its own quantity and unit,
+// so unlike every other sensor here these are not compile-time constants.
+static char bleNodeQuantity[24] = "블루투스";
+static char bleNodeUnit[24] = "-";
 
 static bool ina228Ready = false;
 static float ina228LastPowerW = NAN;
@@ -730,6 +745,14 @@ static lv_obj_t *labelBarBleTime;
 static lv_obj_t *labelBarBleWifi;
 static lv_obj_t *labelBarBleSd;
 static volatile bool pendingBleScan = false;
+// A tapped row asks for a connection; the radio work happens in the loop.
+static volatile int pendingBleConnectIndex = -1;
+static volatile bool pendingBleDisconnect = false;
+
+// Rows are rebuilt on every refresh, so the addresses they connect to live
+// here and the row only carries an index.
+static char bleRowAddress[BLE_SCAN_MAX_RESULTS][18];
+static lv_obj_t *labelBleLink = NULL;
 // Scanning bit-bangs the bus, so it runs from the loop, not a callback.
 static volatile bool pendingI2cScan = false;
 
@@ -2674,6 +2697,7 @@ const char *activeSensorName()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "TMP117 정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "INA228 전압·전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전 엔코더";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "VL53L1X 거리";
   return "DPS310";
 }
@@ -2686,6 +2710,7 @@ const char *activeMeasurementTitle()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀 온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전압 · 전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도 · 기압";
 }
@@ -2698,6 +2723,7 @@ const char *activePrimaryName()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "각도";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도";
 }
@@ -2709,6 +2735,7 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
   if (activeSensorMode == SENSOR_MODE_INA228) return "A";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "°";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeUnit;
   return "℃";
 }
 
@@ -2737,6 +2764,7 @@ const char *islTemperatureNickname()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류센서";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전센서";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
   return "온도센서";
 }
 
@@ -2843,6 +2871,12 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
   {
     if (includeName) snprintf(out, outSize, "각도: %.1f°", value);
     else snprintf(out, outSize, "%.1f", value);
+  }
+  else if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    // A node can be sending anything, so no assumption about decimals.
+    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity, value, bleNodeUnit);
+    else snprintf(out, outSize, "%.4g", value);
   }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
@@ -2968,6 +3002,7 @@ static void measureValuePlaceholder(int index, char *out, size_t outSize)
   if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "--.-");
   else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
   else if (activeSensorMode == SENSOR_MODE_ENCODER) snprintf(out, outSize, "---.-");
+  else if (activeSensorMode == SENSOR_MODE_BLE) snprintf(out, outSize, "----");
   else snprintf(out, outSize, "----.-");
 }
 
@@ -3709,6 +3744,13 @@ bool activeSensorBegin()
     return encoderBegin();
   }
 
+  // Nothing to initialise: the node is already connected, or it is not, and
+  // that was settled on the 블루투스 screen.
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    return bleLinkIsSubscribed();
+  }
+
   if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     return ds18b20Begin();
@@ -3803,6 +3845,24 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
     return true;
   }
 
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    float value = NAN;
+    char quantity[24] = "";
+    char unit[24] = "";
+    uint32_t ageMs = 0;
+
+    if (!bleLinkLatestReading(&value, quantity, unit, &ageMs)) return false;
+    if (ageMs > BLE_READING_MAX_AGE_MS) return false;
+
+    if (quantity[0]) snprintf(bleNodeQuantity, sizeof(bleNodeQuantity), "%s", quantity);
+    if (unit[0]) snprintf(bleNodeUnit, sizeof(bleNodeUnit), "%s", unit);
+
+    *primaryValue = value;
+    *secondaryValue = NAN;
+    return true;
+  }
+
   return readDps310(primaryValue, secondaryValue);
 }
 
@@ -3815,6 +3875,7 @@ void setActiveSensorMode(int mode)
       mode != SENSOR_MODE_TMP117 &&
       mode != SENSOR_MODE_INA228 &&
       mode != SENSOR_MODE_ENCODER &&
+      mode != SENSOR_MODE_BLE &&
       mode != SENSOR_MODE_VL53L1X)
   {
     return;
@@ -3911,6 +3972,13 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_ENCODER)
   {
     setIslStatusText("회전: 엔코더 준비 / 센서포트, 3.3V 연결");
+  }
+  else if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    char text[96];
+    snprintf(text, sizeof(text), "블루투스 센서: %s / %s",
+             bleLinkPeerName()[0] ? bleLinkPeerName() : "-", bleLinkStateText());
+    setIslStatusText(text);
   }
 }
 
@@ -7960,6 +8028,36 @@ static void i2c_scan_event_cb(lv_event_t *e)
   pendingI2cScan = true;
 }
 
+static void ble_row_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= BLE_SCAN_MAX_RESULTS) return;
+
+  pendingBleConnectIndex = index;
+}
+
+static void ble_disconnect_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  pendingBleDisconnect = true;
+}
+
+static void ble_use_sensor_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  if (!bleLinkIsSubscribed())
+  {
+    setIslStatusText("먼저 센서 노드에 연결하세요");
+    return;
+  }
+
+  pendingSensorMode = SENSOR_MODE_BLE;
+  requestScreenSwitch(measureScreen);
+}
+
 static void ble_scan_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -7977,6 +8075,41 @@ static void go_ble_event_cb(lv_event_t *e)
 void refreshBleScreen()
 {
   if (bleList == NULL) return;
+
+  if (labelBleLink)
+  {
+    char text[160];
+
+    if (bleLinkIsSubscribed())
+    {
+      float value = NAN;
+      char quantity[24] = "";
+      char unit[24] = "";
+      uint32_t ageMs = 0;
+
+      if (bleLinkLatestReading(&value, quantity, unit, &ageMs))
+      {
+        snprintf(text, sizeof(text), "%s · %s · %s %.4g%s (%lu초 전)",
+                 bleLinkPeerName(), bleLinkStateText(), quantity, value, unit,
+                 (unsigned long)(ageMs / 1000));
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "%s · %s · 아직 값 없음",
+                 bleLinkPeerName(), bleLinkStateText());
+      }
+    }
+    else if (bleLinkPeerName()[0])
+    {
+      snprintf(text, sizeof(text), "%s · %s", bleLinkPeerName(), bleLinkStateText());
+    }
+    else
+    {
+      snprintf(text, sizeof(text), "%s", bleLinkStateText());
+    }
+
+    lv_label_set_text(labelBleLink, text);
+  }
 
   if (labelBleState)
   {
@@ -8029,6 +8162,7 @@ void refreshBleScreen()
   // Anonymous devices are collapsed into one line: thirteen rows of random
   // addresses hide the one row that matters.
   int anonymous = 0;
+  int rowCount = 0;
 
   for (int i = 0; i < count; i++)
   {
@@ -8039,6 +8173,17 @@ void refreshBleScreen()
 
     lv_obj_t *row = lv_obj_create(bleList);
     lv_obj_set_size(row, 908, 52);
+
+    // The row is the connect button: a separate one per row would not fit
+    // beside the address and the signal strength.
+    if (rowCount < BLE_SCAN_MAX_RESULTS)
+    {
+      snprintf(bleRowAddress[rowCount], sizeof(bleRowAddress[rowCount]), "%s", r.address);
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, ble_row_event_cb, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)rowCount);
+      rowCount++;
+    }
     lv_obj_set_style_bg_color(row, lv_color_hex(UI_SURFACE), 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(row, 10, 0);
@@ -8064,8 +8209,18 @@ void refreshBleScreen()
     lv_obj_set_style_text_color(detail, lv_color_hex(UI_TEXT_3), 0);
     lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 14, 28);
 
+    const bool isLinked =
+      bleLinkIsSubscribed() && strcmp(bleLinkPeerName(), r.name[0] ? r.name : r.address) == 0;
+
+    if (isLinked)
+    {
+      lv_obj_set_style_bg_color(row, lv_color_hex(UI_ACCENT_TINT), 0);
+      lv_obj_set_style_border_color(row, lv_color_hex(UI_ACCENT), 0);
+      lv_obj_set_style_border_width(row, 2, 0);
+    }
+
     lv_obj_t *rssi = lv_label_create(row);
-    snprintf(text, sizeof(text), "%d dBm", r.rssi);
+    snprintf(text, sizeof(text), "%s%d dBm", isLinked ? "연결됨  ·  " : "", r.rssi);
     lv_label_set_text(rssi, text);
     lv_obj_set_style_text_font(rssi, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(rssi, lv_color_hex(UI_TEXT_2), 0);
@@ -8122,13 +8277,17 @@ void createBleUi()
   makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
   makeQuietButton(bleScreen, "켜기/끄기", 648, 60, 168, 44, ble_enable_event_cb);
 
-  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 116, UI_TEXT_2);
+  labelBleLink = makeSmallLabel(bleScreen, "연결 안 됨", 28, 116, UI_TEXT_2);
+  lv_obj_set_width(labelBleLink, 968);
+  lv_label_set_long_mode(labelBleLink, LV_LABEL_LONG_CLIP);
+
+  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 138, UI_TEXT_2);
   lv_obj_set_width(labelBleEnabledState, 968);
   lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_CLIP);
 
   bleList = lv_obj_create(bleScreen);
-  lv_obj_set_size(bleList, 968, 336);
-  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 148);
+  lv_obj_set_size(bleList, 968, 300);
+  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 166);
   lv_obj_set_style_bg_color(bleList, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(bleList, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bleList, 0, 0);
@@ -8138,11 +8297,14 @@ void createBleUi()
   lv_obj_set_flex_flow(bleList, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_scrollbar_mode(bleList, LV_SCROLLBAR_MODE_AUTO);
 
+  makeQuietButton(bleScreen, "연결 해제", 628, 474, 170, 44, ble_disconnect_event_cb);
+  makePrimaryButton(bleScreen, "이 센서로 측정", 808, 474, 188, 44, UI_ACCENT, ble_use_sensor_event_cb);
+
   makeSmallLabel(
     bleScreen,
-    "센서를 연결하려면 그 센서가 광고하는 서비스 UUID를 알아야 합니다. 위 목록의 UUID를 확인하세요.",
+    "목록에서 센서를 누르면 연결합니다. 연결된 뒤 [이 센서로 측정]을 누르면 측정 화면으로 넘어갑니다.",
     28,
-    500,
+    486,
     UI_TEXT_3
   );
 
@@ -11736,6 +11898,25 @@ void loop()
     {
       pendingBleScan = false;
       bleScanStart(6000);
+    }
+
+    if (pendingBleDisconnect)
+    {
+      pendingBleDisconnect = false;
+      bleLinkDisconnect();
+      refreshBleScreen();
+    }
+
+    if (pendingBleConnectIndex >= 0)
+    {
+      const int index = pendingBleConnectIndex;
+      pendingBleConnectIndex = -1;
+
+      if (index < BLE_SCAN_MAX_RESULTS && bleRowAddress[index][0])
+      {
+        bleLinkConnect(bleRowAddress[index]);
+        refreshBleScreen();
+      }
     }
 
     if (pendingI2cScan)

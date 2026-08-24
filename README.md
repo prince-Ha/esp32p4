@@ -34,6 +34,37 @@ font rendering support.
   `tools/make_heading_font.py`, which `platformio.ini` runs before every build
   so a newly added Korean string cannot ship as tofu.
 
+## BLE sensor nodes
+
+The board is also a hub. [`sensor_node/`](sensor_node/) is a separate firmware
+for a plain ESP32 dev board: it advertises the service the P4 scans for and
+notifies one reading per second, and the P4 treats those readings like any
+sensor on its own bus - measurement screen, CSV, the lot.
+
+```bash
+cd sensor_node && pio run -t upload
+```
+
+Then on the P4: 설정 -> 블루투스 센서 -> 다시 검색, tap the `SciNode-XXXX` row
+to connect, and press **이 센서로 측정**.
+
+The node ships sending an obvious 0-100 test ramp. Replace `readNodeSensor()`
+at the bottom of [`sensor_node/src/main.cpp`](sensor_node/src/main.cpp) with a
+real sensor read - it is the only function meant to be edited.
+
+Two things to know about the payload, which is one line of
+`<time_s>,<sensor>,<value>,<unit>`:
+
+- Commas separate the fields, so no field may contain one.
+- The unit is drawn in the 24 px subset font, so keep it ASCII (`C`, `hPa`,
+  `lx`). A Korean unit renders as empty boxes; the quantity name is drawn in
+  the full-range font and can be Korean.
+
+The P4's BLE and its TLS uploads compete for the same contiguous DMA-capable
+internal memory, which is why Bluetooth is opt-in rather than always on. If
+uploads to 지능형 과학실 start failing with DMA descriptor errors after the
+link is up, that is the trade to look at first.
+
 ## Hardware pinout
 
 See [`include/pins_config.h`](include/pins_config.h) for the LCD and touch

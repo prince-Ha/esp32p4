@@ -75,6 +75,42 @@ int bleScanCandidateCount();
 // Prints the current results over Serial, one device per line.
 void bleScanDumpResults();
 
+// =====================================================
+// Central role: linking to one sensor node
+//
+// Scanning only says what is nearby. Linking connects to one of those devices,
+// finds the measurement characteristic and subscribes to it, after which its
+// readings arrive as notifications and are treated like any other sensor on
+// this board.
+// =====================================================
+
+// Connects to `address` ("aa:bb:cc:dd:ee:ff", as printed by the scan) and
+// subscribes to its measurement characteristic. Asynchronous: this returns as
+// soon as the attempt starts, and bleLinkStateText() reports progress.
+bool bleLinkConnect(const char *address);
+
+// Drops the link. Safe when nothing is connected.
+void bleLinkDisconnect();
+
+// True once the subscription is in place and readings are arriving.
+bool bleLinkIsSubscribed();
+
+// True from the moment a connection attempt starts until it fails or drops.
+bool bleLinkIsBusy();
+
+// The name of the node this board is linked to, or "" when there is none.
+const char *bleLinkPeerName();
+
+// Progress for the UI: "연결 안 됨", "연결 중", "서비스 검색 중", "구독 중",
+// "수신 중", or a failure reason.
+const char *bleLinkStateText();
+
+// The most recent reading, unpacked from "<time_s>,<sensor>,<value>,<unit>".
+// `sensorName` and `unit` must have room for 24 bytes each. Returns false when
+// nothing has arrived yet. `ageMs` is how long ago it landed, which is what
+// tells a stalled node from a slow one.
+bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs);
+
 #ifdef __cplusplus
 }
 #endif

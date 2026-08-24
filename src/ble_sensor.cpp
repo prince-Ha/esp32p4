@@ -517,6 +517,360 @@ void bleScanDumpResults()
   Serial.println("[BLE] --- end ---");
 }
 
+// =====================================================
+// Central role: linking to one sensor node
+//
+// NimBLE drives this as a chain of callbacks, each starting the next step:
+//   connect -> discover the service -> discover the characteristic
+//           -> discover its CCCD -> write 0x0001 to it -> notifications arrive
+//
+// The CCCD write is the step that is easy to leave out. Without it the link
+// looks healthy - connected, characteristic found - and no reading ever
+// arrives, because a GATT server only notifies subscribers.
+// =====================================================
+
+static uint16_t bleLinkConnHandle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t bleLinkValueHandle = 0;
+static uint16_t bleLinkCccdHandle = 0;
+static uint16_t bleLinkSvcEndHandle = 0;
+static bool bleLinkSubscribed = false;
+static bool bleLinkBusy = false;
+static char bleLinkPeer[32] = "";
+static char bleLinkState[48] = "연결 안 됨";
+
+// Last notification, kept unparsed until something asks for it.
+static char bleLinkPayload[96] = "";
+static uint32_t bleLinkPayloadMs = 0;
+static bool bleLinkHasReading = false;
+
+static void bleLinkSetState(const char *text)
+{
+  snprintf(bleLinkState, sizeof(bleLinkState), "%s", text);
+  blePrintf("link: %s", text);
+}
+
+static void bleLinkReset(const char *why)
+{
+  bleLinkConnHandle = BLE_HS_CONN_HANDLE_NONE;
+  bleLinkValueHandle = 0;
+  bleLinkCccdHandle = 0;
+  bleLinkSvcEndHandle = 0;
+  bleLinkSubscribed = false;
+  bleLinkBusy = false;
+  bleLinkSetState(why);
+}
+
+// Step 4: the subscription write came back.
+static int bleLinkOnSubscribed(uint16_t conn_handle,
+                               const struct ble_gatt_error *error,
+                               struct ble_gatt_attr *attr, void *arg)
+{
+  (void)conn_handle; (void)attr; (void)arg;
+
+  if (error->status != 0)
+  {
+    blePrintf("CCCD write failed: %d", error->status);
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("구독 실패");
+    return 0;
+  }
+
+  bleLinkSubscribed = true;
+  bleLinkBusy = false;
+  bleLinkSetState("수신 중");
+  return 0;
+}
+
+// Step 3: found the descriptors on the characteristic; the CCCD is 0x2902.
+static int bleLinkOnDescriptor(uint16_t conn_handle,
+                               const struct ble_gatt_error *error,
+                               uint16_t chr_val_handle,
+                               const struct ble_gatt_dsc *dsc, void *arg)
+{
+  (void)conn_handle; (void)chr_val_handle; (void)arg;
+
+  if (error->status == 0 && dsc != NULL &&
+      ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16)
+  {
+    bleLinkCccdHandle = dsc->handle;
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinkCccdHandle == 0)
+  {
+    blePrintf("no CCCD on the measurement characteristic");
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("알림 미지원 장치");
+    return 0;
+  }
+
+  bleLinkSetState("구독 중");
+
+  const uint8_t enableNotify[2] = { 0x01, 0x00 };
+  const int rc = ble_gattc_write_flat(bleLinkConnHandle, bleLinkCccdHandle,
+                                      enableNotify, sizeof(enableNotify),
+                                      bleLinkOnSubscribed, NULL);
+  if (rc != 0)
+  {
+    blePrintf("ble_gattc_write_flat failed: %d", rc);
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("구독 실패");
+  }
+
+  return 0;
+}
+
+// Step 2: found the measurement characteristic.
+static int bleLinkOnCharacteristic(uint16_t conn_handle,
+                                   const struct ble_gatt_error *error,
+                                   const struct ble_gatt_chr *chr, void *arg)
+{
+  (void)conn_handle; (void)arg;
+
+  if (error->status == 0 && chr != NULL)
+  {
+    bleLinkValueHandle = chr->val_handle;
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinkValueHandle == 0)
+  {
+    blePrintf("measurement characteristic not found");
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("측정 특성 없음");
+    return 0;
+  }
+
+  const int rc = ble_gattc_disc_all_dscs(bleLinkConnHandle, bleLinkValueHandle,
+                                         bleLinkSvcEndHandle,
+                                         bleLinkOnDescriptor, NULL);
+  if (rc != 0)
+  {
+    blePrintf("ble_gattc_disc_all_dscs failed: %d", rc);
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("구독 실패");
+  }
+
+  return 0;
+}
+
+// Step 1: found the service.
+static int bleLinkOnService(uint16_t conn_handle,
+                            const struct ble_gatt_error *error,
+                            const struct ble_gatt_svc *service, void *arg)
+{
+  (void)arg;
+
+  if (error->status == 0 && service != NULL)
+  {
+    bleLinkSvcEndHandle = service->end_handle;
+
+    const int rc = ble_gattc_disc_chrs_by_uuid(
+      conn_handle, service->start_handle, service->end_handle,
+      &kMeasurementUuid.u, bleLinkOnCharacteristic, NULL
+    );
+
+    if (rc != 0)
+    {
+      blePrintf("ble_gattc_disc_chrs_by_uuid failed: %d", rc);
+      ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+      bleLinkReset("서비스 검색 실패");
+    }
+
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinkSvcEndHandle == 0)
+  {
+    blePrintf("sensor service not found on this device");
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkReset("센서 노드가 아님");
+  }
+
+  return 0;
+}
+
+static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
+{
+  (void)arg;
+
+  switch (event->type)
+  {
+    case BLE_GAP_EVENT_CONNECT:
+      if (event->connect.status != 0)
+      {
+        blePrintf("connect failed: %d", event->connect.status);
+        bleLinkReset("연결 실패");
+        return 0;
+      }
+
+      bleLinkConnHandle = event->connect.conn_handle;
+      bleLinkSetState("서비스 검색 중");
+
+      ble_gattc_disc_svc_by_uuid(bleLinkConnHandle, &kServiceUuid.u,
+                                 bleLinkOnService, NULL);
+      return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+      blePrintf("link dropped, reason %d", event->disconnect.reason);
+      bleLinkReset("연결 끕김");
+      return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX:
+    {
+      if (event->notify_rx.attr_handle != bleLinkValueHandle) return 0;
+
+      const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+      const uint16_t copy = len < sizeof(bleLinkPayload) - 1
+                            ? len : (uint16_t)(sizeof(bleLinkPayload) - 1);
+
+      if (ble_hs_mbuf_to_flat(event->notify_rx.om, bleLinkPayload, copy, NULL) == 0)
+      {
+        bleLinkPayload[copy] = '\0';
+        bleLinkPayloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+        bleLinkHasReading = true;
+      }
+
+      return 0;
+    }
+
+    default:
+      return 0;
+  }
+}
+
+bool bleLinkConnect(const char *address)
+{
+  if (!bleStarted)
+  {
+    bleLinkSetState("블루투스 꺼짐");
+    return false;
+  }
+
+  if (address == NULL || strlen(address) != 17)
+  {
+    bleLinkSetState("주소 형식 오류");
+    return false;
+  }
+
+  // Scanning and connecting cannot share the radio.
+  if (bleScanning)
+  {
+    ble_gap_disc_cancel();
+    bleScanning = false;
+  }
+
+  bleLinkDisconnect();
+
+  unsigned int b[6] = { 0 };
+  if (sscanf(address, "%02x:%02x:%02x:%02x:%02x:%02x",
+             &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+  {
+    bleLinkSetState("주소 형식 오류");
+    return false;
+  }
+
+  ble_addr_t peer;
+  memset(&peer, 0, sizeof(peer));
+
+  // bleFormatAddr() prints most significant byte first; NimBLE stores it the
+  // other way round.
+  for (int i = 0; i < 6; i++) peer.val[i] = (uint8_t)b[5 - i];
+
+  snprintf(bleLinkPeer, sizeof(bleLinkPeer), "%s", address);
+
+  // A node advertising a random static address has its two top bits set. Guess
+  // from the address itself rather than trying one type and retrying, because
+  // ble_gap_connect() accepts a wrong type and then simply times out.
+  peer.type = ((peer.val[5] & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strcmp(bleScanResults[i].address, address) == 0 && bleScanResults[i].name[0])
+    {
+      snprintf(bleLinkPeer, sizeof(bleLinkPeer), "%s", bleScanResults[i].name);
+      break;
+    }
+  }
+
+  bleLinkBusy = true;
+  bleLinkHasReading = false;
+  bleLinkSetState("연결 중");
+
+  const int rc = ble_gap_connect(bleAddrType, &peer, 10000, NULL,
+                                 bleLinkGapEvent, NULL);
+
+  if (rc != 0)
+  {
+    blePrintf("ble_gap_connect failed: %d", rc);
+    bleLinkReset("연결 실패");
+    return false;
+  }
+
+  return true;
+}
+
+void bleLinkDisconnect()
+{
+  if (bleLinkConnHandle != BLE_HS_CONN_HANDLE_NONE)
+  {
+    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
+  }
+
+  bleLinkReset("연결 안 됨");
+  bleLinkHasReading = false;
+}
+
+bool bleLinkIsSubscribed() { return bleLinkSubscribed; }
+bool bleLinkIsBusy() { return bleLinkBusy; }
+const char *bleLinkPeerName() { return bleLinkPeer; }
+const char *bleLinkStateText() { return bleLinkState; }
+
+bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+{
+  if (!bleLinkHasReading) return false;
+
+  // "<time_s>,<sensor>,<value>,<unit>"
+  char work[sizeof(bleLinkPayload)];
+  snprintf(work, sizeof(work), "%s", bleLinkPayload);
+
+  char *cursor = work;
+  char *fields[4] = { NULL, NULL, NULL, NULL };
+  int found = 0;
+
+  fields[found++] = cursor;
+
+  while (*cursor && found < 4)
+  {
+    if (*cursor == ',')
+    {
+      *cursor = '\0';
+      fields[found++] = cursor + 1;
+    }
+    cursor++;
+  }
+
+  if (found < 4) return false;
+
+  if (value) *value = strtof(fields[2], NULL);
+  if (sensorName) snprintf(sensorName, 24, "%s", fields[1]);
+  if (unit) snprintf(unit, 24, "%s", fields[3]);
+
+  if (ageMs)
+  {
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    *ageMs = now - bleLinkPayloadMs;
+  }
+
+  return true;
+}
+
 #else  // BLE_SENSOR_SUPPORTED
 
 bool bleSensorBegin(const char *deviceName) { (void)deviceName; return false; }
@@ -535,5 +889,16 @@ bool bleScanResultAt(int index, BleScanResult *out) { (void)index; (void)out; re
 void bleScanDumpResults() {}
 bool bleScanResultIsCandidate(const BleScanResult *r) { (void)r; return false; }
 int bleScanCandidateCount() { return 0; }
+bool bleLinkConnect(const char *address) { (void)address; return false; }
+void bleLinkDisconnect() {}
+bool bleLinkIsSubscribed() { return false; }
+bool bleLinkIsBusy() { return false; }
+const char *bleLinkPeerName() { return ""; }
+const char *bleLinkStateText() { return "지원 안 함"; }
+bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+{
+  (void)value; (void)sensorName; (void)unit; (void)ageMs;
+  return false;
+}
 
 #endif  // BLE_SENSOR_SUPPORTED
