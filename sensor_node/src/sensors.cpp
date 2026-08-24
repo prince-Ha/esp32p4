@@ -831,16 +831,28 @@ static bool dsStartConversion()
   return true;
 }
 
-// Pins on a classic ESP32 dev board that can drive a 1-Wire line. 0, 2 and 12
-// are strapping pins, 1 and 3 are the console, 6-11 are the flash, and 34-39
-// are input-only so they cannot pull the line down at all.
+// Pins on a classic ESP32 dev board that can drive a 1-Wire line.
+//
+// GPIO2 is in the list despite being a strapping pin: the P4 runs its own
+// DS18B20 on GPIO2, so anyone wiring a node to match will have used it, and a
+// 1-Wire line idles high, which is the level GPIO2 needs at boot anyway.
+//
+// Still out: 0 is the boot button, 12 picks the flash voltage and reads the
+// wrong thing with a pull-up on it, 1 and 3 are the console, 6-11 are the
+// flash, and 34-39 are input only so they cannot pull the line down at all.
 static const uint8_t kOneWireCandidates[] = {
-  4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33
+  4, 2, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33
 };
+
+// What the last probe saw, for the report when nothing is found.
+static int dsLastIdleLevel = -1;
+static bool dsLastPresence = false;
 
 static bool dsProbePin(uint8_t pin)
 {
   oneWirePin = pin;
+  dsLastIdleLevel = -1;
+  dsLastPresence = false;
 
   // Handing the pad back from the I2C peripheral has to happen before the
   // line is driven, not after a candidate is chosen: the peripheral fights the
@@ -855,8 +867,11 @@ static bool dsProbePin(uint8_t pin)
   delayMicroseconds(10);
 
   // An empty pin idles high on the pull-up; one shorted to ground never rises.
-  if (dsOwReadLevel() == 0) return false;
-  if (!dsOwReset()) return false;
+  dsLastIdleLevel = dsOwReadLevel();
+  if (dsLastIdleLevel == 0) return false;
+
+  dsLastPresence = dsOwReset();
+  if (!dsLastPresence) return false;
 
   // A presence pulse on its own is not proof. A long probe cable on a weak
   // internal pull-up can read low at the moment presence is sampled, which is
@@ -890,6 +905,12 @@ static bool ds18b20Begin()
         found = true;
         break;
       }
+
+      // Presence without a readable scratchpad is a different fault from
+      // silence, and the difference is what says whether the probe is on this
+      // pin at all.
+      Serial.printf("[DS18B20] GPIO%-2d idle=%d presence=%d\n",
+                    kOneWireCandidates[i], dsLastIdleLevel, dsLastPresence ? 1 : 0);
     }
 
     if (!found)
