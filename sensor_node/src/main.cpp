@@ -47,9 +47,6 @@
 
 #define PUBLISH_INTERVAL_MS 1000
 
-#define I2C_SDA_PIN 21
-#define I2C_SCL_PIN 22
-
 static BLECharacteristic *measurementChar = NULL;
 static bool centralConnected = false;
 static char nodeName[24] = NODE_NAME_PREFIX;

@@ -690,20 +690,25 @@ static int ina228Read(NodeValue *out, int maxValues)
 static bool dsConversionStarted = false;
 static unsigned long dsConversionStartMs = 0;
 
+// Which pin the probe is actually on. ONE_WIRE_PIN is only where the search
+// starts: a three-wire probe gets soldered wherever there was room, and the
+// part announces itself on any pin, so there is no reason to insist on one.
+static uint8_t oneWirePin = ONE_WIRE_PIN;
+
 static inline void dsOwRelease()
 {
-  pinMode(ONE_WIRE_PIN, INPUT_PULLUP);
+  pinMode(oneWirePin, INPUT_PULLUP);
 }
 
 static inline void dsOwLow()
 {
-  digitalWrite(ONE_WIRE_PIN, LOW);
-  pinMode(ONE_WIRE_PIN, OUTPUT);
+  digitalWrite(oneWirePin, LOW);
+  pinMode(oneWirePin, OUTPUT);
 }
 
 static inline int dsOwReadLevel()
 {
-  return digitalRead(ONE_WIRE_PIN);
+  return digitalRead(oneWirePin);
 }
 
 static bool dsOwReset()
@@ -804,17 +809,92 @@ static bool dsStartConversion()
   return true;
 }
 
-static bool ds18b20Begin()
-{
-  dsOwRelease();
-  delay(10);
-  dsConversionStarted = false;
+// Pins on a classic ESP32 dev board that can drive a 1-Wire line. 0, 2 and 12
+// are strapping pins, 1 and 3 are the console, 6-11 are the flash, and 34-39
+// are input-only so they cannot pull the line down at all.
+static const uint8_t kOneWireCandidates[] = {
+  4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33
+};
 
-  // A DS18B20 answers a reset by pulling the line down itself. Nothing there
-  // leaves it held high by the pull-up.
+static bool dsProbePin(uint8_t pin)
+{
+  oneWirePin = pin;
+
+  // Handing the pad back from the I2C peripheral has to happen before the
+  // line is driven, not after a candidate is chosen: the peripheral fights the
+  // bit-banging hard enough to corrupt every byte.
+  if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) Wire.end();
+
+  dsOwRelease();
+  delay(2);
+
+  // An empty pin idles high on the pull-up; one shorted to ground never rises.
+  if (dsOwReadLevel() == 0) return false;
   if (!dsOwReset()) return false;
 
-  Serial.printf("[DS18B20] present on GPIO%d\n", ONE_WIRE_PIN);
+  // A presence pulse on its own is not proof. A long probe cable on a weak
+  // internal pull-up can read low at the moment presence is sampled, which is
+  // how an empty pin came to be adopted and then returned FF FF FF for every
+  // byte. Read the scratchpad instead: a DS18B20 has valid power-on contents
+  // with a good CRC before any conversion has been asked for, so this settles
+  // it in microseconds rather than waiting 750 ms for a measurement.
+  dsOwWriteByte(0xCC);
+  dsOwWriteByte(0xBE);
+
+  uint8_t data[9];
+  for (uint8_t i = 0; i < 9; i++) data[i] = dsOwReadByte();
+
+  return dsCrc8Dallas(data, 8) == data[8];
+}
+
+static bool ds18b20Begin()
+{
+  dsConversionStarted = false;
+
+  if (!dsProbePin(oneWirePin))
+  {
+    bool found = false;
+
+    for (size_t i = 0; i < sizeof(kOneWireCandidates) / sizeof(kOneWireCandidates[0]); i++)
+    {
+      if (kOneWireCandidates[i] == ONE_WIRE_PIN) continue;   // already tried
+
+      if (dsProbePin(kOneWireCandidates[i]))
+      {
+        found = true;
+        break;
+      }
+    }
+
+    if (!found)
+    {
+      oneWirePin = ONE_WIRE_PIN;
+      // Put the bus back: a probe that is not there must not cost the node
+      // its I2C sensors.
+      Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+      Wire.setClock(100000);
+
+      // Naming the pins that were tried turns "it does not work" into
+      // something a teacher can check against the board in front of them.
+      Serial.print("[DS18B20] no probe answered. Tried GPIO");
+      for (size_t i = 0; i < sizeof(kOneWireCandidates) / sizeof(kOneWireCandidates[0]); i++)
+      {
+        Serial.printf("%s%d", i ? "," : " ", kOneWireCandidates[i]);
+      }
+      Serial.println();
+      Serial.println("[DS18B20] check: data line on one of those pins, VCC on 3.3V, "
+                     "and a 4.7k resistor between data and 3.3V. GPIO34-39 cannot "
+                     "work - they are input only.");
+      return false;
+    }
+  }
+
+  if (oneWirePin == I2C_SDA_PIN || oneWirePin == I2C_SCL_PIN)
+  {
+    Serial.println("[DS18B20] shares a pin with I2C; the bus has been released to it");
+  }
+
+  Serial.printf("[DS18B20] answering on GPIO%d\n", oneWirePin);
   return dsStartConversion();
 }
 
@@ -844,6 +924,12 @@ static int ds18b20Read(NodeValue *out, int maxValues)
 
   if (dsCrc8Dallas(data, 8) != data[8])
   {
+    // All ones is an open data line - no pull-up, or nothing on the other end.
+    // Anything else is a line that answers but is being read at the wrong
+    // moment.
+    Serial.printf("[DS18B20] bad CRC: %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                  data[0], data[1], data[2], data[3], data[4],
+                  data[5], data[6], data[7], data[8]);
     dsStartConversion();
     return 0;
   }
@@ -923,7 +1009,7 @@ bool nodeSensorDetect()
   {
     detectedKind = NODE_SENSOR_DS18B20;
     detectedAddress = 0x00;
-    Serial.printf("[SENSOR] using %s on GPIO%d\n", nodeSensorName(), ONE_WIRE_PIN);
+    Serial.printf("[SENSOR] using %s on GPIO%d\n", nodeSensorName(), oneWirePin);
     return true;
   }
 

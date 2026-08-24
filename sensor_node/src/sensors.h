@@ -41,6 +41,11 @@ typedef enum
 // 4.7 kΩ pull-up to 3.3 V unless the module already carries one.
 #define ONE_WIRE_PIN 4
 
+// The I2C bus. Named here because the 1-Wire code has to know when the probe
+// has been wired to one of these lines.
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
+
 // Walks the bus, identifies what is there and initialises it. Safe to call
 // repeatedly: a sensor plugged in after boot is picked up on a later call.
 bool nodeSensorDetect();
