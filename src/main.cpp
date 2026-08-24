@@ -9903,6 +9903,29 @@ void httpCloseConnection(const char *reason)
 void httpCloseConnection(const char *reason) { (void)reason; }
 #endif
 
+// A TLS handshake asks ESP-Hosted for DMA-capable internal buffers, and when
+// it cannot get one the SDIO driver asserts and the board reboots - which in a
+// classroom looks like the board randomly restarting mid-experiment. Below
+// this, refuse the upload and say why instead.
+//
+// 32 kB was the largest free block on the reboot that produced this check;
+// 56 kB leaves the handshake room to breathe.
+#define HTTP_MIN_DMA_BLOCK 56000
+
+static bool httpHasRoomForTls(const char *context)
+{
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  if (largest >= HTTP_MIN_DMA_BLOCK) return true;
+
+  Serial.printf("[HTTP] %s refused: largest DMA block %u < %u\n",
+                context, (unsigned)largest, (unsigned)HTTP_MIN_DMA_BLOCK);
+
+  setIslStatusText(bleEnabled
+                     ? "메모리 부족: 블루투스를 끄고 전송하세요"
+                     : "메모리 부족: 보드를 다시 시작하세요");
+  return false;
+}
+
 void logHeapState(const char *context)
 {
   Serial.printf(
@@ -9927,6 +9950,10 @@ bool httpPostJson(const char *url, const String &payload, String *response)
 
   Serial.println("----- HTTP POST START -----");
   logHeapState("before POST");
+
+  if (!httpHasRoomForTls("POST")) return false;
+
+  if (!httpHasRoomForTls("POST")) return false;
   Serial.print("URL: ");
   Serial.println(url);
   Serial.print("Payload length: ");
@@ -12391,6 +12418,7 @@ void setup()
 
   lv_indev_drv_register(&indev_drv);
 
+  logHeapState("before building any screen");
   createHomeUi();
   createMeasureUi();
   createSettingsUi();

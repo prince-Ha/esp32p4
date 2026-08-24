@@ -75,10 +75,18 @@ pairing the DPS310 already uses. A unit outside that table is not uploaded and
 is named on screen as excluded, rather than being filed under a guessed
 sensorType.
 
-The P4's BLE and its TLS uploads compete for the same contiguous DMA-capable
-internal memory, which is why Bluetooth is opt-in rather than always on. If
-uploads to 지능형 과학실 start failing with DMA descriptor errors after the
-link is up, that is the trade to look at first.
+Bluetooth and the TLS uploads draw on the same pool: WiFi and BLE both reach
+the ESP32-C6 over one SDIO link, and that driver needs DMA-capable internal
+buffers. With a node linked and an upload starting, the board used to reach the
+handshake with 32 kB contiguous left, and ESP-Hosted asserted in
+`sdio_rx_get_buffer()` - a reboot loop, mid-lesson.
+
+LVGL now allocates from PSRAM (`LV_MEM_CUSTOM_ALLOC` in
+[`include/lv_conf.h`](include/lv_conf.h)), which costs the UI nothing and hands
+back about 150 kB of internal RAM: building all eight screens no longer moves
+the internal figure at all. An upload also refuses, with a message, if the
+largest DMA block is under 56 kB, so a shortage says so instead of restarting
+the board. `logHeapState()` prints the figures before every POST.
 
 ## Hardware pinout
 
