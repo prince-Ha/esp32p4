@@ -306,6 +306,85 @@ static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
 static int bleNodeValueCount = 1;
 static float bleNodeThirdValue = NAN;
 
+// Every other sensor's 지능형 과학실 code is chosen at compile time, because
+// the firmware knows what the part measures. A node does not offer that: it
+// says "hPa" and the code has to be looked up.
+//
+// Only codes this firmware has watched the server accept are listed. An
+// unknown unit is not transmitted at all - a guessed sensorType would put a
+// reading under the wrong quantity in a student's report, which is worse than
+// sending nothing and saying so.
+//
+// The channel codes mirror the DPS310 pairing that already works: TPR on 01,
+// PRS on 02.
+typedef struct
+{
+  const char *nodeUnit;    // what the node writes in its payload
+  const char *sensorType;  // 별첨2 code
+  const char *nickname;
+  const char *channel;
+  const char *collectUnit; // what the platform expects to be told
+} BleIslMapping;
+
+static const BleIslMapping kBleIslMappings[] = {
+  { "C",    "TPR", "온도센서", "01", "C" },
+  { "℃",   "TPR", "온도센서", "01", "C" },
+  { "degC", "TPR", "온도센서", "01", "C" },
+  { "hPa",  "PRS", "기압센서", "02", "hPa" }
+};
+
+static const BleIslMapping *bleIslMappingForUnit(const char *unit)
+{
+  if (unit == NULL || unit[0] == 0) return NULL;
+
+  const int count = (int)(sizeof(kBleIslMappings) / sizeof(kBleIslMappings[0]));
+
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(kBleIslMappings[i].nodeUnit, unit) == 0) return &kBleIslMappings[i];
+  }
+
+  return NULL;
+}
+
+// The mapping for value `index` of the node's last packet, or NULL when that
+// unit is not one the server is known to accept.
+static const BleIslMapping *bleIslMappingForValue(int index)
+{
+  if (index < 0 || index >= BLE_LINK_MAX_VALUES) return NULL;
+  if (index >= bleNodeValueCount) return NULL;
+  return bleIslMappingForUnit(bleNodeUnit[index]);
+}
+
+static int bleIslMappedCount()
+{
+  int mapped = 0;
+
+  for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    if (bleIslMappingForValue(i) != NULL) mapped++;
+  }
+
+  return mapped;
+}
+
+// Names the units that will not be sent, so the reason is on the glass rather
+// than only in a log nobody reads during a lesson.
+static void bleIslUnmappedSummary(char *out, size_t outSize)
+{
+  out[0] = 0;
+
+  for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    if (bleIslMappingForValue(i) != NULL) continue;
+
+    char entry[40];
+    snprintf(entry, sizeof(entry), "%s%s(%s)", out[0] ? ", " : "",
+             bleNodeQuantity[i], bleNodeUnit[i][0] ? bleNodeUnit[i] : "단위 없음");
+    strncat(out, entry, outSize - strlen(out) - 1);
+  }
+}
+
 static bool ina228Ready = false;
 static float ina228LastPowerW = NAN;
 static float ina228CurrentLsb = 0.0f;
@@ -2826,6 +2905,7 @@ bool activeSensorSupportsDirectIsl()
          activeSensorMode == SENSOR_MODE_VL53L1X ||
          activeSensorMode == SENSOR_MODE_INA228 ||
          activeSensorMode == SENSOR_MODE_ENCODER ||
+         (activeSensorMode == SENSOR_MODE_BLE && bleIslMappedCount() > 0) ||
          (SCD41_DIRECT_ISL_ENABLED && activeSensorMode == SENSOR_MODE_SCD41);
 }
 
@@ -3006,6 +3086,15 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
     *caption = activePrimaryName();
     *unit = activePrimaryUnit();
   }
+}
+
+// How many decimals a sensor's second and third readings deserve. The first
+// column has formatPrimaryValueText() for this; these needed the same.
+static void formatMeasureExtraValue(float value, char *out, size_t outSize)
+{
+  if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "%.3f", value);
+  else if (activeSensorMode == SENSOR_MODE_BLE) snprintf(out, outSize, "%.4g", value);
+  else snprintf(out, outSize, "%.1f", value);
 }
 
 // Placeholder digits at the width each value will occupy, so the layout does
@@ -3203,40 +3292,28 @@ static void refreshLatestMeasurementLabels()
   lv_label_set_text(labelValueNumber[0], text);
 
   // Columns 1 and 2 carry whatever else the part measured in the same reading:
-  // 기압 for DPS310, 온도 and 습도 for SCD41. Each is a bare number under its
-  // own caption, at the same size as the first — a sensor that measures two
-  // things has two readings, not one reading and a footnote.
-  if (activeSensorMode == SENSOR_MODE_SCD41)
-  {
-    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
-    else snprintf(text, sizeof(text), "--.-");
-    lv_label_set_text(labelValueNumber[1], text);
+  // 기압 for DPS310, 온도 and 습도 for SCD41, both of a node's quantities over
+  // BLE. Each is a bare number under its own caption, at the same size as the
+  // first - a sensor that measures two things has two readings, not one
+  // reading and a footnote.
+  //
+  // This is driven by activeSensorValueCount(), not by a branch per sensor.
+  // It was a chain of branches and had grown one arm per part, and the newest
+  // one - a BLE node - was simply missing from it, so its 기압 column stayed
+  // blank while the value was arriving, being logged and being uploaded.
+  const float extraValues[2] = { pressureHistory[idx], humidityHistory[idx] };
+  const int shownValues = activeSensorValueCount();
 
-    if (!isnan(humidityHistory[idx])) snprintf(text, sizeof(text), "%.1f", humidityHistory[idx]);
-    else snprintf(text, sizeof(text), "--.-");
-    lv_label_set_text(labelValueNumber[2], text);
-  }
-  else if (activeSensorMode == SENSOR_MODE_INA228)
+  for (int i = 1; i < shownValues && i < MEASURE_VALUE_MAX; i++)
   {
-    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.3f", pressureHistory[idx]);
-    else snprintf(text, sizeof(text), "-.---");
-    lv_label_set_text(labelValueNumber[1], text);
+    const float value = extraValues[i - 1];
+    const bool usable =
+      !isnan(value) && (i != 1 || !activeSensorHasPressure() || pressureValueValid(value));
 
-    if (!isnan(humidityHistory[idx])) snprintf(text, sizeof(text), "%.3f", humidityHistory[idx]);
-    else snprintf(text, sizeof(text), "-.---");
-    lv_label_set_text(labelValueNumber[2], text);
-  }
-  else if (activeSensorMode == SENSOR_MODE_ENCODER)
-  {
-    if (!isnan(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
-    else snprintf(text, sizeof(text), "---.-");
-    lv_label_set_text(labelValueNumber[1], text);
-  }
-  else if (activeSensorHasPressure())
-  {
-    if (pressureValueValid(pressureHistory[idx])) snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
-    else snprintf(text, sizeof(text), "----.-");
-    lv_label_set_text(labelValueNumber[1], text);
+    if (usable) formatMeasureExtraValue(value, text, sizeof(text));
+    else measureValuePlaceholder(i, text, sizeof(text));
+
+    lv_label_set_text(labelValueNumber[i], text);
   }
 
   refreshMeasureValueLayout();
@@ -4026,8 +4103,12 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_BLE)
   {
     char text[96];
-    snprintf(text, sizeof(text), "블루투스: %s / %s",
-             bleLinkPeerName()[0] ? bleLinkPeerName() : "-", bleLinkStateText());
+    char skipped[120] = "";
+    bleIslUnmappedSummary(skipped, sizeof(skipped));
+
+    snprintf(text, sizeof(text), "블루투스: %s / %s%s%s",
+             bleLinkPeerName()[0] ? bleLinkPeerName() : "-", bleLinkStateText(),
+             skipped[0] ? " / 전송 제외: " : "", skipped);
     setIslStatusText(text);
   }
 }
@@ -10010,6 +10091,80 @@ bool directIslSendSensorTypeIfNeeded()
   }
 
   // =====================================================
+  // BLE 노드: whichever of its quantities carry a unit we can map.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    const int mapped = bleIslMappedCount();
+
+    if (mapped == 0)
+    {
+      setIslStatusText("블루투스: 전송할 수 있는 단위가 없음");
+      return false;
+    }
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":";
+    payload += mapped;
+    payload += ",\"items\":[";
+
+    bool first = true;
+
+    for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+    {
+      const BleIslMapping *m = bleIslMappingForValue(i);
+      if (m == NULL) continue;
+
+      if (!first) payload += ",";
+      first = false;
+
+      payload += "{\"sensorType\":\"";
+      payload += m->sensorType;
+      payload += "\",\"sensorNicNm\":\"";
+      payload += m->nickname;
+      payload += "\",\"channelCode\":\"";
+      payload += m->channel;
+      payload += "\"}";
+    }
+
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_BLE", 2, 700))
+    {
+      setIslStatusText("블루투스 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+
+      char skipped[120] = "";
+      bleIslUnmappedSummary(skipped, sizeof(skipped));
+
+      char line[200];
+      if (skipped[0]) snprintf(line, sizeof(line), "블루투스 센서등록 OK / 제외: %s", skipped);
+      else snprintf(line, sizeof(line), "블루투스 센서등록 OK: %d개", mapped);
+
+      setIslStatusText(line);
+      return true;
+    }
+
+    Serial.print("BLE node sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("블루투스 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
   // 회전 엔코더: 각도와 각속도.
   // =====================================================
   if (activeSensorMode == SENSOR_MODE_ENCODER)
@@ -10315,6 +10470,42 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+    }
+    else if (activeSensorMode == SENSOR_MODE_BLE)
+    {
+      const float nodeValues[BLE_LINK_MAX_VALUES] = {
+        NAN, packet.pressureHpa, packet.humidityPct
+      };
+
+      bool first = true;
+
+      for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+      {
+        const BleIslMapping *m = bleIslMappingForValue(i);
+        if (m == NULL) continue;
+
+        char number[24];
+        if (i == 0) snprintf(number, sizeof(number), "%s", primaryValue);
+        else if (isnan(nodeValues[i])) continue;
+        else snprintf(number, sizeof(number), "%.4f", nodeValues[i]);
+
+        if (!first) payload += ",";
+        first = false;
+
+        payload += "{\"sensorType\":\"";
+        payload += m->sensorType;
+        payload += "\",\"sensorNicNm\":\"";
+        payload += m->nickname;
+        payload += "\",\"channelCode\":\"";
+        payload += m->channel;
+        payload += "\",\"sensorData\":\"";
+        payload += number;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"";
+        payload += m->collectUnit;
+        payload += "\"}";
+      }
     }
     else if (activeSensorMode == SENSOR_MODE_ENCODER)
     {
@@ -10662,6 +10853,44 @@ bool cloudSendBatchHistory()
         payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+      }
+      else if (activeSensorMode == SENSOR_MODE_BLE)
+      {
+        // The node's units are read from its most recent packet, on the
+        // assumption that a node does not change what it measures mid-run.
+        const float nodeValues[BLE_LINK_MAX_VALUES] = {
+          NAN, pressureHistory[i], humidityHistory[i]
+        };
+
+        bool firstItem = true;
+
+        for (int v = 0; v < bleNodeValueCount && v < BLE_LINK_MAX_VALUES; v++)
+        {
+          const BleIslMapping *m = bleIslMappingForValue(v);
+          if (m == NULL) continue;
+
+          char number[24];
+          if (v == 0) snprintf(number, sizeof(number), "%s", tempValue);
+          else if (isnan(nodeValues[v])) continue;
+          else snprintf(number, sizeof(number), "%.4f", nodeValues[v]);
+
+          if (!firstItem) payload += ",";
+          firstItem = false;
+
+          payload += "{\"sensorType\":\"";
+          payload += m->sensorType;
+          payload += "\",\"sensorNicNm\":\"";
+          payload += m->nickname;
+          payload += "\",\"channelCode\":\"";
+          payload += m->channel;
+          payload += "\",\"sensorData\":\"";
+          payload += number;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"";
+          payload += m->collectUnit;
+          payload += "\"}";
+        }
       }
       else if (activeSensorMode == SENSOR_MODE_ENCODER)
       {
