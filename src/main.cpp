@@ -3129,6 +3129,23 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
   }
 }
 
+// Whether the graph draws a second line, and whether a given sample belongs on
+// it. Both used to ask activeSensorHasPressure(), which is true for the DPS310
+// alone, so a node reporting 온도 and 기압 - or the encoder, or the INA228 -
+// plotted only its first quantity while the readout showed both.
+static bool secondaryPlotAxisOn()
+{
+  return activeSensorValueCount() >= 2;
+}
+
+static bool secondaryPlotValueValid(float value)
+{
+  if (isnan(value)) return false;
+
+  // NO_PRESSURE_VALUE is the DPS310's own "no reading" sentinel and is not NaN.
+  return !activeSensorHasPressure() || pressureValueValid(value);
+}
+
 // How many decimals a sensor's second and third readings deserve. The first
 // column has formatPrimaryValueText() for this; these needed the same.
 static void formatMeasureExtraValue(float value, char *out, size_t outSize)
@@ -5653,7 +5670,7 @@ void clearChart()
   if (labelGraphStart) lv_label_set_text(labelGraphStart, "시간(s)");
   if (labelGraphEnd) lv_label_set_text(labelGraphEnd, "");
 
-  bool pressureAxisOn = activeSensorHasPressure();
+  bool pressureAxisOn = secondaryPlotAxisOn();
 
   if (labelMeasurePressureAxisTitle)
   {
@@ -5998,7 +6015,7 @@ void updateChartAutoScale()
 {
   if (sampleCount <= 0 || chart == NULL || seriesTemp == NULL || seriesPressure == NULL) return;
 
-  const bool pressureAxisOn = activeSensorHasPressure();
+  const bool pressureAxisOn = secondaryPlotAxisOn();
 
   if (labelMeasurePressureAxisTitle)
   {
@@ -6022,7 +6039,7 @@ void updateChartAutoScale()
     if (value < primaryMin) primaryMin = value;
     if (value > primaryMax) primaryMax = value;
 
-    if (pressureAxisOn && pressureValueValid(pressureHistory[i]))
+    if (pressureAxisOn && secondaryPlotValueValid(pressureHistory[i]))
     {
       if (!hasPressure)
       {
@@ -6110,7 +6127,7 @@ void updateChartAutoScale()
     if (hasPressure)
     {
       float pressureValue = graphSecondaryInterpolated(sourcePosition);
-      if (pressureValueValid(pressureValue))
+      if (secondaryPlotValueValid(pressureValue))
       {
         float pressureRatio = (pressureValue - pressureMin) / pressureSpan;
         if (pressureRatio < 0.0f) pressureRatio = 0.0f;
@@ -8296,6 +8313,11 @@ static void ble_slot_use_event_cb(lv_event_t *e)
   else pendingSensorMode = SENSOR_MODE_BLE;
 
   refreshBleScreen();
+
+  // The graph, the 시작/정지 pair and 일괄전송 all live on the measurement
+  // screen, so staying here would leave the node connected with no way to
+  // record it - which is exactly how it looked.
+  requestScreenSwitch(measureScreen);
 }
 
 static void ble_slot_drop_event_cb(lv_event_t *e)
