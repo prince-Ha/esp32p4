@@ -4005,7 +4005,6 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
     bleNodeRefreshMetadata();
-    refreshHomeBleTiles();
     return bleLinkSlotIsSubscribed(activeBleSlot);
   }
 
@@ -12557,6 +12556,12 @@ void loop()
     }
 
     bleNodeRefreshMetadata();
+
+    // A node appears on the home grid as soon as it links, so this has to run
+    // on the clock rather than when the sensor changes - the tile is how the
+    // sensor gets changed.
+    refreshHomeBleTiles();
+    refreshHomeSensorTilesFor(activeSensorMode);
 
     // dpsReady is settled once when a sensor is chosen, which is wrong for a
     // link that comes and goes; for a node it is simply whether it is linked.
