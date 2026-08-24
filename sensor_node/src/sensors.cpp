@@ -471,6 +471,9 @@ static int tsl2591Read(NodeValue *out, int maxValues)
 // ------------------------------------------------------------ VL53L1X ------
 
 #define VL53L1X_REG_SOFT_RESET             0x0000
+#define VL53L1X_REG_VHV_TIMEOUT            0x0008
+#define VL53L1X_REG_VHV_INIT               0x000B
+#define VL53L1X_REG_GPIO_HV_MUX_CTRL       0x0030
 #define VL53L1X_REG_GPIO_TIO_HV_STATUS     0x0031
 #define VL53L1X_REG_INTERRUPT_CLEAR        0x0086
 #define VL53L1X_REG_MODE_START             0x0087
@@ -500,6 +503,39 @@ static bool vl53Read16(uint16_t reg, uint16_t *out)
   if (!i2cRead16Addr(detectedAddress, reg, buf, 2)) return false;
   *out = ((uint16_t)buf[0] << 8) | buf[1];
   return true;
+}
+
+// Whether a measurement is waiting.
+//
+// The ready bit's meaning depends on the interrupt polarity the part booted
+// with, which is bit 4 of GPIO_HV_MUX_CTRL: clear means active high, set means
+// active low. Assuming one of the two - which this driver did at first - gives
+// a sensor that initialises perfectly and then never has a reading ready.
+static bool vl53DataReady(bool *ready)
+{
+  uint8_t mux[1];
+  uint8_t status[1];
+
+  if (!i2cRead16Addr(detectedAddress, VL53L1X_REG_GPIO_HV_MUX_CTRL, mux, 1)) return false;
+  if (!i2cRead16Addr(detectedAddress, VL53L1X_REG_GPIO_TIO_HV_STATUS, status, 1)) return false;
+
+  const uint8_t expected = (mux[0] & 0x10) ? 0 : 1;
+  *ready = ((status[0] & 0x01) == expected);
+  return true;
+}
+
+static bool vl53WaitDataReady(uint32_t timeoutMs)
+{
+  const unsigned long start = millis();
+
+  while (millis() - start < timeoutMs)
+  {
+    bool ready = false;
+    if (vl53DataReady(&ready) && ready) return true;
+    delay(5);
+  }
+
+  return false;
 }
 
 static bool vl53Identify(uint8_t addr)
@@ -550,9 +586,32 @@ static bool vl53Begin(uint8_t addr)
     }
   }
 
+  // The ULD's own SensorInit cycle: range once, clear, stop, then the VHV
+  // follow-up. Skipping it leaves the part ranging but never settling.
+  detectedAddress = addr;   // the helpers below read through it
+
   if (!i2cWrite16Addr8(addr, VL53L1X_REG_MODE_START, 0x40)) return false;
 
-  Serial.println("[VL53L1X] init OK");
+  if (!vl53WaitDataReady(1000))
+  {
+    Serial.println("[VL53L1X] initial data-ready timeout");
+    i2cWrite16Addr8(addr, VL53L1X_REG_MODE_START, 0x00);
+    return false;
+  }
+
+  i2cWrite16Addr8(addr, VL53L1X_REG_INTERRUPT_CLEAR, 0x01);
+  i2cWrite16Addr8(addr, VL53L1X_REG_MODE_START, 0x00);
+
+  if (!i2cWrite16Addr8(addr, VL53L1X_REG_VHV_TIMEOUT, 0x09) ||
+      !i2cWrite16Addr8(addr, VL53L1X_REG_VHV_INIT, 0x00))
+  {
+    Serial.println("[VL53L1X] VHV post-init write failed");
+    return false;
+  }
+
+  if (!i2cWrite16Addr8(addr, VL53L1X_REG_MODE_START, 0x40)) return false;
+
+  Serial.println("[VL53L1X] init OK / continuous ranging");
   return true;
 }
 
@@ -560,9 +619,8 @@ static int vl53Read(NodeValue *out, int maxValues)
 {
   if (maxValues < 1) return 0;
 
-  uint8_t status[1];
-  if (!i2cRead16Addr(detectedAddress, VL53L1X_REG_GPIO_TIO_HV_STATUS, status, 1)) return 0;
-  if ((status[0] & 0x01) != 0) return 0;   // interrupt not raised: no new range
+  bool ready = false;
+  if (!vl53DataReady(&ready) || !ready) return 0;
 
   uint8_t rangeStatus[1];
   uint16_t rangeMm = 0;
