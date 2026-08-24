@@ -976,10 +976,6 @@ static bool ds18b20Begin()
     if (!found)
     {
       oneWirePin = ONE_WIRE_PIN;
-      // Put the bus back: a probe that is not there must not cost the node
-      // its I2C sensors.
-      Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-      Wire.setClock(100000);
 
       // Naming the pins that were tried turns "it does not work" into
       // something a teacher can check against the board in front of them.
@@ -1067,6 +1063,15 @@ bool nodeSensorDetect()
 {
   detectedKind = NODE_SENSOR_NONE;
   detectedAddress = 0x00;
+
+  // The 1-Wire probe takes the pad away from the I2C peripheral when the
+  // DS18B20 turns out to be on SDA, and it has to be given back before
+  // anything looks for an I2C part again - otherwise swapping the probe for a
+  // light or CO2 sensor finds a bus that was switched off and never comes
+  // back. Re-attaching an already-attached bus costs nothing.
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  delay(2);
 
   struct Candidate
   {
