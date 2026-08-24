@@ -3018,6 +3018,16 @@ void refreshMeasureValueCaptions()
 
     lv_label_set_text(labelValueCaption[i], caption);
     lv_label_set_text(labelValueUnit[i], unit);
+
+    // Every other sensor's unit is a string literal in this file, so the
+    // build-time subset font is guaranteed to cover it. A BLE node names its
+    // own unit at runtime and nothing here can have subset a glyph for it, so
+    // that one case falls back to the full-range face.
+    lv_obj_set_style_text_font(
+      labelValueUnit[i],
+      activeSensorMode == SENSOR_MODE_BLE ? FONT_KR : FONT_KR_HEAD,
+      0
+    );
   }
 }
 
@@ -3028,6 +3038,13 @@ void updateActiveSensorUiLabels()
   if (labelMeasureSensorName)
   {
     lv_label_set_text(labelMeasureSensorName, activeMeasurementTitle());
+
+    // Same reason as the unit above: this title is the node's own wording.
+    lv_obj_set_style_text_font(
+      labelMeasureSensorName,
+      activeSensorMode == SENSOR_MODE_BLE ? FONT_KR : FONT_KR_HEAD,
+      0
+    );
   }
 
   refreshMeasureValueCaptions();
