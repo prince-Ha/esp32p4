@@ -894,7 +894,11 @@ static lv_obj_t *labelFileViewerPageInfo;
 
 
 // Home sensor grid, kept so the selected tile can follow the active sensor.
-#define HOME_SENSOR_TILE_COUNT 8
+// Eight sensors wired to the board, plus a tile for each connected BLE node.
+// A node is chosen exactly the way a local sensor is, because from the
+// measurement screen's point of view there is no difference between them.
+#define HOME_LOCAL_TILE_COUNT 8
+#define HOME_SENSOR_TILE_COUNT (HOME_LOCAL_TILE_COUNT + BLE_LINK_MAX_NODES)
 // The group code is edited in a modal sheet rather than in place: the keyboard
 // covers the lower third of the screen, so an inline field would either sit
 // under the keyboard or have to displace the sensor grid.
@@ -904,6 +908,12 @@ static lv_obj_t *labelHomeModumCode;
 static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
 static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
 static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
+
+// -1 for a sensor on this board; otherwise the BLE slot the tile stands for.
+static int homeSensorTileSlot[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeSensorTileName[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeSensorTileDetail[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeSensorTileUnit[HOME_SENSOR_TILE_COUNT];
 
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
@@ -1095,16 +1105,58 @@ void clearChart();
 void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 const char *sensorDetailText(int mode);
 
+// Node tiles carry the node's own name and whatever it is currently
+// reporting, so the home grid says the same thing whether a sensor is wired to
+// this board or three metres away on another one.
+void refreshHomeBleTiles()
+{
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    const int i = HOME_LOCAL_TILE_COUNT + slot;
+    if (homeSensorTiles[i] == NULL) continue;
+
+    if (!bleLinkSlotIsSubscribed(slot))
+    {
+      lv_obj_add_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    lv_obj_clear_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
+
+    if (homeSensorTileName[i]) lv_label_set_text(homeSensorTileName[i], bleLinkSlotName(slot));
+
+    char units[64] = "";
+    const int count = bleLinkValueCount(slot);
+
+    for (int v = 0; v < count && v < BLE_LINK_MAX_VALUES; v++)
+    {
+      char quantity[24] = "";
+      char unit[24] = "";
+      if (!bleLinkValueAt(slot, v, NULL, quantity, unit, NULL)) break;
+
+      char entry[32];
+      snprintf(entry, sizeof(entry), "%s%s", units[0] ? " · " : "", unit);
+      strncat(units, entry, sizeof(units) - strlen(units) - 1);
+    }
+
+    if (homeSensorTileUnit[i]) lv_label_set_text(homeSensorTileUnit[i], units);
+    if (homeSensorTileDetail[i]) lv_label_set_text(homeSensorTileDetail[i], "블루투스 노드");
+  }
+}
+
 // Move the "선택됨" state onto the tile for `mode`.
 void refreshHomeSensorTilesFor(int mode)
 {
   for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
   {
-    styleSensorTile(
-      homeSensorTiles[i],
-      homeSensorTileMarks[i],
-      homeSensorTileModes[i] == mode
-    );
+    if (homeSensorTiles[i] == NULL) continue;
+
+    // Every node tile carries SENSOR_MODE_BLE, so the mode alone would light
+    // all of them up. Only the slot being recorded is selected.
+    bool selected = homeSensorTileModes[i] == mode;
+    if (selected && homeSensorTileSlot[i] >= 0) selected = homeSensorTileSlot[i] == activeBleSlot;
+
+    styleSensorTile(homeSensorTiles[i], homeSensorTileMarks[i], selected);
   }
 }
 
@@ -1208,6 +1260,18 @@ static void home_sensor_encoder_event_cb(lv_event_t *e)
   pendingSensorMode = SENSOR_MODE_ENCODER;
 }
 
+static void home_sensor_ble_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
+
+  const int slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (!bleLinkSlotIsSubscribed(slot)) return;
+
+  activeBleSlot = slot;
+  pendingSensorMode = SENSOR_MODE_BLE;
+}
+
 void servicePendingSensorMode()
 {
   int mode = pendingSensorMode;
@@ -1263,6 +1327,7 @@ static void home_sensor_tmp117_event_cb(lv_event_t *e);
 static void home_sensor_vl53_event_cb(lv_event_t *e);
 static void home_sensor_ina228_event_cb(lv_event_t *e);
 static void home_sensor_encoder_event_cb(lv_event_t *e);
+static void home_sensor_ble_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
 void sanitizeBasicFileName(const char *input, char *out, size_t outSize);
@@ -1327,6 +1392,7 @@ bool measuring = false;
 bool sdReady = false;
 
 unsigned long lastReadMs = 0;
+unsigned long lastPreviewMs = 0;
 unsigned long lastUiClockMs = 0;
 unsigned long startMs = 0;
 const unsigned long readIntervalMs = 1000;
@@ -3146,6 +3212,12 @@ static bool secondaryPlotValueValid(float value)
   return !activeSensorHasPressure() || pressureValueValid(value);
 }
 
+// The last reading taken while not recording. Recording is what 측정 시작
+// starts; seeing is not, and a sensor that shows nothing until then looks
+// broken.
+static float previewValues[MEASURE_VALUE_MAX] = { NAN, NAN, NAN };
+static bool previewValid = false;
+
 // How many decimals a sensor's second and third readings deserve. The first
 // column has formatPrimaryValueText() for this; these needed the same.
 static void formatMeasureExtraValue(float value, char *out, size_t outSize)
@@ -3333,9 +3405,22 @@ static void refreshLatestMeasurementLabels()
 
   if (sampleCount <= 0)
   {
+    // Nothing recorded yet, but the sensor is still reading. Showing the live
+    // value here is what makes choosing a sensor feel like it did something:
+    // before this the screen sat on a row of dashes until 측정 시작 was
+    // pressed, which read as "the sensor did not open".
     for (int i = 0; i < MEASURE_VALUE_MAX; i++)
     {
-      measureValuePlaceholder(i, text, sizeof(text));
+      if (previewValid && !isnan(previewValues[i]))
+      {
+        if (i == 0) formatPrimaryValueText(text, sizeof(text), previewValues[0], false);
+        else formatMeasureExtraValue(previewValues[i], text, sizeof(text));
+      }
+      else
+      {
+        measureValuePlaceholder(i, text, sizeof(text));
+      }
+
       lv_label_set_text(labelValueNumber[i], text);
     }
 
@@ -3920,6 +4005,7 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
     bleNodeRefreshMetadata();
+    refreshHomeBleTiles();
     return bleLinkSlotIsSubscribed(activeBleSlot);
   }
 
@@ -4760,7 +4846,9 @@ void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
 // keeps `markOut` so the selected state can be moved later.
 lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
                          const char *detail, int x, int y, int w, int h,
-                         bool selected, lv_event_cb_t cb, lv_obj_t **markOut)
+                         bool selected, lv_event_cb_t cb, lv_obj_t **markOut,
+                         lv_obj_t **nameOut = NULL, lv_obj_t **detailOut = NULL,
+                         lv_obj_t **unitOut = NULL)
 {
   lv_obj_t *tile = lv_btn_create(parent);
   lv_obj_set_size(tile, w, h);
@@ -4802,6 +4890,9 @@ lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
   styleSensorTile(tile, mark, selected);
 
   if (markOut != NULL) *markOut = mark;
+  if (nameOut != NULL) *nameOut = nameLabel;
+  if (detailOut != NULL) *detailOut = detailLabel;
+  if (unitOut != NULL) *unitOut = unitLabel;
   return tile;
 }
 
@@ -7624,12 +7715,15 @@ void createHomeUi()
   // Seven tiles on a 4x2 grid. Narrower than the old 3x2 at 231 px, but still
   // twice the width of a fingertip, and it keeps the grid to two rows so the
   // group code and 측정 시작 stay where they were.
+  // Three rows now: eight sensors on this board and up to three BLE nodes.
+  // The tiles lose 14 px of height to make room, which the group code panel
+  // and 측정 시작 below give back by moving down.
   const int tileW = 231;
-  const int tileH = 112;
+  const int tileH = 98;
   const int tileGapX = 14;
-  const int tileGapY = 14;
+  const int tileGapY = 10;
   const int tileLeft = 28;
-  const int tileTop = 128;
+  const int tileTop = 120;
   const int tileCols = 4;
 
   struct SensorTileSpec
@@ -7642,7 +7736,7 @@ void createHomeUi()
 
   // Named by the quantity measured, not the part number: a student reads
   // "이산화탄소", not "SCD41".
-  const SensorTileSpec tiles[HOME_SENSOR_TILE_COUNT] = {
+  const SensorTileSpec tiles[HOME_LOCAL_TILE_COUNT] = {
     { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
     { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
     { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
@@ -7653,12 +7747,13 @@ void createHomeUi()
     { "회전",        "° · °/s",   SENSOR_MODE_ENCODER, home_sensor_encoder_event_cb }
   };
 
-  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+  for (int i = 0; i < HOME_LOCAL_TILE_COUNT; i++)
   {
     const int col = i % tileCols;
     const int row = i / tileCols;
 
     homeSensorTileModes[i] = tiles[i].mode;
+    homeSensorTileSlot[i] = -1;
     homeSensorTiles[i] = makeSensorTile(
       homeScreen,
       tiles[i].name,
@@ -7674,10 +7769,40 @@ void createHomeUi()
     );
   }
 
+  // A tile per BLE slot, hidden until something is connected to it.
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    const int i = HOME_LOCAL_TILE_COUNT + slot;
+    const int col = i % tileCols;
+    const int row = i / tileCols;
+
+    homeSensorTileModes[i] = SENSOR_MODE_BLE;
+    homeSensorTileSlot[i] = slot;
+    homeSensorTiles[i] = makeSensorTile(
+      homeScreen,
+      "블루투스",
+      "",
+      "연결된 노드 없음",
+      tileLeft + col * (tileW + tileGapX),
+      tileTop + row * (tileH + tileGapY),
+      tileW,
+      tileH,
+      false,
+      home_sensor_ble_event_cb,
+      &homeSensorTileMarks[i],
+      &homeSensorTileName[i],
+      &homeSensorTileDetail[i],
+      &homeSensorTileUnit[i]
+    );
+
+    lv_obj_set_user_data(homeSensorTiles[i], (void *)(intptr_t)slot);
+    lv_obj_add_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
   // The selected tile already carries 선택됨, so no "선택: ..." line here.
   labelHomeSensorMode = NULL;
 
-  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 388, UI_TEXT_2);
+  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 440, UI_TEXT_2);
   lv_obj_set_width(labelHomeSensorStatus, 392);
   lv_obj_set_style_text_align(labelHomeSensorStatus, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
@@ -7688,7 +7813,7 @@ void createHomeUi()
   // =====================================================
   // Resting state: the saved code is read-only text. Editing happens in a
   // modal sheet, opened by 변경.
-  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 458, 604, 72);
 
   makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
 
@@ -7699,7 +7824,7 @@ void createHomeUi()
   makeQuietButton(codePanel, "변경", 486, 18, 100, 38, home_code_open_event_cb);
 
   // The one primary action on this screen.
-  makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
+  makePrimaryButton(homeScreen, "측정 시작", 652, 458, 344, 72, UI_ACCENT, go_measure_event_cb);
 
   // Upload mode and queue counts belong in Settings, not on the home screen.
   labelCloudMode = NULL;
@@ -12521,6 +12646,30 @@ void loop()
   {
     setIslStatusText("일괄전송 요청 대기 >5초: WiFi task 확인");
     requestBatchUiRefresh();
+  }
+
+  // Idle preview. Same cadence as a run, but nothing is stored: no sample, no
+  // CSV row, no upload.
+  if (!measuring && dpsReady && !uiInputLocked && now - lastPreviewMs >= readIntervalMs)
+  {
+    lastPreviewMs = now;
+
+    float previewPrimary = NAN;
+    float previewSecondary = NAN;
+
+    if (readActiveSensor(&previewPrimary, &previewSecondary))
+    {
+      previewValues[0] = previewPrimary;
+      previewValues[1] = previewSecondary;
+      previewValues[2] = thirdValueForActiveSensor();
+      previewValid = true;
+    }
+    else
+    {
+      previewValid = false;
+    }
+
+    if (sampleCount == 0) refreshLatestMeasurementLabels();
   }
 
   if (measuring && dpsReady)
