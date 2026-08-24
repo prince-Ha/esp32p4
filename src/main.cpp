@@ -6341,9 +6341,30 @@ void loadHomeScreenFresh()
   requestScreenSwitch(homeScreen);
 }
 
+// Names a screen for the log. Nothing else needs this, but "which screen did
+// it actually go to" is otherwise invisible from a serial capture.
+static const char *screenName(lv_obj_t *screen)
+{
+  if (screen == homeScreen) return "home";
+  if (screen == measureScreen) return "measure";
+  if (screen == csvScreen) return "record";
+  if (screen == bleScreen) return "ble";
+  if (screen == settingsScreen) return "wifi";
+  if (screen == deviceScreen) return "device";
+  if (screen == islScreen) return "isl";
+  if (screen == fileViewerScreen) return "fileviewer";
+  return screen == NULL ? "(null)" : "(unknown)";
+}
+
 void requestScreenSwitch(lv_obj_t *screen)
 {
-  if (screen == NULL) return;
+  if (screen == NULL)
+  {
+    Serial.println("[UI] screen switch requested to a screen that was never built");
+    return;
+  }
+
+  Serial.printf("[UI] switch requested -> %s\n", screenName(screen));
   pendingScreen = screen;
   pendingScreenRequestMs = millis();
 }
@@ -6394,6 +6415,7 @@ void activateScreenNow(lv_obj_t *screen)
   ensureOpaqueScreenBase(screen);
   prepareScreenContent(screen);
 
+  Serial.printf("[UI] now showing %s\n", screenName(screen));
   lv_scr_load(screen);
   currentLoadedScreen = screen;
   lv_obj_invalidate(screen);
@@ -12240,6 +12262,11 @@ void setup()
   createCsvUi();
   createFileViewerUi();
   createIslUi();
+
+  // Eight screens now carry a six-tab bar, and the 블루투스 tab holds three
+  // node cards. LVGL allocates from the system heap here, so this is the line
+  // to read if screens ever start coming up empty.
+  logHeapState("after building every screen");
   // its drawing buffers were cut down to stubs.
 
   // Allocate every main screen base during setup, not on the first user tap.
