@@ -366,6 +366,19 @@ static void bleNodeRefreshMetadata()
   bleNodeValueCount = count < BLE_LINK_MAX_VALUES ? count : BLE_LINK_MAX_VALUES;
 }
 
+// A node writes its unit in ASCII, because the payload has to survive a font
+// subset cut at build time and a comma-separated line. On screen it should
+// still read the way a student writes it. The 지능형 과학실 mapping keeps
+// using the raw unit, so this is display only.
+const char *bleDisplayUnit(const char *unit)
+{
+  if (unit == NULL) return "";
+  if (strcmp(unit, "C") == 0 || strcmp(unit, "degC") == 0) return "℃";
+  if (strcmp(unit, "deg") == 0) return "°";
+  if (strcmp(unit, "deg/s") == 0) return "°/s";
+  return unit;
+}
+
 static const BleIslMapping *bleIslMappingForUnit(const char *unit)
 {
   if (unit == NULL || unit[0] == 0) return NULL;
@@ -1135,7 +1148,7 @@ void refreshHomeBleTiles()
       if (!bleLinkValueAt(slot, v, NULL, quantity, unit, NULL)) break;
 
       char entry[32];
-      snprintf(entry, sizeof(entry), "%s%s", units[0] ? " · " : "", unit);
+      snprintf(entry, sizeof(entry), "%s%s", units[0] ? " · " : "", bleDisplayUnit(unit));
       strncat(units, entry, sizeof(units) - strlen(units) - 1);
     }
 
@@ -2924,7 +2937,7 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
   if (activeSensorMode == SENSOR_MODE_INA228) return "A";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "°";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeUnit[0];
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleDisplayUnit(bleNodeUnit[0]);
   return "℃";
 }
 
@@ -3071,7 +3084,7 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
   else if (activeSensorMode == SENSOR_MODE_BLE)
   {
     // A node can be sending anything, so no assumption about decimals.
-    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity[0], value, bleNodeUnit[0]);
+    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity[0], value, bleDisplayUnit(bleNodeUnit[0]));
     else snprintf(out, outSize, "%.4g", value);
   }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
@@ -3161,7 +3174,7 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
     if (index >= 0 && index < BLE_LINK_MAX_VALUES)
     {
       *caption = bleNodeQuantity[index];
-      *unit = bleNodeUnit[index];
+      *unit = bleDisplayUnit(bleNodeUnit[index]);
     }
     return;
   }
@@ -8490,7 +8503,7 @@ static void bleSlotValueSummary(int slot, char *out, size_t outSize)
 
     char entry[48];
     snprintf(entry, sizeof(entry), "%s%s %.4g%s", out[0] ? "  ·  " : "",
-             quantity, value, unit);
+             quantity, value, bleDisplayUnit(unit));
     strncat(out, entry, outSize - strlen(out) - 1);
   }
 
