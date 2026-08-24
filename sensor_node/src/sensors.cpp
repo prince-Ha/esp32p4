@@ -711,6 +711,24 @@ static inline int dsOwReadLevel()
   return digitalRead(oneWirePin);
 }
 
+// Drives the line high from the pin itself, instead of leaving it to a
+// resistor.
+//
+// The ESP32's internal pull-up is about 45k. That is enough to hold an idle
+// line high, but not to power a DS18B20 wired without its VCC - in parasite
+// mode the part draws its supply from the data line during conversion, and on
+// 45k it never charges enough to answer, which reads back as FF for every
+// byte. The datasheet's own answer is a strong pull-up held across the
+// conversion, which is what this is.
+//
+// Only safe while nothing else is driving: between transactions, and during
+// the conversion wait. Never during a slot the part might pull low.
+static inline void dsOwStrongPullup()
+{
+  digitalWrite(oneWirePin, HIGH);
+  pinMode(oneWirePin, OUTPUT);
+}
+
 static bool dsOwReset()
 {
   bool presence;
@@ -804,6 +822,10 @@ static bool dsStartConversion()
   dsOwWriteByte(0xCC);   // Skip ROM: one part on the line
   dsOwWriteByte(0x44);   // Convert T
 
+  // Hold the line up for the whole conversion. A part with its VCC connected
+  // ignores this; one running on parasite power needs it.
+  dsOwStrongPullup();
+
   dsConversionStarted = true;
   dsConversionStartMs = millis();
   return true;
@@ -825,8 +847,12 @@ static bool dsProbePin(uint8_t pin)
   // bit-banging hard enough to corrupt every byte.
   if (pin == I2C_SDA_PIN || pin == I2C_SCL_PIN) Wire.end();
 
+  // Charge a parasite-powered part before asking it anything, or its first
+  // answer is the one that fails.
+  dsOwStrongPullup();
+  delay(10);
   dsOwRelease();
-  delay(2);
+  delayMicroseconds(10);
 
   // An empty pin idles high on the pull-up; one shorted to ground never rises.
   if (dsOwReadLevel() == 0) return false;
@@ -909,6 +935,10 @@ static int ds18b20Read(NodeValue *out, int maxValues)
   }
 
   if (millis() - dsConversionStartMs < DS18B20_CONVERT_MS) return 0;
+
+  // Stop driving before the part is asked to answer.
+  dsOwRelease();
+  delayMicroseconds(10);
 
   if (!dsOwReset())
   {
