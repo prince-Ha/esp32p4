@@ -542,6 +542,7 @@ static char bleLinkState[48] = "연결 안 됨";
 static char bleLinkPayload[96] = "";
 static uint32_t bleLinkPayloadMs = 0;
 static bool bleLinkHasReading = false;
+static uint32_t bleLinkNotifyCount = 0;
 
 static void bleLinkSetState(const char *text)
 {
@@ -551,13 +552,17 @@ static void bleLinkSetState(const char *text)
 
 static void bleLinkReset(const char *why)
 {
+  const bool wasIdle = bleLinkConnHandle == BLE_HS_CONN_HANDLE_NONE && !bleLinkBusy;
+
   bleLinkConnHandle = BLE_HS_CONN_HANDLE_NONE;
   bleLinkValueHandle = 0;
   bleLinkCccdHandle = 0;
   bleLinkSvcEndHandle = 0;
   bleLinkSubscribed = false;
   bleLinkBusy = false;
-  bleLinkSetState(why);
+
+  if (wasIdle) snprintf(bleLinkState, sizeof(bleLinkState), "%s", why);
+  else bleLinkSetState(why);
 }
 
 // Step 4: the subscription write came back.
@@ -658,6 +663,29 @@ static int bleLinkOnCharacteristic(uint16_t conn_handle,
   return 0;
 }
 
+static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            const struct ble_gatt_svc *service, void *arg);
+
+// Step 0: agree an MTU.
+//
+// The default ATT MTU is 23, which leaves 20 bytes for a notification. A
+// reading like "202,테스트,2.0000,-" is 23 bytes once the Korean is UTF-8
+// encoded, so without this the unit field is silently cut off the end and the
+// packet no longer parses. Do it before subscribing, not after, or the first
+// readings arrive at the old size.
+static int bleLinkOnMtu(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t mtu, void *arg)
+{
+  (void)arg;
+
+  if (error->status == 0) blePrintf("MTU is %u", (unsigned)mtu);
+  else blePrintf("MTU exchange failed: %d, staying at 23", error->status);
+
+  bleLinkSetState("서비스 검색 중");
+  ble_gattc_disc_svc_by_uuid(conn_handle, &kServiceUuid.u, bleLinkOnService, NULL);
+  return 0;
+}
+
 // Step 1: found the service.
 static int bleLinkOnService(uint16_t conn_handle,
                             const struct ble_gatt_error *error,
@@ -711,10 +739,16 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
       }
 
       bleLinkConnHandle = event->connect.conn_handle;
-      bleLinkSetState("서비스 검색 중");
+      bleLinkSetState("MTU 협상 중");
 
-      ble_gattc_disc_svc_by_uuid(bleLinkConnHandle, &kServiceUuid.u,
-                                 bleLinkOnService, NULL);
+      if (ble_gattc_exchange_mtu(bleLinkConnHandle, bleLinkOnMtu, NULL) != 0)
+      {
+        // Not fatal on its own; carry on at the default size.
+        bleLinkSetState("서비스 검색 중");
+        ble_gattc_disc_svc_by_uuid(bleLinkConnHandle, &kServiceUuid.u,
+                                   bleLinkOnService, NULL);
+      }
+
       return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -734,6 +768,16 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
       {
         bleLinkPayload[copy] = '\0';
         bleLinkPayloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+
+        // The first packet is the one that proves the subscription took; after
+        // that a line every ten seconds is enough to show the node is alive
+        // without burying everything else in the log.
+        if (!bleLinkHasReading || (bleLinkNotifyCount % 10) == 0)
+        {
+          blePrintf("rx #%lu: %s", (unsigned long)bleLinkNotifyCount, bleLinkPayload);
+        }
+
+        bleLinkNotifyCount++;
         bleLinkHasReading = true;
       }
 
@@ -801,6 +845,7 @@ bool bleLinkConnect(const char *address)
 
   bleLinkBusy = true;
   bleLinkHasReading = false;
+  bleLinkNotifyCount = 0;
   bleLinkSetState("연결 중");
 
   const int rc = ble_gap_connect(bleAddrType, &peer, 10000, NULL,
@@ -825,6 +870,31 @@ void bleLinkDisconnect()
 
   bleLinkReset("연결 안 됨");
   bleLinkHasReading = false;
+}
+
+// bleFormatServices() prints a 128-bit UUID as its leading four bytes, which
+// is enough to tell this project's nodes from anything else in the room.
+#define BLE_SENSOR_SERVICE_TAG "6e5f0001"
+
+bool bleAutoLinkToSensorNode()
+{
+  if (bleLinkSubscribed || bleLinkBusy) return false;
+
+  int best = -1;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strstr(bleScanResults[i].services, BLE_SENSOR_SERVICE_TAG) == NULL) continue;
+    if (best < 0 || bleScanResults[i].rssi > bleScanResults[best].rssi) best = i;
+  }
+
+  if (best < 0) return false;
+
+  blePrintf("auto-linking to %s (%s, %d dBm)",
+            bleScanResults[best].name[0] ? bleScanResults[best].name : "(unnamed)",
+            bleScanResults[best].address, bleScanResults[best].rssi);
+
+  return bleLinkConnect(bleScanResults[best].address);
 }
 
 bool bleLinkIsSubscribed() { return bleLinkSubscribed; }
@@ -856,11 +926,13 @@ bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *
     cursor++;
   }
 
-  if (found < 4) return false;
+  // The unit is optional: a node that omits it, or whose packet was clipped by
+  // a small MTU, still gives a usable number.
+  if (found < 3) return false;
 
   if (value) *value = strtof(fields[2], NULL);
   if (sensorName) snprintf(sensorName, 24, "%s", fields[1]);
-  if (unit) snprintf(unit, 24, "%s", fields[3]);
+  if (unit) snprintf(unit, 24, "%s", found >= 4 ? fields[3] : "");
 
   if (ageMs)
   {
@@ -892,6 +964,7 @@ int bleScanCandidateCount() { return 0; }
 bool bleLinkConnect(const char *address) { (void)address; return false; }
 void bleLinkDisconnect() {}
 bool bleLinkIsSubscribed() { return false; }
+bool bleAutoLinkToSensorNode() { return false; }
 bool bleLinkIsBusy() { return false; }
 const char *bleLinkPeerName() { return ""; }
 const char *bleLinkStateText() { return "지원 안 함"; }

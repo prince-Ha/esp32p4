@@ -79,6 +79,11 @@ void setup()
 
   BLEDevice::init(nodeName);
 
+  // The default ATT MTU of 23 leaves 20 bytes per notification, which a
+  // reading with a Korean quantity name overruns. The P4 asks for a bigger
+  // one, but the server has to be willing to grant it.
+  BLEDevice::setMTU(247);
+
   BLEServer *server = BLEDevice::createServer();
   server->setCallbacks(new NodeServerCallbacks());
 

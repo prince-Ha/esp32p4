@@ -111,6 +111,12 @@ const char *bleLinkStateText();
 // tells a stalled node from a slow one.
 bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs);
 
+// Links to the strongest node in the last scan that advertises this project's
+// service, so a hub that is power-cycled mid-lesson comes back talking to its
+// node instead of waiting for someone to tap the list. Returns false when no
+// such node was seen.
+bool bleAutoLinkToSensorNode();
+
 #ifdef __cplusplus
 }
 #endif

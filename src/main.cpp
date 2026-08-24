@@ -11917,6 +11917,17 @@ void loop()
       bleScanStart(6000);
     }
 
+    // A scan that just finished is the one moment the result list is fresh.
+    static bool bleScanWasRunning = false;
+    const bool bleScanNow = bleScanIsRunning();
+
+    if (bleScanWasRunning && !bleScanNow && bleAutoLinkToSensorNode())
+    {
+      refreshBleScreen();
+    }
+
+    bleScanWasRunning = bleScanNow;
+
     if (pendingBleDisconnect)
     {
       pendingBleDisconnect = false;
