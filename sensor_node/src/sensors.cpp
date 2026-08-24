@@ -5,6 +5,7 @@
 #include "sensors.h"
 
 #include <math.h>
+#include <driver/gpio.h>
 
 static NodeSensorKind detectedKind = NODE_SENSOR_NONE;
 static uint8_t detectedAddress = 0x00;
@@ -685,7 +686,10 @@ static int ina228Read(NodeValue *out, int maxValues)
 // node's one-second cycle, so a reading is started on one pass and collected
 // on the next rather than blocking the loop.
 
-#define DS18B20_CONVERT_MS 1000
+// The datasheet allows 750 ms for a 12-bit conversion. Waiting the full second
+// the P4 uses put this a hair over the node's own one-second cycle, so every
+// other tick had no reading and the probe reported half as often as it could.
+#define DS18B20_CONVERT_MS 800
 
 static bool dsConversionStarted = false;
 static unsigned long dsConversionStartMs = 0;
@@ -695,15 +699,37 @@ static unsigned long dsConversionStartMs = 0;
 // part announces itself on any pin, so there is no reason to insist on one.
 static uint8_t oneWirePin = ONE_WIRE_PIN;
 
+// The line is held in open-drain the whole time it is being talked to, so
+// driving it and letting go are both a single digitalWrite.
+//
+// This is the difference between the P4's copy of this driver and this one.
+// There the pin is switched with ESP-IDF calls that take a few hundred
+// nanoseconds; pinMode() on Arduino reconfigures the IO MUX and costs
+// microseconds. A read slot has to release the line within 15 us of pulling it
+// down, and pinMode() inside that window overruns it - the part then reads the
+// master's timing as a write instead of a read and says nothing, which comes
+// back as FF for every byte. A 520 us reset pulse has room to absorb the same
+// overhead, which is why presence worked while nothing could be read.
+static inline void dsOwBusIdle()
+{
+  pinMode(oneWirePin, OUTPUT_OPEN_DRAIN);
+  digitalWrite(oneWirePin, HIGH);
+
+  // Open drain on its own leaves an unconnected pin floating, and a floating
+  // pin reads back whatever it last held - which is how an empty GPIO4 came to
+  // return a scratchpad of zeros. The weak internal pull-up puts an empty pin
+  // firmly high again; a real line has its own 4.7k and does not notice.
+  gpio_pullup_en((gpio_num_t)oneWirePin);
+}
+
 static inline void dsOwRelease()
 {
-  pinMode(oneWirePin, INPUT_PULLUP);
+  digitalWrite(oneWirePin, HIGH);
 }
 
 static inline void dsOwLow()
 {
   digitalWrite(oneWirePin, LOW);
-  pinMode(oneWirePin, OUTPUT);
 }
 
 static inline int dsOwReadLevel()
@@ -726,7 +752,7 @@ static inline int dsOwReadLevel()
 static inline void dsOwStrongPullup()
 {
   digitalWrite(oneWirePin, HIGH);
-  pinMode(oneWirePin, OUTPUT);
+  pinMode(oneWirePin, OUTPUT);   // push-pull: outside any timed slot
 }
 
 static bool dsOwReset()
@@ -848,6 +874,31 @@ static const uint8_t kOneWireCandidates[] = {
 static int dsLastIdleLevel = -1;
 static bool dsLastPresence = false;
 
+// A CRC is not enough on its own: eight zero bytes have a CRC of zero, so a
+// line stuck low passes, and so does one stuck high. Those two patterns are
+// rejected by name.
+//
+// The reserved bytes are deliberately not checked. The datasheet gives 0xFF
+// for byte 5 and 0x10 for byte 7, and the part on this bench answers A5 and
+// 66 with a CRC that verifies - plenty of DS18B20s in circulation are clones
+// that fill the reserved bytes differently. Insisting on the datasheet values
+// threw away a perfectly good 25.0 C reading.
+static bool dsScratchpadLooksReal(const uint8_t *data)
+{
+  if (dsCrc8Dallas(data, 8) != data[8]) return false;
+
+  bool allZero = true;
+  bool allOnes = true;
+
+  for (int i = 0; i < 9; i++)
+  {
+    if (data[i] != 0x00) allZero = false;
+    if (data[i] != 0xFF) allOnes = false;
+  }
+
+  return !allZero && !allOnes;
+}
+
 static bool dsProbePin(uint8_t pin)
 {
   oneWirePin = pin;
@@ -863,7 +914,7 @@ static bool dsProbePin(uint8_t pin)
   // answer is the one that fails.
   dsOwStrongPullup();
   delay(10);
-  dsOwRelease();
+  dsOwBusIdle();
   delayMicroseconds(10);
 
   // An empty pin idles high on the pull-up; one shorted to ground never rises.
@@ -885,12 +936,21 @@ static bool dsProbePin(uint8_t pin)
   uint8_t data[9];
   for (uint8_t i = 0; i < 9; i++) data[i] = dsOwReadByte();
 
-  return dsCrc8Dallas(data, 8) == data[8];
+  if (dsScratchpadLooksReal(data)) return true;
+
+  // A pin that answered a reset and then returned something unreadable is the
+  // interesting case: the part is there, and what came back says whether the
+  // problem is the line or the timing.
+  Serial.printf("[DS18B20] GPIO%-2d answered but read %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                pin, data[0], data[1], data[2], data[3], data[4],
+                data[5], data[6], data[7], data[8]);
+  return false;
 }
 
 static bool ds18b20Begin()
 {
   dsConversionStarted = false;
+  dsOwBusIdle();
 
   if (!dsProbePin(oneWirePin))
   {
@@ -957,8 +1017,8 @@ static int ds18b20Read(NodeValue *out, int maxValues)
 
   if (millis() - dsConversionStartMs < DS18B20_CONVERT_MS) return 0;
 
-  // Stop driving before the part is asked to answer.
-  dsOwRelease();
+  // Out of push-pull and back to open drain before the part is asked to answer.
+  dsOwBusIdle();
   delayMicroseconds(10);
 
   if (!dsOwReset())
@@ -973,7 +1033,7 @@ static int ds18b20Read(NodeValue *out, int maxValues)
   uint8_t data[9];
   for (uint8_t i = 0; i < 9; i++) data[i] = dsOwReadByte();
 
-  if (dsCrc8Dallas(data, 8) != data[8])
+  if (!dsScratchpadLooksReal(data))
   {
     // All ones is an open data line - no pull-up, or nothing on the other end.
     // Anything else is a line that answers but is being read at the wrong
