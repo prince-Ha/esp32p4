@@ -298,10 +298,13 @@ static int32_t encoderPrevCount = 0;
 static unsigned long encoderPrevMs = 0;
 static float encoderLastRateDegPerS = NAN;
 
-// Filled in from each notification: a node names its own quantity and unit,
-// so unlike every other sensor here these are not compile-time constants.
-static char bleNodeQuantity[24] = "블루투스";
-static char bleNodeUnit[24] = "-";
+// Filled in from each notification: a node names its own quantities and units,
+// so unlike every other sensor here these are not compile-time constants. A
+// DPS310 on a node reports two, the same as one wired to this board.
+static char bleNodeQuantity[BLE_LINK_MAX_VALUES][24] = { "블루투스", "", "" };
+static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
+static int bleNodeValueCount = 1;
+static float bleNodeThirdValue = NAN;
 
 static bool ina228Ready = false;
 static float ina228LastPowerW = NAN;
@@ -2697,7 +2700,7 @@ const char *activeSensorName()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "TMP117 정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "INA228 전압·전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전 엔코더";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "VL53L1X 거리";
   return "DPS310";
 }
@@ -2710,7 +2713,7 @@ const char *activeMeasurementTitle()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀 온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전압 · 전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도 · 기압";
 }
@@ -2723,7 +2726,7 @@ const char *activePrimaryName()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "각도";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도";
 }
@@ -2735,7 +2738,7 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
   if (activeSensorMode == SENSOR_MODE_INA228) return "A";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "°";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeUnit;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeUnit[0];
   return "℃";
 }
 
@@ -2764,7 +2767,7 @@ const char *islTemperatureNickname()
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
   if (activeSensorMode == SENSOR_MODE_INA228) return "전류센서";
   if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전센서";
-  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   return "온도센서";
 }
 
@@ -2791,6 +2794,12 @@ const char *sensorDetailText(int mode)
 // How many quantities the active sensor reports at once.
 int activeSensorValueCount()
 {
+  // However many the node last sent, which is its business, not ours.
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    return bleNodeValueCount > 0 ? bleNodeValueCount : 1;
+  }
+
   if (activeSensorMode == SENSOR_MODE_SCD41) return 3;   // CO2, 온도, 습도
   if (activeSensorMode == SENSOR_MODE_INA228) return 3;  // 전류, 전압, 전력
   if (activeSensorMode == SENSOR_MODE_ENCODER) return 2;  // 각도, 각속도
@@ -2875,7 +2884,7 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
   else if (activeSensorMode == SENSOR_MODE_BLE)
   {
     // A node can be sending anything, so no assumption about decimals.
-    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity, value, bleNodeUnit);
+    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity[0], value, bleNodeUnit[0]);
     else snprintf(out, outSize, "%.4g", value);
   }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
@@ -2957,6 +2966,16 @@ static void measureValueMeta(int index, const char **caption, const char **unit)
     if (index == 0) { *caption = "이산화탄소"; *unit = "ppm"; }
     else if (index == 1) { *caption = "온도"; *unit = "℃"; }
     else if (index == 2) { *caption = "습도"; *unit = "%"; }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    if (index >= 0 && index < BLE_LINK_MAX_VALUES)
+    {
+      *caption = bleNodeQuantity[index];
+      *unit = bleNodeUnit[index];
+    }
     return;
   }
 
@@ -3864,19 +3883,33 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
 
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
-    float value = NAN;
-    char quantity[24] = "";
-    char unit[24] = "";
-    uint32_t ageMs = 0;
+    const int count = bleLinkValueCount();
+    if (count <= 0) return false;
 
-    if (!bleLinkLatestReading(&value, quantity, unit, &ageMs)) return false;
+    float values[BLE_LINK_MAX_VALUES] = { NAN, NAN, NAN };
+    uint32_t ageMs = 0;
+    int read = 0;
+
+    for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
+    {
+      char quantity[24] = "";
+      char unit[24] = "";
+
+      if (!bleLinkValueAt(i, &values[i], quantity, unit, &ageMs)) break;
+
+      if (quantity[0]) snprintf(bleNodeQuantity[i], sizeof(bleNodeQuantity[i]), "%s", quantity);
+      if (unit[0]) snprintf(bleNodeUnit[i], sizeof(bleNodeUnit[i]), "%s", unit);
+      read++;
+    }
+
+    if (read == 0) return false;
     if (ageMs > BLE_READING_MAX_AGE_MS) return false;
 
-    if (quantity[0]) snprintf(bleNodeQuantity, sizeof(bleNodeQuantity), "%s", quantity);
-    if (unit[0]) snprintf(bleNodeUnit, sizeof(bleNodeUnit), "%s", unit);
+    bleNodeValueCount = read;
 
-    *primaryValue = value;
-    *secondaryValue = NAN;
+    *primaryValue = values[0];
+    *secondaryValue = values[1];
+    bleNodeThirdValue = values[2];
     return true;
   }
 
@@ -3993,7 +4026,7 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_BLE)
   {
     char text[96];
-    snprintf(text, sizeof(text), "블루투스 센서: %s / %s",
+    snprintf(text, sizeof(text), "블루투스: %s / %s",
              bleLinkPeerName()[0] ? bleLinkPeerName() : "-", bleLinkStateText());
     setIslStatusText(text);
   }
@@ -5514,6 +5547,7 @@ static float thirdValueForActiveSensor()
 {
   if (activeSensorMode == SENSOR_MODE_SCD41) return scd41LastHumidityPct;
   if (activeSensorMode == SENSOR_MODE_INA228) return ina228LastPowerW;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeThirdValue;
   return NAN;
 }
 

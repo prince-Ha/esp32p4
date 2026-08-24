@@ -105,7 +105,18 @@ const char *bleLinkPeerName();
 // "수신 중", or a failure reason.
 const char *bleLinkStateText();
 
-// The most recent reading, unpacked from "<time_s>,<sensor>,<value>,<unit>".
+// The most quantities one node may report in a single packet. The P4 shows
+// three values at once, so more would have nowhere to go.
+#define BLE_LINK_MAX_VALUES 3
+
+// How many complete (name, value, unit) groups the last packet carried. Zero
+// when nothing has arrived, or when the packet was clipped mid-group.
+int bleLinkValueCount();
+
+// One of those groups. `name` and `unit` must have room for 24 bytes each.
+bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs);
+
+// The first reading, unpacked from "<time_s>,<sensor>,<value>,<unit>".
 // `sensorName` and `unit` must have room for 24 bytes each. Returns false when
 // nothing has arrived yet. `ageMs` is how long ago it landed, which is what
 // tells a stalled node from a slow one.

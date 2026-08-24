@@ -902,21 +902,39 @@ bool bleLinkIsBusy() { return bleLinkBusy; }
 const char *bleLinkPeerName() { return bleLinkPeer; }
 const char *bleLinkStateText() { return bleLinkState; }
 
-bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+int bleLinkValueCount()
 {
-  if (!bleLinkHasReading) return false;
+  if (!bleLinkHasReading) return 0;
 
-  // "<time_s>,<sensor>,<value>,<unit>"
+  int commas = 0;
+  for (const char *c = bleLinkPayload; *c; c++)
+  {
+    if (*c == ',') commas++;
+  }
+
+  // One timestamp then groups of three. An incomplete trailing group - which
+  // is what a too-small MTU produces - is not counted, so a clipped packet
+  // yields fewer values rather than a wrong one.
+  int groups = commas / 3;
+  if (groups > BLE_LINK_MAX_VALUES) groups = BLE_LINK_MAX_VALUES;
+  return groups;
+}
+
+bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs)
+{
+  if (index < 0 || index >= bleLinkValueCount()) return false;
+
   char work[sizeof(bleLinkPayload)];
   snprintf(work, sizeof(work), "%s", bleLinkPayload);
 
-  char *cursor = work;
-  char *fields[4] = { NULL, NULL, NULL, NULL };
+  char *fields[1 + 3 * BLE_LINK_MAX_VALUES];
+  const int maxFields = (int)(sizeof(fields) / sizeof(fields[0]));
   int found = 0;
+  char *cursor = work;
 
   fields[found++] = cursor;
 
-  while (*cursor && found < 4)
+  while (*cursor && found < maxFields)
   {
     if (*cursor == ',')
     {
@@ -926,13 +944,12 @@ bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *
     cursor++;
   }
 
-  // The unit is optional: a node that omits it, or whose packet was clipped by
-  // a small MTU, still gives a usable number.
-  if (found < 3) return false;
+  const int base = 1 + index * 3;   // field 0 is the node's own timestamp
+  if (base + 2 >= found) return false;
 
-  if (value) *value = strtof(fields[2], NULL);
-  if (sensorName) snprintf(sensorName, 24, "%s", fields[1]);
-  if (unit) snprintf(unit, 24, "%s", found >= 4 ? fields[3] : "");
+  if (name) snprintf(name, 24, "%s", fields[base]);
+  if (value) *value = strtof(fields[base + 1], NULL);
+  if (unit) snprintf(unit, 24, "%s", fields[base + 2]);
 
   if (ageMs)
   {
@@ -941,6 +958,11 @@ bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *
   }
 
   return true;
+}
+
+bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+{
+  return bleLinkValueAt(0, value, sensorName, unit, ageMs);
 }
 
 #else  // BLE_SENSOR_SUPPORTED
@@ -971,6 +993,12 @@ const char *bleLinkStateText() { return "지원 안 함"; }
 bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
 {
   (void)value; (void)sensorName; (void)unit; (void)ageMs;
+  return false;
+}
+int bleLinkValueCount() { return 0; }
+bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs)
+{
+  (void)index; (void)value; (void)name; (void)unit; (void)ageMs;
   return false;
 }
 
