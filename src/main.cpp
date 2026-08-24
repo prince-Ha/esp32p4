@@ -338,10 +338,17 @@ typedef struct
 } BleIslMapping;
 
 static const BleIslMapping kBleIslMappings[] = {
-  { "C",    "TPR", "온도센서", "01", "C" },
-  { "℃",   "TPR", "온도센서", "01", "C" },
-  { "degC", "TPR", "온도센서", "01", "C" },
-  { "hPa",  "PRS", "기압센서", "02", "hPa" }
+  { "C",    "TPR",  "온도센서",       "01", "C" },
+  { "℃",   "TPR",  "온도센서",       "01", "C" },
+  { "degC", "TPR",  "온도센서",       "01", "C" },
+  { "hPa",  "PRS",  "기압센서",       "02", "hPa" },
+
+  // ISL_SENSOR_TYPE_CO2 and ISL_SENSOR_TYPE_HUMIDITY, written out because this
+  // table is above where they are defined. A SCD41 wired to this board already
+  // registers with exactly these, so a node carrying one looks the same to the
+  // platform as the local part.
+  { "ppm",  "CTRT", "이산화탄소센서", "01", "ppm" },
+  { "%",    "HMDT", "습도센서",       "01", "%" }
 };
 
 // Pulls the active node's quantity names, units and count out of its last
