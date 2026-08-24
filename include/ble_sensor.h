@@ -76,57 +76,72 @@ int bleScanCandidateCount();
 void bleScanDumpResults();
 
 // =====================================================
-// Central role: linking to one sensor node
+// Central role: linking to sensor nodes
+//
+// The board is the hub, and a lesson can have more than one node in the room:
+// one group measuring pressure, another temperature. The controller holds
+// three connections at once (CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3), and the P4
+// keeps advertising as a peripheral as well, so a phone connecting to the
+// board takes one of those three.
 //
 // Scanning only says what is nearby. Linking connects to one of those devices,
 // finds the measurement characteristic and subscribes to it, after which its
-// readings arrive as notifications and are treated like any other sensor on
-// this board.
+// readings arrive as notifications.
 // =====================================================
 
-// Connects to `address` ("aa:bb:cc:dd:ee:ff", as printed by the scan) and
-// subscribes to its measurement characteristic. Asynchronous: this returns as
-// soon as the attempt starts, and bleLinkStateText() reports progress.
-bool bleLinkConnect(const char *address);
-
-// Drops the link. Safe when nothing is connected.
-void bleLinkDisconnect();
-
-// True once the subscription is in place and readings are arriving.
-bool bleLinkIsSubscribed();
-
-// True from the moment a connection attempt starts until it fails or drops.
-bool bleLinkIsBusy();
-
-// The name of the node this board is linked to, or "" when there is none.
-const char *bleLinkPeerName();
-
-// Progress for the UI: "연결 안 됨", "연결 중", "서비스 검색 중", "구독 중",
-// "수신 중", or a failure reason.
-const char *bleLinkStateText();
+// Connections the controller can hold at once.
+#define BLE_LINK_MAX_NODES 3
 
 // The most quantities one node may report in a single packet. The P4 shows
 // three values at once, so more would have nowhere to go.
 #define BLE_LINK_MAX_VALUES 3
 
-// How many complete (name, value, unit) groups the last packet carried. Zero
-// when nothing has arrived, or when the packet was clipped mid-group.
-int bleLinkValueCount();
+// Connects to `address` ("aa:bb:cc:dd:ee:ff", as printed by the scan) using
+// the first free slot. Asynchronous: this returns as soon as the attempt
+// starts, and the slot's state text reports progress. An address that already
+// holds a slot reuses it rather than taking a second one.
+bool bleLinkConnect(const char *address);
+
+// Drops one link, or all of them. Safe when nothing is connected.
+void bleLinkDisconnectSlot(int slot);
+void bleLinkDisconnect();
+
+// Slots that are connected and receiving, and the first of them. The slot
+// finder returns -1 when nothing is linked.
+int bleLinkNodeCount();
+int bleLinkFirstSubscribedSlot();
+
+bool bleLinkSlotIsSubscribed(int slot);
+
+// True from the moment a connection attempt starts until it fails or drops.
+bool bleLinkSlotIsBusy(int slot);
+bool bleLinkIsBusy();
+
+// The slot holding `address`, or -1.
+int bleLinkSlotForAddress(const char *address);
+
+// The node's advertised name, or its address when it advertised none. Empty
+// for a free slot.
+const char *bleLinkSlotName(int slot);
+
+// Progress for the UI: "연결 안 됨", "연결 중", "MTU 협상 중", "서비스 검색 중",
+// "구독 중", "수신 중", or a failure reason.
+const char *bleLinkSlotState(int slot);
+
+// How many complete (name, value, unit) groups the slot's last packet carried.
+// Zero when nothing has arrived, or when the packet was clipped mid-group.
+int bleLinkValueCount(int slot);
 
 // One of those groups. `name` and `unit` must have room for 24 bytes each.
-bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs);
+// `ageMs` is how long ago the packet landed, which is what tells a stalled
+// node from a slow one.
+bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs);
 
-// The first reading, unpacked from "<time_s>,<sensor>,<value>,<unit>".
-// `sensorName` and `unit` must have room for 24 bytes each. Returns false when
-// nothing has arrived yet. `ageMs` is how long ago it landed, which is what
-// tells a stalled node from a slow one.
-bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs);
-
-// Links to the strongest node in the last scan that advertises this project's
-// service, so a hub that is power-cycled mid-lesson comes back talking to its
-// node instead of waiting for someone to tap the list. Returns false when no
-// such node was seen.
-bool bleAutoLinkToSensorNode();
+// Links to every node in the last scan that advertises this project's service
+// and is not already connected, so a hub power-cycled mid-lesson comes back
+// talking to the room rather than waiting for someone to tap a list. Returns
+// how many attempts it started.
+int bleAutoLinkToSensorNode();
 
 #ifdef __cplusplus
 }

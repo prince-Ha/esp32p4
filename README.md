@@ -45,8 +45,17 @@ sensor on its own bus - measurement screen, CSV, the lot.
 cd sensor_node && pio run -t upload
 ```
 
-Then on the P4: 설정 -> 블루투스 센서 -> 다시 검색, tap the `SciNode-XXXX` row
-to connect, and press **이 센서로 측정**.
+Then on the P4: the **블루투스** tab -> 다시 검색, tap the `SciNode-XXXX` row to
+connect, and press **이 센서로 측정**. After a scan the board also links itself
+to every node advertising this project's service, so a hub power-cycled
+mid-lesson comes back talking to the room on its own.
+
+**Up to three nodes at once** - that is what the controller holds
+(`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3`), and the P4 keeps advertising as a
+peripheral too, so a phone connecting to the board takes one of the three. All
+linked nodes appear on the 블루투스 tab with their current reading; tapping one
+makes it the node being recorded. Only one at a time is: the sample buffers,
+the CSV and the 지능형 과학실 session each describe a single experiment.
 
 The node ships sending an obvious 0-100 test ramp. Replace `readNodeSensor()`
 at the bottom of [`sensor_node/src/main.cpp`](sensor_node/src/main.cpp) with a
@@ -59,6 +68,12 @@ Two things to know about the payload, which is one line of
 - The unit is drawn in the 24 px subset font, so keep it ASCII (`C`, `hPa`,
   `lx`). A Korean unit renders as empty boxes; the quantity name is drawn in
   the full-range font and can be Korean.
+
+Readings reach 지능형 과학실 by unit, since a node names its own quantities:
+`C`/`℃` go up as `TPR` on channel 01 and `hPa` as `PRS` on channel 02, the
+pairing the DPS310 already uses. A unit outside that table is not uploaded and
+is named on screen as excluded, rather than being filed under a guessed
+sensorType.
 
 The P4's BLE and its TLS uploads compete for the same contiguous DMA-capable
 internal memory, which is why Bluetooth is opt-in rather than always on. If

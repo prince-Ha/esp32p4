@@ -518,195 +518,250 @@ void bleScanDumpResults()
 }
 
 // =====================================================
-// Central role: linking to one sensor node
+// Central role: linking to sensor nodes
 //
-// NimBLE drives this as a chain of callbacks, each starting the next step:
-//   connect -> discover the service -> discover the characteristic
-//           -> discover its CCCD -> write 0x0001 to it -> notifications arrive
+// NimBLE drives each link as a chain of callbacks, one starting the next:
+//   connect -> agree an MTU -> discover the service -> discover the
+//   characteristic -> discover its CCCD -> write 0x0001 -> notifications
 //
-// The CCCD write is the step that is easy to leave out. Without it the link
-// looks healthy - connected, characteristic found - and no reading ever
-// arrives, because a GATT server only notifies subscribers.
+// Two of those steps are easy to leave out and both fail quietly. Without the
+// CCCD write the link looks healthy - connected, characteristic found - and no
+// reading ever arrives, because a GATT server only notifies subscribers. And
+// without the MTU exchange every notification is capped at 20 bytes, which
+// silently clips the end off a reading rather than failing.
+//
+// Each connection gets a slot. The slot index rides along as the callback
+// `arg`, so a packet from one node cannot be mistaken for another's.
 // =====================================================
 
-static uint16_t bleLinkConnHandle = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t bleLinkValueHandle = 0;
-static uint16_t bleLinkCccdHandle = 0;
-static uint16_t bleLinkSvcEndHandle = 0;
-static bool bleLinkSubscribed = false;
-static bool bleLinkBusy = false;
-static char bleLinkPeer[32] = "";
-static char bleLinkState[48] = "연결 안 됨";
-
-// Last notification, kept unparsed until something asks for it.
-static char bleLinkPayload[96] = "";
-static uint32_t bleLinkPayloadMs = 0;
-static bool bleLinkHasReading = false;
-static uint32_t bleLinkNotifyCount = 0;
-
-static void bleLinkSetState(const char *text)
+typedef struct
 {
-  snprintf(bleLinkState, sizeof(bleLinkState), "%s", text);
-  blePrintf("link: %s", text);
+  uint16_t connHandle;
+  uint16_t valueHandle;
+  uint16_t cccdHandle;
+  uint16_t svcEndHandle;
+  bool subscribed;
+  bool busy;
+  char peerName[32];
+  char peerAddress[18];
+  char state[48];
+
+  char payload[96];
+  uint32_t payloadMs;
+  bool hasReading;
+  uint32_t notifyCount;
+} BleLink;
+
+static BleLink bleLinks[BLE_LINK_MAX_NODES];
+static bool bleLinksInitialised = false;
+
+static void bleLinkInitAll()
+{
+  if (bleLinksInitialised) return;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    memset(&bleLinks[i], 0, sizeof(bleLinks[i]));
+    bleLinks[i].connHandle = BLE_HS_CONN_HANDLE_NONE;
+    snprintf(bleLinks[i].state, sizeof(bleLinks[i].state), "%s", "연결 안 됨");
+  }
+
+  bleLinksInitialised = true;
 }
 
-static void bleLinkReset(const char *why)
+static bool bleSlotValid(int slot)
 {
-  const bool wasIdle = bleLinkConnHandle == BLE_HS_CONN_HANDLE_NONE && !bleLinkBusy;
-
-  bleLinkConnHandle = BLE_HS_CONN_HANDLE_NONE;
-  bleLinkValueHandle = 0;
-  bleLinkCccdHandle = 0;
-  bleLinkSvcEndHandle = 0;
-  bleLinkSubscribed = false;
-  bleLinkBusy = false;
-
-  if (wasIdle) snprintf(bleLinkState, sizeof(bleLinkState), "%s", why);
-  else bleLinkSetState(why);
+  return slot >= 0 && slot < BLE_LINK_MAX_NODES;
 }
+
+static void bleLinkSetState(int slot, const char *text)
+{
+  if (!bleSlotValid(slot)) return;
+
+  snprintf(bleLinks[slot].state, sizeof(bleLinks[slot].state), "%s", text);
+  blePrintf("link %d (%s): %s", slot,
+            bleLinks[slot].peerName[0] ? bleLinks[slot].peerName : "-", text);
+}
+
+static void bleLinkClear(int slot, const char *why, bool keepName)
+{
+  if (!bleSlotValid(slot)) return;
+
+  BleLink *link = &bleLinks[slot];
+  const bool wasIdle = link->connHandle == BLE_HS_CONN_HANDLE_NONE && !link->busy;
+
+  link->connHandle = BLE_HS_CONN_HANDLE_NONE;
+  link->valueHandle = 0;
+  link->cccdHandle = 0;
+  link->svcEndHandle = 0;
+  link->subscribed = false;
+  link->busy = false;
+  link->hasReading = false;
+
+  if (!keepName)
+  {
+    link->peerName[0] = '\0';
+    link->peerAddress[0] = '\0';
+  }
+
+  // Announcing a state that was already the state only clutters the log.
+  if (wasIdle) snprintf(link->state, sizeof(link->state), "%s", why);
+  else bleLinkSetState(slot, why);
+}
+
+static int bleLinkSlotForConn(uint16_t connHandle)
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinks[i].connHandle == connHandle) return i;
+  }
+
+  return -1;
+}
+
+int bleLinkSlotForAddress(const char *address)
+{
+  if (address == NULL) return -1;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (strcmp(bleLinks[i].peerAddress, address) == 0) return i;
+  }
+
+  return -1;
+}
+
+static int bleLinkFreeSlot()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinks[i].connHandle == BLE_HS_CONN_HANDLE_NONE && !bleLinks[i].busy) return i;
+  }
+
+  return -1;
+}
+
+static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            const struct ble_gatt_svc *service, void *arg);
 
 // Step 4: the subscription write came back.
-static int bleLinkOnSubscribed(uint16_t conn_handle,
-                               const struct ble_gatt_error *error,
+static int bleLinkOnSubscribed(uint16_t conn_handle, const struct ble_gatt_error *error,
                                struct ble_gatt_attr *attr, void *arg)
 {
-  (void)conn_handle; (void)attr; (void)arg;
+  (void)attr;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
 
   if (error->status != 0)
   {
-    blePrintf("CCCD write failed: %d", error->status);
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("구독 실패");
+    blePrintf("CCCD write failed on slot %d: %d", slot, error->status);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
     return 0;
   }
 
-  bleLinkSubscribed = true;
-  bleLinkBusy = false;
-  bleLinkSetState("수신 중");
+  bleLinks[slot].subscribed = true;
+  bleLinks[slot].busy = false;
+  bleLinkSetState(slot, "수신 중");
   return 0;
 }
 
-// Step 3: found the descriptors on the characteristic; the CCCD is 0x2902.
-static int bleLinkOnDescriptor(uint16_t conn_handle,
-                               const struct ble_gatt_error *error,
-                               uint16_t chr_val_handle,
-                               const struct ble_gatt_dsc *dsc, void *arg)
+// Step 3: found the descriptors; the CCCD is 0x2902.
+static int bleLinkOnDescriptor(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
-  (void)conn_handle; (void)chr_val_handle; (void)arg;
+  (void)chr_val_handle;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
 
   if (error->status == 0 && dsc != NULL &&
       ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16)
   {
-    bleLinkCccdHandle = dsc->handle;
+    bleLinks[slot].cccdHandle = dsc->handle;
     return 0;
   }
 
   if (error->status != BLE_HS_EDONE) return 0;
 
-  if (bleLinkCccdHandle == 0)
+  if (bleLinks[slot].cccdHandle == 0)
   {
-    blePrintf("no CCCD on the measurement characteristic");
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("알림 미지원 장치");
+    blePrintf("slot %d: no CCCD on the measurement characteristic", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "알림 미지원 장치", true);
     return 0;
   }
 
-  bleLinkSetState("구독 중");
+  bleLinkSetState(slot, "구독 중");
 
   const uint8_t enableNotify[2] = { 0x01, 0x00 };
-  const int rc = ble_gattc_write_flat(bleLinkConnHandle, bleLinkCccdHandle,
+  const int rc = ble_gattc_write_flat(conn_handle, bleLinks[slot].cccdHandle,
                                       enableNotify, sizeof(enableNotify),
-                                      bleLinkOnSubscribed, NULL);
+                                      bleLinkOnSubscribed, arg);
   if (rc != 0)
   {
-    blePrintf("ble_gattc_write_flat failed: %d", rc);
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("구독 실패");
+    blePrintf("slot %d: ble_gattc_write_flat failed: %d", slot, rc);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
   }
 
   return 0;
 }
 
 // Step 2: found the measurement characteristic.
-static int bleLinkOnCharacteristic(uint16_t conn_handle,
-                                   const struct ble_gatt_error *error,
+static int bleLinkOnCharacteristic(uint16_t conn_handle, const struct ble_gatt_error *error,
                                    const struct ble_gatt_chr *chr, void *arg)
 {
-  (void)conn_handle; (void)arg;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
 
   if (error->status == 0 && chr != NULL)
   {
-    bleLinkValueHandle = chr->val_handle;
+    bleLinks[slot].valueHandle = chr->val_handle;
     return 0;
   }
 
   if (error->status != BLE_HS_EDONE) return 0;
 
-  if (bleLinkValueHandle == 0)
+  if (bleLinks[slot].valueHandle == 0)
   {
-    blePrintf("measurement characteristic not found");
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("측정 특성 없음");
+    blePrintf("slot %d: measurement characteristic not found", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "측정 특성 없음", true);
     return 0;
   }
 
-  const int rc = ble_gattc_disc_all_dscs(bleLinkConnHandle, bleLinkValueHandle,
-                                         bleLinkSvcEndHandle,
-                                         bleLinkOnDescriptor, NULL);
+  const int rc = ble_gattc_disc_all_dscs(conn_handle, bleLinks[slot].valueHandle,
+                                         bleLinks[slot].svcEndHandle,
+                                         bleLinkOnDescriptor, arg);
   if (rc != 0)
   {
-    blePrintf("ble_gattc_disc_all_dscs failed: %d", rc);
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("구독 실패");
+    blePrintf("slot %d: ble_gattc_disc_all_dscs failed: %d", slot, rc);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
   }
 
-  return 0;
-}
-
-static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
-                            const struct ble_gatt_svc *service, void *arg);
-
-// Step 0: agree an MTU.
-//
-// The default ATT MTU is 23, which leaves 20 bytes for a notification. A
-// reading like "202,테스트,2.0000,-" is 23 bytes once the Korean is UTF-8
-// encoded, so without this the unit field is silently cut off the end and the
-// packet no longer parses. Do it before subscribing, not after, or the first
-// readings arrive at the old size.
-static int bleLinkOnMtu(uint16_t conn_handle, const struct ble_gatt_error *error,
-                        uint16_t mtu, void *arg)
-{
-  (void)arg;
-
-  if (error->status == 0) blePrintf("MTU is %u", (unsigned)mtu);
-  else blePrintf("MTU exchange failed: %d, staying at 23", error->status);
-
-  bleLinkSetState("서비스 검색 중");
-  ble_gattc_disc_svc_by_uuid(conn_handle, &kServiceUuid.u, bleLinkOnService, NULL);
   return 0;
 }
 
 // Step 1: found the service.
-static int bleLinkOnService(uint16_t conn_handle,
-                            const struct ble_gatt_error *error,
+static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
                             const struct ble_gatt_svc *service, void *arg)
 {
-  (void)arg;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
 
   if (error->status == 0 && service != NULL)
   {
-    bleLinkSvcEndHandle = service->end_handle;
+    bleLinks[slot].svcEndHandle = service->end_handle;
 
-    const int rc = ble_gattc_disc_chrs_by_uuid(
-      conn_handle, service->start_handle, service->end_handle,
-      &kMeasurementUuid.u, bleLinkOnCharacteristic, NULL
-    );
-
+    const int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, service->start_handle,
+                                               service->end_handle, &kMeasurementUuid.u,
+                                               bleLinkOnCharacteristic, arg);
     if (rc != 0)
     {
-      blePrintf("ble_gattc_disc_chrs_by_uuid failed: %d", rc);
-      ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-      bleLinkReset("서비스 검색 실패");
+      blePrintf("slot %d: ble_gattc_disc_chrs_by_uuid failed: %d", slot, rc);
+      ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+      bleLinkClear(slot, "서비스 검색 실패", true);
     }
 
     return 0;
@@ -714,71 +769,93 @@ static int bleLinkOnService(uint16_t conn_handle,
 
   if (error->status != BLE_HS_EDONE) return 0;
 
-  if (bleLinkSvcEndHandle == 0)
+  if (bleLinks[slot].svcEndHandle == 0)
   {
-    blePrintf("sensor service not found on this device");
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-    bleLinkReset("센서 노드가 아님");
+    blePrintf("slot %d: sensor service not found on this device", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "센서 노드가 아님", true);
   }
 
   return 0;
 }
 
+// Step 0: agree an MTU.
+//
+// The default ATT MTU is 23, which leaves 20 bytes for a notification. A
+// reading carrying two quantities with Korean names is well past that, and
+// without this the tail is cut off silently. Do it before subscribing, not
+// after, or the first readings still arrive at the old size.
+static int bleLinkOnMtu(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t mtu, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0) blePrintf("slot %d: MTU is %u", slot, (unsigned)mtu);
+  else blePrintf("slot %d: MTU exchange failed: %d, staying at 23", slot, error->status);
+
+  bleLinkSetState(slot, "서비스 검색 중");
+  ble_gattc_disc_svc_by_uuid(conn_handle, &kServiceUuid.u, bleLinkOnService, arg);
+  return 0;
+}
+
 static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
 {
-  (void)arg;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
 
   switch (event->type)
   {
     case BLE_GAP_EVENT_CONNECT:
       if (event->connect.status != 0)
       {
-        blePrintf("connect failed: %d", event->connect.status);
-        bleLinkReset("연결 실패");
+        blePrintf("slot %d: connect failed: %d", slot, event->connect.status);
+        bleLinkClear(slot, "연결 실패", true);
         return 0;
       }
 
-      bleLinkConnHandle = event->connect.conn_handle;
-      bleLinkSetState("MTU 협상 중");
+      bleLinks[slot].connHandle = event->connect.conn_handle;
+      bleLinkSetState(slot, "MTU 협상 중");
 
-      if (ble_gattc_exchange_mtu(bleLinkConnHandle, bleLinkOnMtu, NULL) != 0)
+      if (ble_gattc_exchange_mtu(event->connect.conn_handle, bleLinkOnMtu, arg) != 0)
       {
         // Not fatal on its own; carry on at the default size.
-        bleLinkSetState("서비스 검색 중");
-        ble_gattc_disc_svc_by_uuid(bleLinkConnHandle, &kServiceUuid.u,
-                                   bleLinkOnService, NULL);
+        bleLinkSetState(slot, "서비스 검색 중");
+        ble_gattc_disc_svc_by_uuid(event->connect.conn_handle, &kServiceUuid.u,
+                                   bleLinkOnService, arg);
       }
 
       return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-      blePrintf("link dropped, reason %d", event->disconnect.reason);
-      bleLinkReset("연결 끕김");
+      blePrintf("slot %d: link dropped, reason %d", slot, event->disconnect.reason);
+      bleLinkClear(slot, "연결 끊김", true);
       return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:
     {
-      if (event->notify_rx.attr_handle != bleLinkValueHandle) return 0;
+      if (event->notify_rx.attr_handle != bleLinks[slot].valueHandle) return 0;
 
+      BleLink *link = &bleLinks[slot];
       const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
-      const uint16_t copy = len < sizeof(bleLinkPayload) - 1
-                            ? len : (uint16_t)(sizeof(bleLinkPayload) - 1);
+      const uint16_t copy = len < sizeof(link->payload) - 1
+                            ? len : (uint16_t)(sizeof(link->payload) - 1);
 
-      if (ble_hs_mbuf_to_flat(event->notify_rx.om, bleLinkPayload, copy, NULL) == 0)
+      if (ble_hs_mbuf_to_flat(event->notify_rx.om, link->payload, copy, NULL) == 0)
       {
-        bleLinkPayload[copy] = '\0';
-        bleLinkPayloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+        link->payload[copy] = '\0';
+        link->payloadMs = (uint32_t)(esp_timer_get_time() / 1000);
 
-        // The first packet is the one that proves the subscription took; after
-        // that a line every ten seconds is enough to show the node is alive
-        // without burying everything else in the log.
-        if (!bleLinkHasReading || (bleLinkNotifyCount % 10) == 0)
+        // The first packet proves the subscription took; after that one line
+        // every ten seconds shows the node is alive without burying the log.
+        if (!link->hasReading || (link->notifyCount % 10) == 0)
         {
-          blePrintf("rx #%lu: %s", (unsigned long)bleLinkNotifyCount, bleLinkPayload);
+          blePrintf("slot %d rx #%lu: %s", slot,
+                    (unsigned long)link->notifyCount, link->payload);
         }
 
-        bleLinkNotifyCount++;
-        bleLinkHasReading = true;
+        link->notifyCount++;
+        link->hasReading = true;
       }
 
       return 0;
@@ -791,15 +868,26 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
 
 bool bleLinkConnect(const char *address)
 {
-  if (!bleStarted)
+  bleLinkInitAll();
+
+  if (!bleStarted) return false;
+  if (address == NULL || strlen(address) != 17) return false;
+
+  // An address already in a slot reconnects there rather than taking a second.
+  int slot = bleLinkSlotForAddress(address);
+
+  if (slot >= 0)
   {
-    bleLinkSetState("블루투스 꺼짐");
-    return false;
+    if (bleLinks[slot].subscribed || bleLinks[slot].busy) return true;
+  }
+  else
+  {
+    slot = bleLinkFreeSlot();
   }
 
-  if (address == NULL || strlen(address) != 17)
+  if (slot < 0)
   {
-    bleLinkSetState("주소 형식 오류");
+    blePrintf("no free slot: %d nodes already connected", BLE_LINK_MAX_NODES);
     return false;
   }
 
@@ -810,13 +898,10 @@ bool bleLinkConnect(const char *address)
     bleScanning = false;
   }
 
-  bleLinkDisconnect();
-
   unsigned int b[6] = { 0 };
   if (sscanf(address, "%02x:%02x:%02x:%02x:%02x:%02x",
              &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
   {
-    bleLinkSetState("주소 형식 오류");
     return false;
   }
 
@@ -827,87 +912,123 @@ bool bleLinkConnect(const char *address)
   // other way round.
   for (int i = 0; i < 6; i++) peer.val[i] = (uint8_t)b[5 - i];
 
-  snprintf(bleLinkPeer, sizeof(bleLinkPeer), "%s", address);
-
-  // A node advertising a random static address has its two top bits set. Guess
-  // from the address itself rather than trying one type and retrying, because
-  // ble_gap_connect() accepts a wrong type and then simply times out.
+  // A random static address has its two top bits set. Read that from the
+  // address rather than trying one type and retrying, because ble_gap_connect
+  // accepts a wrong type and then simply times out.
   peer.type = ((peer.val[5] & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+
+  snprintf(bleLinks[slot].peerAddress, sizeof(bleLinks[slot].peerAddress), "%s", address);
+  snprintf(bleLinks[slot].peerName, sizeof(bleLinks[slot].peerName), "%s", address);
 
   for (int i = 0; i < bleScanCount; i++)
   {
     if (strcmp(bleScanResults[i].address, address) == 0 && bleScanResults[i].name[0])
     {
-      snprintf(bleLinkPeer, sizeof(bleLinkPeer), "%s", bleScanResults[i].name);
+      snprintf(bleLinks[slot].peerName, sizeof(bleLinks[slot].peerName), "%s",
+               bleScanResults[i].name);
       break;
     }
   }
 
-  bleLinkBusy = true;
-  bleLinkHasReading = false;
-  bleLinkNotifyCount = 0;
-  bleLinkSetState("연결 중");
+  bleLinks[slot].busy = true;
+  bleLinks[slot].hasReading = false;
+  bleLinks[slot].notifyCount = 0;
+  bleLinkSetState(slot, "연결 중");
 
   const int rc = ble_gap_connect(bleAddrType, &peer, 10000, NULL,
-                                 bleLinkGapEvent, NULL);
+                                 bleLinkGapEvent, (void *)(intptr_t)slot);
 
   if (rc != 0)
   {
-    blePrintf("ble_gap_connect failed: %d", rc);
-    bleLinkReset("연결 실패");
+    blePrintf("slot %d: ble_gap_connect failed: %d", slot, rc);
+    bleLinkClear(slot, "연결 실패", true);
     return false;
   }
 
   return true;
 }
 
+void bleLinkDisconnectSlot(int slot)
+{
+  bleLinkInitAll();
+  if (!bleSlotValid(slot)) return;
+
+  if (bleLinks[slot].connHandle != BLE_HS_CONN_HANDLE_NONE)
+  {
+    ble_gap_terminate(bleLinks[slot].connHandle, BLE_ERR_REM_USER_CONN_TERM);
+  }
+
+  bleLinkClear(slot, "연결 안 됨", false);
+}
+
 void bleLinkDisconnect()
 {
-  if (bleLinkConnHandle != BLE_HS_CONN_HANDLE_NONE)
-  {
-    ble_gap_terminate(bleLinkConnHandle, BLE_ERR_REM_USER_CONN_TERM);
-  }
-
-  bleLinkReset("연결 안 됨");
-  bleLinkHasReading = false;
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++) bleLinkDisconnectSlot(i);
 }
 
-// bleFormatServices() prints a 128-bit UUID as its leading four bytes, which
-// is enough to tell this project's nodes from anything else in the room.
-#define BLE_SENSOR_SERVICE_TAG "6e5f0001"
-
-bool bleAutoLinkToSensorNode()
+bool bleLinkSlotIsSubscribed(int slot)
 {
-  if (bleLinkSubscribed || bleLinkBusy) return false;
-
-  int best = -1;
-
-  for (int i = 0; i < bleScanCount; i++)
-  {
-    if (strstr(bleScanResults[i].services, BLE_SENSOR_SERVICE_TAG) == NULL) continue;
-    if (best < 0 || bleScanResults[i].rssi > bleScanResults[best].rssi) best = i;
-  }
-
-  if (best < 0) return false;
-
-  blePrintf("auto-linking to %s (%s, %d dBm)",
-            bleScanResults[best].name[0] ? bleScanResults[best].name : "(unnamed)",
-            bleScanResults[best].address, bleScanResults[best].rssi);
-
-  return bleLinkConnect(bleScanResults[best].address);
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].subscribed;
 }
 
-bool bleLinkIsSubscribed() { return bleLinkSubscribed; }
-bool bleLinkIsBusy() { return bleLinkBusy; }
-const char *bleLinkPeerName() { return bleLinkPeer; }
-const char *bleLinkStateText() { return bleLinkState; }
-
-int bleLinkValueCount()
+bool bleLinkSlotIsBusy(int slot)
 {
-  if (!bleLinkHasReading) return 0;
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].busy;
+}
+
+bool bleLinkIsBusy()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsBusy(i)) return true;
+  }
+
+  return false;
+}
+
+int bleLinkNodeCount()
+{
+  int count = 0;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsSubscribed(i)) count++;
+  }
+
+  return count;
+}
+
+int bleLinkFirstSubscribedSlot()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsSubscribed(i)) return i;
+  }
+
+  return -1;
+}
+
+const char *bleLinkSlotName(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].peerName : "";
+}
+
+const char *bleLinkSlotState(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].state : "연결 안 됨";
+}
+
+int bleLinkValueCount(int slot)
+{
+  bleLinkInitAll();
+  if (!bleSlotValid(slot) || !bleLinks[slot].hasReading) return 0;
 
   int commas = 0;
-  for (const char *c = bleLinkPayload; *c; c++)
+  for (const char *c = bleLinks[slot].payload; *c; c++)
   {
     if (*c == ',') commas++;
   }
@@ -920,12 +1041,14 @@ int bleLinkValueCount()
   return groups;
 }
 
-bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs)
+bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs)
 {
-  if (index < 0 || index >= bleLinkValueCount()) return false;
+  if (index < 0 || index >= bleLinkValueCount(slot)) return false;
 
-  char work[sizeof(bleLinkPayload)];
-  snprintf(work, sizeof(work), "%s", bleLinkPayload);
+  const BleLink *link = &bleLinks[slot];
+
+  char work[sizeof(link->payload)];
+  snprintf(work, sizeof(work), "%s", link->payload);
 
   char *fields[1 + 3 * BLE_LINK_MAX_VALUES];
   const int maxFields = (int)(sizeof(fields) / sizeof(fields[0]));
@@ -954,15 +1077,39 @@ bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *a
   if (ageMs)
   {
     const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    *ageMs = now - bleLinkPayloadMs;
+    *ageMs = now - link->payloadMs;
   }
 
   return true;
 }
 
-bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+// bleFormatServices() prints a 128-bit UUID as its leading four bytes, which
+// is enough to tell this project's nodes from anything else in the room.
+#define BLE_SENSOR_SERVICE_TAG "6e5f0001"
+
+int bleAutoLinkToSensorNode()
 {
-  return bleLinkValueAt(0, value, sensorName, unit, ageMs);
+  bleLinkInitAll();
+
+  int started = 0;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strstr(bleScanResults[i].services, BLE_SENSOR_SERVICE_TAG) == NULL) continue;
+
+    const int existing = bleLinkSlotForAddress(bleScanResults[i].address);
+    if (existing >= 0 && (bleLinks[existing].subscribed || bleLinks[existing].busy)) continue;
+
+    if (bleLinkFreeSlot() < 0 && existing < 0) break;
+
+    blePrintf("auto-linking to %s (%s, %d dBm)",
+              bleScanResults[i].name[0] ? bleScanResults[i].name : "(unnamed)",
+              bleScanResults[i].address, bleScanResults[i].rssi);
+
+    if (bleLinkConnect(bleScanResults[i].address)) started++;
+  }
+
+  return started;
 }
 
 #else  // BLE_SENSOR_SUPPORTED
@@ -984,22 +1131,22 @@ void bleScanDumpResults() {}
 bool bleScanResultIsCandidate(const BleScanResult *r) { (void)r; return false; }
 int bleScanCandidateCount() { return 0; }
 bool bleLinkConnect(const char *address) { (void)address; return false; }
+void bleLinkDisconnectSlot(int slot) { (void)slot; }
 void bleLinkDisconnect() {}
-bool bleLinkIsSubscribed() { return false; }
-bool bleAutoLinkToSensorNode() { return false; }
+int bleLinkNodeCount() { return 0; }
+int bleLinkFirstSubscribedSlot() { return -1; }
+bool bleLinkSlotIsSubscribed(int slot) { (void)slot; return false; }
+bool bleLinkSlotIsBusy(int slot) { (void)slot; return false; }
 bool bleLinkIsBusy() { return false; }
-const char *bleLinkPeerName() { return ""; }
-const char *bleLinkStateText() { return "지원 안 함"; }
-bool bleLinkLatestReading(float *value, char *sensorName, char *unit, uint32_t *ageMs)
+int bleLinkSlotForAddress(const char *address) { (void)address; return -1; }
+const char *bleLinkSlotName(int slot) { (void)slot; return ""; }
+const char *bleLinkSlotState(int slot) { (void)slot; return "지원 안 함"; }
+int bleLinkValueCount(int slot) { (void)slot; return 0; }
+bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs)
 {
-  (void)value; (void)sensorName; (void)unit; (void)ageMs;
+  (void)slot; (void)index; (void)value; (void)name; (void)unit; (void)ageMs;
   return false;
 }
-int bleLinkValueCount() { return 0; }
-bool bleLinkValueAt(int index, float *value, char *name, char *unit, uint32_t *ageMs)
-{
-  (void)index; (void)value; (void)name; (void)unit; (void)ageMs;
-  return false;
-}
+int bleAutoLinkToSensorNode() { return 0; }
 
 #endif  // BLE_SENSOR_SUPPORTED

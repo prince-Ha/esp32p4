@@ -301,6 +301,11 @@ static float encoderLastRateDegPerS = NAN;
 // Filled in from each notification: a node names its own quantities and units,
 // so unlike every other sensor here these are not compile-time constants. A
 // DPS310 on a node reports two, the same as one wired to this board.
+// Which connected node the measurement screen is on. Several can be linked at
+// once, but only one is being recorded, because the sample buffers, the CSV
+// and the 지능형 과학실 session all describe a single experiment.
+static int activeBleSlot = 0;
+
 static char bleNodeQuantity[BLE_LINK_MAX_VALUES][24] = { "블루투스", "", "" };
 static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
 static int bleNodeValueCount = 1;
@@ -332,6 +337,34 @@ static const BleIslMapping kBleIslMappings[] = {
   { "degC", "TPR", "온도센서", "01", "C" },
   { "hPa",  "PRS", "기압센서", "02", "hPa" }
 };
+
+// Pulls the active node's quantity names, units and count out of its last
+// packet.
+//
+// This has to run whether or not a measurement is going, and that is the whole
+// reason realtime upload did nothing: readActiveSensor() only runs while
+// measuring, so at the instant 측정 시작 was pressed the units were still the
+// startup placeholders, nothing mapped to a 지능형 과학실 code, and the
+// session was never opened. By the time readings arrived the decision had
+// already been made.
+static void bleNodeRefreshMetadata()
+{
+  const int count = bleLinkValueCount(activeBleSlot);
+  if (count <= 0) return;
+
+  for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    char quantity[24] = "";
+    char unit[24] = "";
+
+    if (!bleLinkValueAt(activeBleSlot, i, NULL, quantity, unit, NULL)) break;
+
+    if (quantity[0]) snprintf(bleNodeQuantity[i], sizeof(bleNodeQuantity[i]), "%s", quantity);
+    if (unit[0]) snprintf(bleNodeUnit[i], sizeof(bleNodeUnit[i]), "%s", unit);
+  }
+
+  bleNodeValueCount = count < BLE_LINK_MAX_VALUES ? count : BLE_LINK_MAX_VALUES;
+}
 
 static const BleIslMapping *bleIslMappingForUnit(const char *unit)
 {
@@ -902,6 +935,11 @@ static lv_obj_t *labelSettingsWifi;
 static lv_obj_t *labelSettingsSd;
 static lv_obj_t *labelSettingsCsv;
 static lv_obj_t *labelSettingsNote;
+static lv_obj_t *labelDeviceNote;
+static lv_obj_t *deviceScreen;
+static lv_obj_t *labelBarDeviceTime;
+static lv_obj_t *labelBarDeviceWifi;
+static lv_obj_t *labelBarDeviceSd;
 static lv_obj_t *labelSettingsIsl;
 static lv_obj_t *islModuleTa;
 static lv_obj_t *sdFileList;
@@ -1031,6 +1069,8 @@ static void go_csv_event_cb(lv_event_t *e);
 static void go_home_event_cb(lv_event_t *e);
 static void go_measure_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
+static void go_ble_event_cb(lv_event_t *e);
+static void go_device_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -3861,7 +3901,8 @@ bool activeSensorBegin()
   // that was settled on the 블루투스 screen.
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
-    return bleLinkIsSubscribed();
+    bleNodeRefreshMetadata();
+    return bleLinkSlotIsSubscribed(activeBleSlot);
   }
 
   if (activeSensorMode == SENSOR_MODE_DS18B20)
@@ -3960,7 +4001,7 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
 
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
-    const int count = bleLinkValueCount();
+    const int count = bleLinkValueCount(activeBleSlot);
     if (count <= 0) return false;
 
     float values[BLE_LINK_MAX_VALUES] = { NAN, NAN, NAN };
@@ -3972,7 +4013,7 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
       char quantity[24] = "";
       char unit[24] = "";
 
-      if (!bleLinkValueAt(i, &values[i], quantity, unit, &ageMs)) break;
+      if (!bleLinkValueAt(activeBleSlot, i, &values[i], quantity, unit, &ageMs)) break;
 
       if (quantity[0]) snprintf(bleNodeQuantity[i], sizeof(bleNodeQuantity[i]), "%s", quantity);
       if (unit[0]) snprintf(bleNodeUnit[i], sizeof(bleNodeUnit[i]), "%s", unit);
@@ -4107,7 +4148,8 @@ void setActiveSensorMode(int mode)
     bleIslUnmappedSummary(skipped, sizeof(skipped));
 
     snprintf(text, sizeof(text), "블루투스: %s / %s%s%s",
-             bleLinkPeerName()[0] ? bleLinkPeerName() : "-", bleLinkStateText(),
+             bleLinkSlotName(activeBleSlot)[0] ? bleLinkSlotName(activeBleSlot) : "-",
+             bleLinkSlotState(activeBleSlot),
              skipped[0] ? " / 전송 제외: " : "", skipped);
     setIslStatusText(text);
   }
@@ -4748,15 +4790,31 @@ lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
 // Bottom tab bar, identical on every screen so "back" is always in one place.
 // Icons come from the Montserrat symbol range; the Korean caption sits below
 // them in the Hangul face, so each tab reads without relying on the glyph.
+// 홈 · 측정 · 기록 · 블루투스 · WiFi · 설정
+#define TAB_COUNT 6
+#define TAB_HOME 0
+#define TAB_MEASURE 1
+#define TAB_RECORD 2
+#define TAB_BLE 3
+#define TAB_WIFI 4
+#define TAB_DEVICE 5
+
 void createTabBar(lv_obj_t *parent, int activeIndex)
 {
-  static const char *tabIcons[4] = {
-    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
+  // 블루투스 and WiFi are where a lesson actually goes wrong - a node that
+  // dropped, a network that did not join - so they are one tap from anywhere
+  // rather than buried two levels into 설정.
+  static const char *tabIcons[TAB_COUNT] = {
+    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST,
+    LV_SYMBOL_BLUETOOTH, LV_SYMBOL_WIFI, LV_SYMBOL_SETTINGS
   };
-  static const char *tabNames[4] = { "홈", "측정", "기록", "설정" };
+  static const char *tabNames[TAB_COUNT] = {
+    "홈", "측정", "기록", "블루투스", "WiFi", "설정"
+  };
 
-  lv_event_cb_t tabCallbacks[4] = {
-    go_home_event_cb, go_measure_event_cb, go_csv_event_cb, go_settings_event_cb
+  lv_event_cb_t tabCallbacks[TAB_COUNT] = {
+    go_home_event_cb, go_measure_event_cb, go_csv_event_cb,
+    go_ble_event_cb, go_settings_event_cb, go_device_event_cb
   };
 
   lv_obj_t *bar = lv_obj_create(parent);
@@ -4780,9 +4838,9 @@ void createTabBar(lv_obj_t *parent, int activeIndex)
   lv_obj_set_style_radius(hairline, 0, 0);
   lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
 
-  const int tabWidth = LCD_H_RES / 4;
+  const int tabWidth = LCD_H_RES / TAB_COUNT;
 
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < TAB_COUNT; i++)
   {
     const bool active = (i == activeIndex);
     const uint32_t tint = active ? UI_ACCENT : UI_TEXT_3;
@@ -7616,7 +7674,7 @@ void createHomeUi()
   lv_obj_set_style_text_font(homeKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(homeKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(homeScreen, 0);
+  createTabBar(homeScreen, TAB_HOME);
 
   updateCloudModeLabel();
   updateHomeWifiLabels();
@@ -7807,7 +7865,7 @@ void createMeasureUi()
   btnMeasureStop = makePrimaryButton(measureScreen, "측정 정지", railX, 466, railW, 64, UI_DANGER, stop_event_cb);
   lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
 
-  createTabBar(measureScreen, 1);
+  createTabBar(measureScreen, TAB_MEASURE);
 
   // Aliases kept for the older update paths.
   labelNow = labelDateTime;
@@ -7922,7 +7980,7 @@ void createIslUi()
   lv_obj_set_style_text_font(islKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(islKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(islScreen, 3);
+  createTabBar(islScreen, TAB_DEVICE);
 
   updateCloudModeLabel();
   updateIslStatusLabels();
@@ -7978,7 +8036,7 @@ void createFileViewerUi()
   lv_obj_set_width(labelFileViewerPageInfo, 968);
   lv_label_set_long_mode(labelFileViewerPageInfo, LV_LABEL_LONG_CLIP);
 
-  createTabBar(fileViewerScreen, 2);
+  createTabBar(fileViewerScreen, TAB_RECORD);
 }
 
 // =====================================================
@@ -8111,7 +8169,7 @@ void createCsvUi()
   lv_obj_set_style_text_font(csvKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(csvKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(csvScreen, 2);
+  createTabBar(csvScreen, TAB_RECORD);
 
   resetTable();
   updateTable();
@@ -8180,7 +8238,7 @@ static void ble_use_sensor_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-  if (!bleLinkIsSubscribed())
+  if (!bleLinkSlotIsSubscribed(activeBleSlot))
   {
     setIslStatusText("먼저 센서 노드에 연결하세요");
     return;
@@ -8204,6 +8262,12 @@ static void go_ble_event_cb(lv_event_t *e)
   requestScreenSwitch(bleScreen);
 }
 
+static void go_device_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  requestScreenSwitch(deviceScreen);
+}
+
 void refreshBleScreen()
 {
   if (bleList == NULL) return;
@@ -8212,32 +8276,38 @@ void refreshBleScreen()
   {
     char text[160];
 
-    if (bleLinkIsSubscribed())
-    {
-      float value = NAN;
-      char quantity[24] = "";
-      char unit[24] = "";
-      uint32_t ageMs = 0;
+    const int linked = bleLinkNodeCount();
 
-      if (bleLinkLatestReading(&value, quantity, unit, &ageMs))
-      {
-        snprintf(text, sizeof(text), "%s · %s · %s %.4g%s (%lu초 전)",
-                 bleLinkPeerName(), bleLinkStateText(), quantity, value, unit,
-                 (unsigned long)(ageMs / 1000));
-      }
-      else
-      {
-        snprintf(text, sizeof(text), "%s · %s · 아직 값 없음",
-                 bleLinkPeerName(), bleLinkStateText());
-      }
-    }
-    else if (bleLinkPeerName()[0])
+    if (linked == 0)
     {
-      snprintf(text, sizeof(text), "%s · %s", bleLinkPeerName(), bleLinkStateText());
+      snprintf(text, sizeof(text), "연결된 노드 없음 · %s", bleLinkSlotState(activeBleSlot));
     }
     else
     {
-      snprintf(text, sizeof(text), "%s", bleLinkStateText());
+      // One line covering every slot, so a room with three nodes can be read
+      // at a glance rather than one node at a time.
+      int used = snprintf(text, sizeof(text), "노드 %d/%d", linked, BLE_LINK_MAX_NODES);
+
+      for (int slot = 0; slot < BLE_LINK_MAX_NODES && used < (int)sizeof(text); slot++)
+      {
+        if (!bleLinkSlotIsSubscribed(slot)) continue;
+
+        float value = NAN;
+        char quantity[24] = "";
+        char unit[24] = "";
+
+        if (bleLinkValueAt(slot, 0, &value, quantity, unit, NULL))
+        {
+          used += snprintf(text + used, sizeof(text) - used, "  ·  %s%s %s %.4g%s",
+                           slot == activeBleSlot ? "▶" : "", bleLinkSlotName(slot),
+                           quantity, value, unit);
+        }
+        else
+        {
+          used += snprintf(text + used, sizeof(text) - used, "  ·  %s%s 값 대기",
+                           slot == activeBleSlot ? "▶" : "", bleLinkSlotName(slot));
+        }
+      }
     }
 
     lv_label_set_text(labelBleLink, text);
@@ -8342,7 +8412,8 @@ void refreshBleScreen()
     lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 14, 28);
 
     const bool isLinked =
-      bleLinkIsSubscribed() && strcmp(bleLinkPeerName(), r.name[0] ? r.name : r.address) == 0;
+      bleLinkSlotForAddress(r.address) >= 0 &&
+      bleLinkSlotIsSubscribed(bleLinkSlotForAddress(r.address));
 
     if (isLinked)
     {
@@ -8445,7 +8516,49 @@ void createBleUi()
     bleEnabled ? "블루투스: 켜짐" : "블루투스: 꺼짐 — 켜면 다음 시작부터 검색할 수 있습니다."
   );
 
-  createTabBar(bleScreen, 3);
+  createTabBar(bleScreen, TAB_BLE);
+}
+
+// 설정: what is left once WiFi and 블루투스 have tabs of their own - the
+// device itself.
+void createDeviceUi()
+{
+  deviceScreen = lv_obj_create(NULL);
+  lv_obj_set_size(deviceScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(deviceScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(deviceScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(deviceScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(deviceScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  createStatusBar(
+    deviceScreen,
+    "",
+    &labelBarDeviceTime,
+    &labelBarDeviceWifi,
+    &labelBarDeviceSd
+  );
+
+  makeHeading(deviceScreen, "설정", 28, 58, UI_TEXT);
+
+  lv_obj_t *card = makePanel(deviceScreen, 28, 104, 968, 240);
+
+  makeSmallLabel(card, "센서", 20, 16, UI_TEXT_3);
+  makeQuietButton(card, "센서 검색", 20, 44, 180, 52, i2c_scan_event_cb);
+  makeSmallLabel(card,
+                 "센서 버스에 응답하는 장치와, 엔코더 신호가 들어오는 핀을 찾습니다.",
+                 216, 60, UI_TEXT_3);
+
+  makeSmallLabel(card, "지능형 과학실", 20, 110, UI_TEXT_3);
+  makeQuietButton(card, "전송 설정", 20, 138, 180, 52, go_isl_event_cb);
+  makeSmallLabel(card, "모듈 코드와 전송 방식을 확인합니다.", 216, 154, UI_TEXT_3);
+
+  makeQuietButton(card, "다시 시작", 788, 138, 160, 52, board_restart_event_cb);
+
+  labelDeviceNote = makeSmallLabel(deviceScreen, "", 28, 360, UI_TEXT_3);
+  lv_obj_set_width(labelDeviceNote, 968);
+  lv_label_set_long_mode(labelDeviceNote, LV_LABEL_LONG_WRAP);
+
+  createTabBar(deviceScreen, TAB_DEVICE);
 }
 
 void createSettingsUi()
@@ -8465,7 +8578,7 @@ void createSettingsUi()
     &labelBarSettingsSd
   );
 
-  makeHeading(settingsScreen, "설정", 28, 58, UI_TEXT);
+  makeHeading(settingsScreen, "WiFi", 28, 58, UI_TEXT);
 
   // =====================================================
   // WiFi
@@ -8521,13 +8634,8 @@ void createSettingsUi()
   lv_obj_set_width(labelWifiMode, 580);
   lv_label_set_long_mode(labelWifiMode, LV_LABEL_LONG_CLIP);
 
-  // Device-level entries that are not WiFi.
-  makeQuietButton(wifiCard, "센서 검색", 20, 330, 150, 46, i2c_scan_event_cb);
-  makeQuietButton(wifiCard, "블루투스 센서", 180, 330, 180, 46, go_ble_event_cb);
-  makeQuietButton(wifiCard, "전송 설정", 370, 330, 130, 46, go_isl_event_cb);
-  makeQuietButton(wifiCard, "다시 시작", 510, 330, 110, 46, board_restart_event_cb);
-
-  labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 384, UI_TEXT_3);
+  // Everything that is not WiFi moved to the 설정 tab.
+  labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 330, UI_TEXT_3);
   lv_obj_set_width(labelSettingsNote, 580);
   lv_label_set_long_mode(labelSettingsNote, LV_LABEL_LONG_CLIP);
 
@@ -8559,7 +8667,7 @@ void createSettingsUi()
   lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(settingsScreen, 3);
+  createTabBar(settingsScreen, TAB_WIFI);
 
   updateWifiRuntimeLabels();
 }
@@ -12034,6 +12142,7 @@ void setup()
   createMeasureUi();
   createSettingsUi();
   createBleUi();
+  createDeviceUi();
   createCsvUi();
   createFileViewerUi();
   createIslUi();
@@ -12184,12 +12293,31 @@ void loop()
     static bool bleScanWasRunning = false;
     const bool bleScanNow = bleScanIsRunning();
 
-    if (bleScanWasRunning && !bleScanNow && bleAutoLinkToSensorNode())
+    if (bleScanWasRunning && !bleScanNow && bleAutoLinkToSensorNode() > 0)
     {
       refreshBleScreen();
     }
 
     bleScanWasRunning = bleScanNow;
+
+    // The active slot has to follow reality: a node that drops should not
+    // leave the measurement screen showing its last number forever, and a node
+    // that connects while nothing else is linked should become the active one
+    // without anybody tapping.
+    if (!bleLinkSlotIsSubscribed(activeBleSlot))
+    {
+      const int firstLinked = bleLinkFirstSubscribedSlot();
+      if (firstLinked >= 0) activeBleSlot = firstLinked;
+    }
+
+    bleNodeRefreshMetadata();
+
+    // dpsReady is settled once when a sensor is chosen, which is wrong for a
+    // link that comes and goes; for a node it is simply whether it is linked.
+    if (activeSensorMode == SENSOR_MODE_BLE)
+    {
+      dpsReady = bleLinkSlotIsSubscribed(activeBleSlot);
+    }
 
     if (pendingBleDisconnect)
     {
@@ -12205,7 +12333,21 @@ void loop()
 
       if (index < BLE_SCAN_MAX_RESULTS && bleRowAddress[index][0])
       {
-        bleLinkConnect(bleRowAddress[index]);
+        // Already linked: the tap means "measure with this one" rather than
+        // "connect again".
+        const int slot = bleLinkSlotForAddress(bleRowAddress[index]);
+
+        if (slot >= 0 && bleLinkSlotIsSubscribed(slot))
+        {
+          activeBleSlot = slot;
+          bleNodeRefreshMetadata();
+          if (activeSensorMode == SENSOR_MODE_BLE) updateActiveSensorUiLabels();
+        }
+        else
+        {
+          bleLinkConnect(bleRowAddress[index]);
+        }
+
         refreshBleScreen();
       }
     }
@@ -12238,6 +12380,7 @@ void loop()
       setIslStatusText(line);
 
       if (labelSettingsNote) lv_label_set_text(labelSettingsNote, line);
+      if (labelDeviceNote) lv_label_set_text(labelDeviceNote, line);
     }
   }
 
