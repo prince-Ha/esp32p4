@@ -310,6 +310,12 @@ static char bleNodeQuantity[BLE_LINK_MAX_VALUES][24] = { "블루투스", "", "" 
 static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
 static int bleNodeValueCount = 1;
 static float bleNodeThirdValue = NAN;
+// What the node was last reporting, so a change of sensor is noticed.
+void onBleNodeSensorChanged(const char *from, const char *to);
+static char bleNodeSignature[56] = "";
+
+// Defined with the measurement labels; cleared from here when a node goes.
+extern bool previewValid;
 
 // Every other sensor's 지능형 과학실 code is chosen at compile time, because
 // the firmware knows what the part measures. A node does not offer that: it
@@ -350,7 +356,52 @@ static const BleIslMapping kBleIslMappings[] = {
 static void bleNodeRefreshMetadata()
 {
   const int count = bleLinkValueCount(activeBleSlot);
-  if (count <= 0) return;
+
+  if (count <= 0)
+  {
+    // A node that has gone must stop looking live. Keeping its last quantity
+    // on screen is how the board came to say 온도 while the node had been
+    // swapped for a light sensor.
+    if (!bleLinkSlotIsSubscribed(activeBleSlot))
+    {
+      snprintf(bleNodeQuantity[0], sizeof(bleNodeQuantity[0]), "%s", "블루투스");
+      snprintf(bleNodeUnit[0], sizeof(bleNodeUnit[0]), "%s", "-");
+      bleNodeQuantity[1][0] = 0;
+      bleNodeQuantity[2][0] = 0;
+      bleNodeUnit[1][0] = 0;
+      bleNodeUnit[2][0] = 0;
+      bleNodeValueCount = 1;
+      bleNodeThirdValue = NAN;
+      previewValid = false;
+      bleNodeSignature[0] = 0;
+    }
+
+    return;
+  }
+
+  // A node that changes what it measures reports fewer values than before;
+  // the leftovers would otherwise keep describing the old sensor.
+  for (int i = count; i < BLE_LINK_MAX_VALUES; i++)
+  {
+    bleNodeQuantity[i][0] = 0;
+    bleNodeUnit[i][0] = 0;
+  }
+
+  // Swapping the sensor on a node is a different experiment, not a
+  // continuation of this one. Samples taken in hPa do not belong on an axis
+  // labelled lx, and the CSV would carry two quantities under one heading.
+  char signature[56];
+  char firstQuantity[24] = "";
+  char firstUnit[24] = "";
+  bleLinkValueAt(activeBleSlot, 0, NULL, firstQuantity, firstUnit, NULL);
+  snprintf(signature, sizeof(signature), "%d|%s|%s", count, firstQuantity, firstUnit);
+
+  if (bleNodeSignature[0] && strcmp(bleNodeSignature, signature) != 0)
+  {
+    onBleNodeSensorChanged(bleNodeSignature, signature);
+  }
+
+  snprintf(bleNodeSignature, sizeof(bleNodeSignature), "%s", signature);
 
   for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
   {
@@ -3229,7 +3280,7 @@ static bool secondaryPlotValueValid(float value)
 // starts; seeing is not, and a sensor that shows nothing until then looks
 // broken.
 static float previewValues[MEASURE_VALUE_MAX] = { NAN, NAN, NAN };
-static bool previewValid = false;
+bool previewValid = false;
 
 // How many decimals a sensor's second and third readings deserve. The first
 // column has formatPrimaryValueText() for this; these needed the same.
@@ -5809,6 +5860,50 @@ static float thirdValueForActiveSensor()
   if (activeSensorMode == SENSOR_MODE_INA228) return ina228LastPowerW;
   if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeThirdValue;
   return NAN;
+}
+
+// Swapping the sensor on a node is a different experiment, not a
+// continuation of this one. Samples taken in hPa do not belong on an axis
+// labelled lx, and the CSV would carry two quantities under one heading.
+void onBleNodeSensorChanged(const char *from, const char *to)
+{
+  Serial.printf("[BLE] node changed sensor: %s -> %s\n", from, to);
+
+    if (measuring)
+    {
+      measuring = false;
+      measureClockRunning = false;
+      setIslStatusText("노드 센서가 바뀌어 측정을 멈췄습니다");
+    }
+    else
+    {
+      setIslStatusText("노드 센서가 바뀌었습니다: 기록 초기화");
+    }
+
+    measurementCount = 0;
+    sampleCount = 0;
+    tablePageOffset = 0;
+    batchUploadStartIndex = 0;
+    measureAccumulatedMs = 0;
+    measureResumeMs = 0;
+    dataClockStarted = false;
+    dataFirstSampleMs = 0;
+    previewValid = false;
+
+    for (int i = 0; i < MAX_SAMPLES; i++)
+    {
+      sampleEnabled[i] = true;
+      noHistory[i] = 0;
+      tempHistory[i] = 0.0f;
+      pressureHistory[i] = NO_PRESSURE_VALUE;
+      humidityHistory[i] = NAN;
+      timeHistory[i] = 0;
+    }
+
+    resetDirectIslSessionCache("node sensor changed");
+    clearChart();
+    chartUiDirty = true;
+    refreshLatestMeasurementLabels();
 }
 
 void addSample(uint32_t timeS, float tempC, float pressureHpa)
@@ -12573,6 +12668,19 @@ void loop()
     {
       pendingBleScan = false;
       bleScanStart(6000);
+    }
+
+    // Nothing linked and nothing being tried: look again. A node that is
+    // reset - or swapped for another board - otherwise stays disconnected
+    // until somebody finds the 블루투스 tab and presses 다시 검색.
+    static unsigned long lastRelinkScanMs = 0;
+
+    if (bleEnabled && bleLinkNodeCount() == 0 && !bleLinkIsBusy() &&
+        !bleScanIsRunning() && !measuring &&
+        (lastRelinkScanMs == 0 || now - lastRelinkScanMs >= 20000UL))
+    {
+      lastRelinkScanMs = now;
+      bleScanStart(4000);
     }
 
     // A scan that just finished is the one moment the result list is fresh.

@@ -8,6 +8,8 @@
 
 static NodeSensorKind detectedKind = NODE_SENSOR_NONE;
 static uint8_t detectedAddress = 0x00;
+// Consecutive seconds the detected part has failed to acknowledge.
+static int missingReads = 0;
 
 // ---------------------------------------------------------------- I2C ------
 
@@ -172,13 +174,17 @@ static int dps310Read(NodeValue *out, int maxValues)
   if (maxValues < 2) return 0;
 
   uint8_t status = 0;
+
+  // If it does not answer at all, say so now rather than polling a part that
+  // has been unplugged for a quarter of a second.
+  if (!i2cReadRegister8(detectedAddress, DPS310_REG_MEAS_CFG, &status)) return 0;
+
   const unsigned long start = millis();
 
-  while (millis() - start < 250)
+  while ((status & 0x30) != 0x30 && millis() - start < 250)
   {
-    if (i2cReadRegister8(detectedAddress, DPS310_REG_MEAS_CFG, &status) &&
-        (status & 0x30) == 0x30) break;
     delay(5);
+    if (!i2cReadRegister8(detectedAddress, DPS310_REG_MEAS_CFG, &status)) return 0;
   }
 
   if ((status & 0x30) != 0x30) return 0;
@@ -746,16 +752,50 @@ const char *nodeSensorName()
 
 int nodeSensorRead(NodeValue *out, int maxValues)
 {
-  if (out == NULL) return 0;
+  if (out == NULL || detectedKind == NODE_SENSOR_NONE) return 0;
+
+  int count = 0;
 
   switch (detectedKind)
   {
-    case NODE_SENSOR_DPS310:  return dps310Read(out, maxValues);
-    case NODE_SENSOR_TMP117:  return tmp117Read(out, maxValues);
-    case NODE_SENSOR_SCD41:   return scd41Read(out, maxValues);
-    case NODE_SENSOR_TSL2591: return tsl2591Read(out, maxValues);
-    case NODE_SENSOR_VL53L1X: return vl53Read(out, maxValues);
-    case NODE_SENSOR_INA228:  return ina228Read(out, maxValues);
-    default: return 0;
+    case NODE_SENSOR_DPS310:  count = dps310Read(out, maxValues); break;
+    case NODE_SENSOR_TMP117:  count = tmp117Read(out, maxValues); break;
+    case NODE_SENSOR_SCD41:   count = scd41Read(out, maxValues); break;
+    case NODE_SENSOR_TSL2591: count = tsl2591Read(out, maxValues); break;
+    case NODE_SENSOR_VL53L1X: count = vl53Read(out, maxValues); break;
+    case NODE_SENSOR_INA228:  count = ina228Read(out, maxValues); break;
+    default: break;
   }
+
+  if (count > 0)
+  {
+    missingReads = 0;
+    return count;
+  }
+
+  // Zero is not the same as gone. An SCD41 warming up returns nothing for
+  // five seconds and is still very much on the bus, so ask the address
+  // directly: a part that still acknowledges is simply not ready.
+  Wire.beginTransmission(detectedAddress);
+
+  if (Wire.endTransmission() == 0)
+  {
+    missingReads = 0;
+    return 0;
+  }
+
+  // It has stopped acknowledging - unplugged, or swapped for something else.
+  // Forget it and look again, so changing a sensor while the node runs works
+  // the same as changing it before boot.
+  if (++missingReads >= 3)
+  {
+    Serial.printf("[SENSOR] %s stopped answering at 0x%02X; looking again\n",
+                  nodeSensorName(), detectedAddress);
+    missingReads = 0;
+    detectedKind = NODE_SENSOR_NONE;
+    detectedAddress = 0x00;
+    nodeSensorDetect();
+  }
+
+  return 0;
 }
