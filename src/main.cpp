@@ -1074,6 +1074,17 @@ static lv_chart_series_t *boyleSeries;
 static lv_obj_t *labelBoyleNow;
 static lv_obj_t *labelBoyleVolume;
 static lv_obj_t *labelBoyleHint;
+
+// The fitted P = k/V, drawn densely enough to read as a curve, plus the tick
+// values and a label on each measured point.
+#define BOYLE_CURVE_POINTS 60
+#define BOYLE_AXIS_TICKS 5
+
+static lv_chart_series_t *boyleCurve;
+static lv_obj_t *labelBoyleXTicks[BOYLE_AXIS_TICKS];
+static lv_obj_t *labelBoyleYTicks[BOYLE_AXIS_TICKS];
+static lv_obj_t *labelBoylePointText[BOYLE_MAX_POINTS];
+static lv_obj_t *labelBoyleConstant;
 static lv_obj_t *tableBoyle;
 static lv_obj_t *labelBarBoyleTime;
 static lv_obj_t *labelBarBoyleWifi;
@@ -9206,75 +9217,160 @@ void refreshBoyleScreen()
   // ---- the table ------------------------------------------------------------
   if (tableBoyle)
   {
-    lv_table_set_cell_value(tableBoyle, 0, 0, "부피(mL)");
-    lv_table_set_cell_value(tableBoyle, 0, 1, "압력(hPa)");
-    lv_table_set_cell_value(tableBoyle, 0, 2, "P×V");
+    // Every point, in the order it was taken, and the table scrolls to reach
+    // them. It used to show the eight most recent with scrolling turned off,
+    // which put the earlier half of an experiment out of reach.
+    lv_table_set_row_cnt(tableBoyle, (uint16_t)(boylePointCount + 1));
 
-    for (int r = 1; r <= 8; r++)
+    lv_table_set_cell_value(tableBoyle, 0, 0, "No");
+    lv_table_set_cell_value(tableBoyle, 0, 1, "부피(mL)");
+    lv_table_set_cell_value(tableBoyle, 0, 2, "압력(hPa)");
+    lv_table_set_cell_value(tableBoyle, 0, 3, "P×V");
+
+    for (int i = 0; i < boylePointCount; i++)
     {
-      // Newest first: the point just taken is the one being checked.
-      const int index = boylePointCount - r;
       char cell[24];
+      const int r = i + 1;
 
-      if (index < 0)
-      {
-        lv_table_set_cell_value(tableBoyle, r, 0, "-");
-        lv_table_set_cell_value(tableBoyle, r, 1, "-");
-        lv_table_set_cell_value(tableBoyle, r, 2, "-");
-        continue;
-      }
-
-      snprintf(cell, sizeof(cell), "%.1f", boyleVolumeMl[index]);
+      snprintf(cell, sizeof(cell), "%d", r);
       lv_table_set_cell_value(tableBoyle, r, 0, cell);
-      snprintf(cell, sizeof(cell), "%.1f", boylePressureHpa[index]);
+      snprintf(cell, sizeof(cell), "%.1f", boyleVolumeMl[i]);
       lv_table_set_cell_value(tableBoyle, r, 1, cell);
-      snprintf(cell, sizeof(cell), "%.0f", boyleVolumeMl[index] * boylePressureHpa[index]);
+      snprintf(cell, sizeof(cell), "%.1f", boylePressureHpa[i]);
       lv_table_set_cell_value(tableBoyle, r, 2, cell);
+      snprintf(cell, sizeof(cell), "%.0f", boyleVolumeMl[i] * boylePressureHpa[i]);
+      lv_table_set_cell_value(tableBoyle, r, 3, cell);
     }
   }
 
   // ---- the graph ------------------------------------------------------------
   lv_chart_set_all_value(boyleChart, boyleSeries, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(boyleChart, boyleCurve, LV_CHART_POINT_NONE);
+
+  for (int i = 0; i < BOYLE_MAX_POINTS; i++)
+  {
+    if (labelBoylePointText[i]) lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
+  }
 
   if (boylePointCount == 0)
   {
+    for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+    {
+      if (labelBoyleXTicks[i]) lv_label_set_text(labelBoyleXTicks[i], "");
+      if (labelBoyleYTicks[i]) lv_label_set_text(labelBoyleYTicks[i], "");
+    }
+
+    if (labelBoyleConstant) lv_label_set_text(labelBoyleConstant, "");
     lv_chart_refresh(boyleChart);
     return;
   }
 
-  float vMin = boyleVolumeMl[0], vMax = boyleVolumeMl[0];
-  float pMin = boylePressureHpa[0], pMax = boylePressureHpa[0];
+  float vMax = boyleVolumeMl[0];
+  float pMax = boylePressureHpa[0];
+  float sumPV = 0.0f;
 
-  for (int i = 1; i < boylePointCount; i++)
+  for (int i = 0; i < boylePointCount; i++)
   {
-    if (boyleVolumeMl[i] < vMin) vMin = boyleVolumeMl[i];
     if (boyleVolumeMl[i] > vMax) vMax = boyleVolumeMl[i];
-    if (boylePressureHpa[i] < pMin) pMin = boylePressureHpa[i];
     if (boylePressureHpa[i] > pMax) pMax = boylePressureHpa[i];
+    sumPV += boyleVolumeMl[i] * boylePressureHpa[i];
   }
 
-  // A single point, or several at one pressure, would otherwise divide by zero.
-  if (vMax - vMin < 0.1f) { vMin -= 1.0f; vMax += 1.0f; }
-  if (pMax - pMin < 1.0f) { pMin -= 10.0f; pMax += 10.0f; }
+  // Both axes start at zero. Fitting them to the data instead would fill the
+  // panel, but a hyperbola only looks like one against its asymptotes: cropped
+  // to the measured range it flattens into a slightly sloped line, which is
+  // exactly what made the shape hard to see.
+  const float vTop = vMax * 1.15f;
+  const float pTop = pMax * 1.15f;
 
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
 
+  const float k = sumPV / (float)boylePointCount;
+
+  // P = k/V through the points, sampled densely enough to read as a curve.
+  // Below vTop/40 the curve runs off the top of the panel and carries no
+  // information anyway.
+  for (int i = 0; i < BOYLE_CURVE_POINTS; i++)
+  {
+    const float v = vTop * ((float)(i + 1) / (float)BOYLE_CURVE_POINTS);
+    const float pressure = k / v;
+
+    if (pressure > pTop) continue;
+
+    lv_chart_set_value_by_id2(
+      boyleChart, boyleCurve, i,
+      (int)lroundf(v / vTop * 1000.0f),
+      (int)lroundf(pressure / pTop * 1000.0f)
+    );
+  }
+
+  // ---- the measured points, each carrying its own numbers -------------------
+  const lv_coord_t chartW = lv_obj_get_width(boyleChart);
+  const lv_coord_t chartH = lv_obj_get_height(boyleChart);
+  const lv_coord_t chartX = lv_obj_get_x(boyleChart);
+  const lv_coord_t chartY = lv_obj_get_y(boyleChart);
+
   for (int i = 0; i < boylePointCount; i++)
   {
-    const int x = (int)lroundf((boyleVolumeMl[i] - vMin) / (vMax - vMin) * 1000.0f);
-    const int y = (int)lroundf((boylePressureHpa[i] - pMin) / (pMax - pMin) * 1000.0f);
-    lv_chart_set_value_by_id2(boyleChart, boyleSeries, i, x, y);
+    const float fx = boyleVolumeMl[i] / vTop;
+    const float fy = boylePressureHpa[i] / pTop;
+
+    lv_chart_set_value_by_id2(boyleChart, boyleSeries, i,
+                              (int)lroundf(fx * 1000.0f),
+                              (int)lroundf(fy * 1000.0f));
+
+    if (labelBoylePointText[i] == NULL) continue;
+
+    char text[24];
+    snprintf(text, sizeof(text), "%.1f / %.0f", boyleVolumeMl[i], boylePressureHpa[i]);
+    lv_label_set_text(labelBoylePointText[i], text);
+    lv_obj_clear_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
+
+    // Sat just above and left of the point; nudged back inside when the point
+    // is near an edge, so a label never leaves the panel.
+    lv_coord_t lx = chartX + (lv_coord_t)(fx * chartW) - 24;
+    lv_coord_t ly = chartY + chartH - (lv_coord_t)(fy * chartH) - 20;
+
+    if (lx < chartX - 20) lx = chartX - 20;
+    if (lx > chartX + chartW - 50) lx = chartX + chartW - 50;
+    if (ly < chartY - 4) ly = chartY - 4;
+
+    lv_obj_set_pos(labelBoylePointText[i], lx, ly);
   }
 
   lv_chart_refresh(boyleChart);
 
+  // ---- what the axes mean ---------------------------------------------------
+  for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+  {
+    char text[16];
+
+    if (labelBoyleXTicks[i])
+    {
+      snprintf(text, sizeof(text), "%.0f", vTop * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
+      lv_label_set_text(labelBoyleXTicks[i], text);
+    }
+
+    if (labelBoyleYTicks[i])
+    {
+      snprintf(text, sizeof(text), "%.0f", pTop * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
+      lv_label_set_text(labelBoyleYTicks[i], text);
+    }
+  }
+
+  if (labelBoyleConstant)
+  {
+    char text[64];
+    snprintf(text, sizeof(text), "P×V 평균 %.0f · 곡선은 P = %.0f / V", k, k);
+    lv_label_set_text(labelBoyleConstant, text);
+  }
+
   if (labelBoyleHint)
   {
     char note[140];
-    snprintf(note, sizeof(note),
-             "점 %d개 · 부피 %.1f~%.1f mL · 압력 %.0f~%.0f hPa",
-             boylePointCount, vMin, vMax, pMin, pMax);
+    snprintf(note, sizeof(note), "점 %d개 · 부피 최대 %.1f mL · 압력 최대 %.0f hPa",
+             boylePointCount, vMax, pMax);
     lv_label_set_text(labelBoyleHint, note);
   }
 }
@@ -9327,12 +9423,13 @@ void createBoyleUi()
   lv_obj_set_style_text_font(tableBoyle, FONT_KR_SMALL, 0);
   lv_obj_set_style_border_width(tableBoyle, 0, 0);
   lv_obj_set_style_bg_color(tableBoyle, lv_color_hex(UI_SURFACE), 0);
-  lv_table_set_col_cnt(tableBoyle, 3);
-  lv_table_set_row_cnt(tableBoyle, 9);
-  lv_table_set_col_width(tableBoyle, 0, 150);
-  lv_table_set_col_width(tableBoyle, 1, 150);
-  lv_table_set_col_width(tableBoyle, 2, 150);
-  lv_obj_clear_flag(tableBoyle, LV_OBJ_FLAG_SCROLLABLE);
+  lv_table_set_col_cnt(tableBoyle, 4);
+  lv_table_set_row_cnt(tableBoyle, 1);
+  lv_table_set_col_width(tableBoyle, 0, 60);
+  lv_table_set_col_width(tableBoyle, 1, 130);
+  lv_table_set_col_width(tableBoyle, 2, 130);
+  lv_table_set_col_width(tableBoyle, 3, 120);
+  lv_obj_set_scrollbar_mode(tableBoyle, LV_SCROLLBAR_MODE_AUTO);
 
   // ---- pressure against volume ----------------------------------------------
   lv_obj_t *chartCard = makePanel(boyleScreen, 504, 104, 492, 350);
@@ -9350,16 +9447,44 @@ void createBoyleUi()
   // Scatter, because the volume is chosen rather than swept: the points do not
   // arrive evenly spaced and must not be drawn as though they did.
   lv_chart_set_type(boyleChart, LV_CHART_TYPE_SCATTER);
-  lv_chart_set_point_count(boyleChart, BOYLE_MAX_POINTS);
-  lv_chart_set_div_line_count(boyleChart, 5, 5);
+  lv_chart_set_point_count(boyleChart, BOYLE_CURVE_POINTS);
+  lv_chart_set_div_line_count(boyleChart, 6, 6);
+
+  // The fitted curve goes on first so the measured points sit over it.
+  boyleCurve = lv_chart_add_series(boyleChart, lv_color_hex(UI_TEXT_4), LV_CHART_AXIS_PRIMARY_Y);
   boyleSeries = lv_chart_add_series(boyleChart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
 
+  // Axis values, drawn as plain labels the way the measurement screen does.
+  for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+  {
+    const int x = 26 + (i + 1) * 440 / BOYLE_AXIS_TICKS;
+    labelBoyleXTicks[i] = makeSmallLabel(chartCard, "", x - 14, 324, UI_TEXT_3);
+
+    const int y = 40 + 280 - (i + 1) * 280 / BOYLE_AXIS_TICKS;
+    labelBoyleYTicks[i] = makeSmallLabel(chartCard, "", 0, y - 8, UI_TEXT_3);
+    lv_obj_set_width(labelBoyleYTicks[i], 24);
+    lv_obj_set_style_text_align(labelBoyleYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
+  }
+
+  makeSmallLabel(chartCard, "부피 (mL)", 400, 324, UI_TEXT_3);
+  makeSmallLabel(chartCard, "hPa", 0, 22, UI_TEXT_3);
+
+  for (int i = 0; i < BOYLE_MAX_POINTS; i++)
+  {
+    labelBoylePointText[i] = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_2);
+    lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  labelBoyleConstant = makeSmallLabel(boyleScreen, "", 504, 466, UI_TEXT_2);
+  lv_obj_set_width(labelBoyleConstant, 492);
+  lv_label_set_long_mode(labelBoyleConstant, LV_LABEL_LONG_CLIP);
+
   labelBoyleHint = makeSmallLabel(boyleScreen, "부피를 정하고 [이 부피로 기록]을 누르세요.",
-                                  504, 466, UI_TEXT_3);
+                                  504, 488, UI_TEXT_3);
   lv_obj_set_width(labelBoyleHint, 492);
   lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
 
-  makeQuietButton(boyleScreen, "CSV 저장", 504, 500, 150, 40, boyle_save_event_cb);
+  makeQuietButton(boyleScreen, "CSV 저장", 838, 484, 158, 44, boyle_save_event_cb);
 
   createTabBar(boyleScreen, TAB_MEASURE);
 }
