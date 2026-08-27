@@ -1077,6 +1077,12 @@ static float boyleVolumeSetting = 20.0f;
 #define BOYLE_VOLUME_MIN 20.0f
 #define BOYLE_VOLUME_MAX 60.0f
 
+// Neither axis starts at zero. A hyperbola reads as one against its
+// asymptotes, but nothing here is measured below 20 mL or much below
+// atmospheric pressure, and a panel spent on ground the experiment never
+// visits costs more resolution than the shape is worth.
+#define BOYLE_PRESSURE_MIN 950.0f
+
 static lv_obj_t *boyleScreen;
 static lv_obj_t *boyleChart;
 static lv_chart_series_t *boyleSeries;
@@ -9470,7 +9476,17 @@ void refreshBoyleScreen()
   }
 
   const float vSpan = vTop - vBottom;
-  const float pTop = pMax * 1.15f;
+
+  float pBottom = BOYLE_PRESSURE_MIN;
+  const float pTop = pMax * 1.10f;
+
+  // A reading below the usual floor drops the axis rather than falling off it.
+  for (int i = 0; i < boylePointCount; i++)
+  {
+    if (boylePressureHpa[i] < pBottom) pBottom = floorf(boylePressureHpa[i] / 50.0f) * 50.0f;
+  }
+
+  const float pSpan = (pTop - pBottom) > 1.0f ? (pTop - pBottom) : 1.0f;
 
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
@@ -9485,12 +9501,12 @@ void refreshBoyleScreen()
     const float v = vBottom + vSpan * ((float)i / (float)(BOYLE_CURVE_POINTS - 1));
     const float pressure = k / v;
 
-    if (pressure > pTop) continue;
+    if (pressure > pTop || pressure < pBottom) continue;
 
     lv_chart_set_value_by_id2(
       boyleChart, boyleCurve, i,
       (int)lroundf((v - vBottom) / vSpan * 1000.0f),
-      (int)lroundf(pressure / pTop * 1000.0f)
+      (int)lroundf((pressure - pBottom) / pSpan * 1000.0f)
     );
   }
 
@@ -9507,7 +9523,7 @@ void refreshBoyleScreen()
   for (int i = 0; i < boylePointCount; i++)
   {
     const float fx = (boyleVolumeMl[i] - vBottom) / vSpan;
-    const float fy = boylePressureHpa[i] / pTop;
+    const float fy = (boylePressureHpa[i] - pBottom) / pSpan;
 
     lv_chart_set_value_by_id2(boyleChart, boyleSeries, i,
                               (int)lroundf(fx * 1000.0f),
@@ -9566,7 +9582,8 @@ void refreshBoyleScreen()
 
     if (labelBoyleYTicks[i])
     {
-      snprintf(text, sizeof(text), "%.0f", pTop * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
+      snprintf(text, sizeof(text), "%.0f",
+               pBottom + pSpan * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
       lv_label_set_text(labelBoyleYTicks[i], text);
     }
   }
