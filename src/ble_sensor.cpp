@@ -557,6 +557,13 @@ typedef struct
   int exploreChrs;
   int exploreSubscribed;
   char exploreSummary[64];
+
+  // Readable characteristics, walked one at a time after discovery. A sensor
+  // that will not stream until it is told to may still hand over its current
+  // measurement to a plain read.
+  uint16_t exploreReadHandles[16];
+  int exploreReadCount;
+  int exploreReadIndex;
 } BleLink;
 
 static BleLink bleLinks[BLE_LINK_MAX_NODES];
@@ -653,6 +660,7 @@ static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *e
                             const struct ble_gatt_svc *service, void *arg);
 static int bleExploreOnSvc(uint16_t conn_handle, const struct ble_gatt_error *error,
                            const struct ble_gatt_svc *service, void *arg);
+static void bleExploreDump(const char *what, uint16_t handle, const struct os_mbuf *om, int slot);
 
 // Step 4: the subscription write came back.
 static int bleLinkOnSubscribed(uint16_t conn_handle, const struct ble_gatt_error *error,
@@ -863,27 +871,7 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
       {
         // Print it as bytes. Which of them carry the reading, and in what
         // order and scale, is what these dumps are for.
-        uint8_t raw[64];
-        const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
-        const uint16_t copy = len < sizeof(raw) ? len : (uint16_t)sizeof(raw);
-
-        if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, copy, NULL) == 0)
-        {
-          char hex[3 * sizeof(raw) + 1];
-          int used = 0;
-          for (uint16_t i = 0; i < copy && used < (int)sizeof(hex) - 3; i++)
-          {
-            used += snprintf(hex + used, sizeof(hex) - used, "%02X ", raw[i]);
-          }
-
-          blePrintf("explore: handle %u (%u bytes) %s",
-                    (unsigned)event->notify_rx.attr_handle, (unsigned)len, hex);
-
-          snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
-                   "h%u %ubyte %s", (unsigned)event->notify_rx.attr_handle,
-                   (unsigned)len, hex);
-        }
-
+        bleExploreDump("notify", event->notify_rx.attr_handle, event->notify_rx.om, slot);
         bleLinks[slot].notifyCount++;
         return 0;
       }
@@ -938,6 +926,79 @@ static void bleExploreSetSummary(int slot)
            bleLinks[slot].exploreSubscribed);
 }
 
+static void bleExploreReadNext(uint16_t conn_handle, int slot);
+
+// Turns an attribute's payload into hex for the log. What the bytes mean is
+// exactly the question these dumps exist to answer.
+static void bleExploreDump(const char *what, uint16_t handle, const struct os_mbuf *om, int slot)
+{
+  uint8_t raw[64];
+  const uint16_t len = OS_MBUF_PKTLEN(om);
+  const uint16_t copy = len < sizeof(raw) ? len : (uint16_t)sizeof(raw);
+
+  if (ble_hs_mbuf_to_flat(om, raw, copy, NULL) != 0) return;
+
+  char hex[3 * sizeof(raw) + 1];
+  int used = 0;
+  for (uint16_t i = 0; i < copy && used < (int)sizeof(hex) - 3; i++)
+  {
+    used += snprintf(hex + used, sizeof(hex) - used, "%02X ", raw[i]);
+  }
+
+  blePrintf("explore: %s handle %u (%u bytes) %s", what, (unsigned)handle,
+            (unsigned)len, hex);
+
+  if (bleSlotValid(slot))
+  {
+    snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
+             "h%u %ubyte %s", (unsigned)handle, (unsigned)len, hex);
+  }
+}
+
+static int bleExploreOnRead(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && attr != NULL && attr->om != NULL)
+  {
+    bleExploreDump("read", attr->handle, attr->om, slot);
+  }
+  else if (error->status != 0)
+  {
+    blePrintf("explore: read of handle %u failed: %d",
+              (unsigned)bleLinks[slot].exploreReadHandles[bleLinks[slot].exploreReadIndex],
+              error->status);
+  }
+
+  bleLinks[slot].exploreReadIndex++;
+  bleExploreReadNext(conn_handle, slot);
+  return 0;
+}
+
+static void bleExploreReadNext(uint16_t conn_handle, int slot)
+{
+  if (!bleSlotValid(slot)) return;
+
+  BleLink *link = &bleLinks[slot];
+
+  if (link->exploreReadIndex >= link->exploreReadCount)
+  {
+    link->busy = false;
+    bleLinkSetState(slot, "분석 완료 · 데이터 대기");
+    return;
+  }
+
+  const uint16_t handle = link->exploreReadHandles[link->exploreReadIndex];
+
+  if (ble_gattc_read(conn_handle, handle, bleExploreOnRead, (void *)(intptr_t)slot) != 0)
+  {
+    link->exploreReadIndex++;
+    bleExploreReadNext(conn_handle, slot);
+  }
+}
+
 static int bleExploreOnDsc(uint16_t conn_handle, const struct ble_gatt_error *error,
                            uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
@@ -964,11 +1025,16 @@ static int bleExploreOnDsc(uint16_t conn_handle, const struct ble_gatt_error *er
   if (error->status != BLE_HS_EDONE) return 0;
 
   bleExploreSetSummary(slot);
-  bleLinks[slot].busy = false;
-  bleLinkSetState(slot, "분석 완료 · 데이터 대기");
   blePrintf("explore: done - %d service(s), %d characteristic(s), %d subscription(s)",
             bleLinks[slot].exploreServices, bleLinks[slot].exploreChrs,
             bleLinks[slot].exploreSubscribed);
+
+  // Nothing may ever be notified: a sensor that waits for a start command
+  // stays silent. Read whatever is readable, which on some parts hands over
+  // the current measurement anyway.
+  bleLinkSetState(slot, "특성 읽는 중");
+  bleLinks[slot].exploreReadIndex = 0;
+  bleExploreReadNext(conn_handle, slot);
   return 0;
 }
 
@@ -992,6 +1058,14 @@ static int bleExploreOnChr(uint16_t conn_handle, const struct ble_gatt_error *er
               (chr->properties & BLE_GATT_CHR_PROP_INDICATE) ? "indicate" : "");
 
     bleLinks[slot].exploreChrs++;
+
+    if ((chr->properties & BLE_GATT_CHR_PROP_READ) &&
+        bleLinks[slot].exploreReadCount < (int)(sizeof(bleLinks[slot].exploreReadHandles) /
+                                                sizeof(bleLinks[slot].exploreReadHandles[0])))
+    {
+      bleLinks[slot].exploreReadHandles[bleLinks[slot].exploreReadCount++] = chr->val_handle;
+    }
+
     bleExploreSetSummary(slot);
     return 0;
   }
@@ -1110,6 +1184,8 @@ bool bleLinkConnect(const char *address)
   bleLinks[slot].exploreServices = 0;
   bleLinks[slot].exploreChrs = 0;
   bleLinks[slot].exploreSubscribed = 0;
+  bleLinks[slot].exploreReadCount = 0;
+  bleLinks[slot].exploreReadIndex = 0;
   bleLinks[slot].exploreSummary[0] = '\0';
   bleLinkSetState(slot, bleLinks[slot].exploring ? "분석 연결 중" : "연결 중");
 
