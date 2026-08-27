@@ -971,13 +971,33 @@ typedef struct
 } BleProbeCommand;
 
 static const BleProbeCommand kBleProbeCommands[] = {
-  { "01",       { 0x01 },             1 },
-  { "0D",       { 0x0D },             1 },
-  { "01 00",    { 0x01, 0x00 },       2 },
-  { "0D 00",    { 0x0D, 0x00 },       2 },
-  { "55 01",    { 0x55, 0x01 },       2 },
-  { "0D 01",    { 0x0D, 0x01 },       2 },
-  { "02 0D 00", { 0x02, 0x0D, 0x00 }, 3 }
+  // Every status frame this sensor sends begins 0x85 - "85 EC 0F 06 01 00" -
+  // so its framing puts an opcode first, in the 0x8_ range. Openers written
+  // outside that range were all accepted and all ignored, which is what a
+  // wrong opcode looks like on a part that does not answer back. This sweeps
+  // the neighbours of the one opcode known to be real.
+  { "80", { 0x80 }, 1 },
+  { "81", { 0x81 }, 1 },
+  { "82", { 0x82 }, 1 },
+  { "83", { 0x83 }, 1 },
+  { "84", { 0x84 }, 1 },
+  { "85", { 0x85 }, 1 },
+  { "86", { 0x86 }, 1 },
+  { "87", { 0x87 }, 1 },
+  { "88", { 0x88 }, 1 },
+  { "89", { 0x89 }, 1 },
+  { "8A", { 0x8A }, 1 },
+  { "8B", { 0x8B }, 1 },
+  { "8C", { 0x8C }, 1 },
+  { "8D", { 0x8D }, 1 },
+  { "8E", { 0x8E }, 1 },
+  { "8F", { 0x8F }, 1 },
+
+  // And the same opcodes carrying one argument, in case a bare byte is too
+  // short to be a frame.
+  { "80 01", { 0x80, 0x01 }, 2 },
+  { "81 01", { 0x81, 0x01 }, 2 },
+  { "8D 01", { 0x8D, 0x01 }, 2 }
 };
 
 // Turns an attribute's payload into hex for the log. What the bytes mean is
