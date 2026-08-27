@@ -584,6 +584,7 @@ typedef struct
   unsigned long pascoNextStepMs;
   uint16_t pascoSensorId;
   uint8_t pascoSampleBytes;
+  int pascoKind;
 } BleLink;
 
 static BleLink bleLinks[BLE_LINK_MAX_NODES];
@@ -985,6 +986,40 @@ static void bleExploreReadNext(uint16_t conn_handle, int slot);
 // Values are 16.16 fixed point: a little-endian int32 over 65536.
 // =====================================================
 
+// Which PASCO part this is. Taken from the advertised name, which carries it
+// plainly - "Pressure 581-124", "Temperature 171-753" - and is available
+// before a single byte has been exchanged.
+#define PASCO_KIND_UNKNOWN     0
+#define PASCO_KIND_PRESSURE    1
+#define PASCO_KIND_TEMPERATURE 2
+
+// From PASCO's own datasheets, which their BLE library ships:
+//
+//   Wireless Pressure Sensor PS-3203, id 2022
+//     adc      RawDigital, 2 bytes
+//     Pressure FactoryCal on adc, params 16016,14.7,38688,34.7, kPa
+//
+//   Wireless Temperature Sensor PS-3201, id 2020
+//     RawTemperature   RawDigital, 2 bytes
+//     UncalTemperature LinearConv on it, params 0.00268127,-46.85, DegC
+//
+// The calibration points are in psi even though the measurement is published
+// as kPa, so the conversion is applied here rather than assumed away.
+#define PASCO_PRESSURE_X1 16016.0f
+#define PASCO_PRESSURE_Y1 14.7f
+#define PASCO_PRESSURE_X2 38688.0f
+#define PASCO_PRESSURE_Y2 34.7f
+#define PASCO_PSI_TO_KPA  6.894757f
+
+#define PASCO_TEMPERATURE_SLOPE  0.00268127f
+#define PASCO_TEMPERATURE_OFFSET (-46.85f)
+
+// Two bytes. That is the whole sample: the datasheet gives the sensor one
+// RawDigital measurement of two bytes and derives the reading from it. Asking
+// for sixteen returned fourteen bytes of stale buffer, which is why three of
+// the four "fields" never moved.
+#define PASCO_SAMPLE_BYTES 2
+
 #define PASCO_CMD_READ_ONE_SAMPLE 0x05
 #define PASCO_CMD_GET_SENSOR_ID   0x08
 #define PASCO_RSP_RESULT          0xC0
@@ -1067,9 +1102,56 @@ static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t l
     return;
   }
 
-  if (command != PASCO_CMD_READ_ONE_SAMPLE || len < 7) return;
+  if (command != PASCO_CMD_READ_ONE_SAMPLE || len < 5) return;
 
-  // Everything after the header is measurement, four bytes per value.
+  // Two bytes of raw ADC, little endian, and the sensor's own calibration
+  // turns it into a reading.
+  const uint16_t raw = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
+
+  float value = NAN;
+  const char *name = "";
+  const char *unit = "";
+
+  if (link->pascoKind == PASCO_KIND_PRESSURE)
+  {
+    // Two-point factory calibration, exactly as PASCO computes it.
+    const float b = (PASCO_PRESSURE_X1 * PASCO_PRESSURE_Y2 -
+                     PASCO_PRESSURE_X2 * PASCO_PRESSURE_Y1) /
+                    (PASCO_PRESSURE_X1 - PASCO_PRESSURE_X2);
+    const float slope = (PASCO_PRESSURE_Y1 - b) / PASCO_PRESSURE_X1;
+
+    value = (slope * (float)raw + b) * PASCO_PSI_TO_KPA;
+    name = "압력";
+    unit = "kPa";
+  }
+  else if (link->pascoKind == PASCO_KIND_TEMPERATURE)
+  {
+    value = (float)raw * PASCO_TEMPERATURE_SLOPE + PASCO_TEMPERATURE_OFFSET;
+    name = "온도";
+    unit = "C";
+  }
+  else
+  {
+    blePrintf("pasco: raw %u from an unrecognised part", (unsigned)raw);
+    return;
+  }
+
+  blePrintf("pasco: raw %u -> %s %.4f %s", (unsigned)raw, name, value, unit);
+
+  // Written in the same shape a sensor node sends, so everything downstream -
+  // the measurement screen, the home tile, the CSV, the upload - treats a
+  // PASCO sensor as just another sensor.
+  link->notifyCount++;
+  snprintf(link->payload, sizeof(link->payload), "%lu,%s,%.4f,%s",
+           (unsigned long)link->notifyCount, name, value, unit);
+  link->payloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+  link->hasReading = true;
+  link->subscribed = true;
+
+  snprintf(link->exploreSummary, sizeof(link->exploreSummary), "%s %.1f %s",
+           name, value, unit);
+  return;
+
   const int payloadLen = len - 3;
   const int values = payloadLen / 4;
 
@@ -1117,19 +1199,16 @@ static void blePascoService(int slot)
 
   const uint8_t getId = PASCO_CMD_GET_SENSOR_ID;
 
+  (void)getId;
+
   switch (link->pascoStep)
   {
     case 0:
-      blePascoSend(slot, 0, &getId, 1);   // device service: bring it up
-      link->pascoNextStepMs = millis() + 600;
-      link->pascoStep = 1;
-      break;
-
-    case 1:
-      blePascoSend(slot, 1, &getId, 1);   // sensor service: what is attached
-      link->pascoNextStepMs = millis() + 600;
+      // 0x08 asks what sensor is attached, which is a question for the
+      // AirLink bridge. A sensor is the thing itself and refuses it with
+      // status 0x01, so it is not asked.
       link->pascoStep = 2;
-      bleLinkSetState(slot, "PASCO 측정 요청 중");
+      bleLinkSetState(slot, "PASCO 수신 중");
       break;
 
     default:
@@ -1139,7 +1218,7 @@ static void blePascoService(int slot)
       // first moved when the pressure did - the other three sat at
       // 8192.2549, 8192.2090 and 4098.8579 through the whole run, which makes
       // them configuration rather than measurement.
-      link->pascoSampleBytes = 16;
+      link->pascoSampleBytes = PASCO_SAMPLE_BYTES;
 
       const uint8_t sample[2] = { PASCO_CMD_READ_ONE_SAMPLE, link->pascoSampleBytes };
       blePascoSend(slot, 1, sample, 2);
@@ -1547,8 +1626,18 @@ bool bleLinkConnect(const char *address)
   bleLinks[slot].pascoPresent = false;
   bleLinks[slot].pascoStep = 0;
   bleLinks[slot].pascoSensorId = 0;
-  bleLinks[slot].pascoSampleBytes = 4;
+  bleLinks[slot].pascoSampleBytes = PASCO_SAMPLE_BYTES;
   memset(bleLinks[slot].pascoHandle, 0, sizeof(bleLinks[slot].pascoHandle));
+
+  bleLinks[slot].pascoKind = PASCO_KIND_UNKNOWN;
+  if (strstr(bleLinks[slot].peerName, "Pressure") != NULL)
+  {
+    bleLinks[slot].pascoKind = PASCO_KIND_PRESSURE;
+  }
+  else if (strstr(bleLinks[slot].peerName, "Temperature") != NULL)
+  {
+    bleLinks[slot].pascoKind = PASCO_KIND_TEMPERATURE;
+  }
   bleLinks[slot].exploreSummary[0] = '\0';
   bleLinkSetState(slot, bleLinks[slot].exploring ? "분석 연결 중" : "연결 중");
 

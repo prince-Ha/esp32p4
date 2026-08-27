@@ -343,6 +343,10 @@ static const BleIslMapping kBleIslMappings[] = {
   { "degC", "TPR",  "온도센서",       "01", "C" },
   { "hPa",  "PRS",  "기압센서",       "02", "hPa" },
 
+  // A PASCO pressure sensor reports kPa. Same quantity, same 별첨2 code; only
+  // the unit label the platform is told differs.
+  { "kPa",  "PRS",  "기압센서",       "02", "kPa" },
+
   // ISL_SENSOR_TYPE_CO2 and ISL_SENSOR_TYPE_HUMIDITY, written out because this
   // table is above where they are defined. A SCD41 wired to this board already
   // registers with exactly these, so a node carrying one looks the same to the
