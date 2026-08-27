@@ -310,6 +310,13 @@ static char bleNodeQuantity[BLE_LINK_MAX_VALUES][24] = { "블루투스", "", "" 
 static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
 static int bleNodeValueCount = 1;
 static float bleNodeThirdValue = NAN;
+// Where each displayed value comes from: which link, and which of that link's
+// quantities. A PASCO pressure sensor and a PASCO temperature sensor are two
+// connections and one experiment, which is the whole point of a gas-law
+// measurement, so the readout is filled across links rather than from one.
+static int bleValueSlot[BLE_LINK_MAX_VALUES];
+static int bleValueIndex[BLE_LINK_MAX_VALUES];
+
 // What the node was last reporting, so a change of sensor is noticed.
 void onBleNodeSensorChanged(const char *from, const char *to);
 static char bleNodeSignature[56] = "";
@@ -364,16 +371,48 @@ static const BleIslMapping kBleIslMappings[] = {
 // startup placeholders, nothing mapped to a 지능형 과학실 code, and the
 // session was never opened. By the time readings arrived the decision had
 // already been made.
+// Collects the quantities every connected node is reporting, in slot order,
+// up to the three the measurement screen can hold.
+static int bleCollectValues()
+{
+  int found = 0;
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES && found < BLE_LINK_MAX_VALUES; slot++)
+  {
+    if (!bleLinkSlotIsSubscribed(slot)) continue;
+
+    const int count = bleLinkValueCount(slot);
+
+    for (int i = 0; i < count && found < BLE_LINK_MAX_VALUES; i++)
+    {
+      char quantity[24] = "";
+      char unit[24] = "";
+
+      if (!bleLinkValueAt(slot, i, NULL, quantity, unit, NULL)) break;
+
+      bleValueSlot[found] = slot;
+      bleValueIndex[found] = i;
+
+      if (quantity[0]) snprintf(bleNodeQuantity[found], sizeof(bleNodeQuantity[found]), "%s", quantity);
+      if (unit[0]) snprintf(bleNodeUnit[found], sizeof(bleNodeUnit[found]), "%s", unit);
+
+      found++;
+    }
+  }
+
+  return found;
+}
+
 static void bleNodeRefreshMetadata()
 {
-  const int count = bleLinkValueCount(activeBleSlot);
+  const int count = bleCollectValues();
 
   if (count <= 0)
   {
     // A node that has gone must stop looking live. Keeping its last quantity
     // on screen is how the board came to say 온도 while the node had been
     // swapped for a light sensor.
-    if (!bleLinkSlotIsSubscribed(activeBleSlot))
+    if (bleLinkNodeCount() == 0)
     {
       snprintf(bleNodeQuantity[0], sizeof(bleNodeQuantity[0]), "%s", "블루투스");
       snprintf(bleNodeUnit[0], sizeof(bleNodeUnit[0]), "%s", "-");
@@ -402,10 +441,13 @@ static void bleNodeRefreshMetadata()
   // continuation of this one. Samples taken in hPa do not belong on an axis
   // labelled lx, and the CSV would carry two quantities under one heading.
   char signature[56];
-  char firstQuantity[24] = "";
-  char firstUnit[24] = "";
-  bleLinkValueAt(activeBleSlot, 0, NULL, firstQuantity, firstUnit, NULL);
-  snprintf(signature, sizeof(signature), "%d|%s|%s", count, firstQuantity, firstUnit);
+  int sigUsed = snprintf(signature, sizeof(signature), "%d", count);
+
+  for (int i = 0; i < count && sigUsed < (int)sizeof(signature) - 1; i++)
+  {
+    sigUsed += snprintf(signature + sigUsed, sizeof(signature) - sigUsed, "|%s|%s",
+                        bleNodeQuantity[i], bleNodeUnit[i]);
+  }
 
   if (bleNodeSignature[0] && strcmp(bleNodeSignature, signature) != 0)
   {
@@ -414,18 +456,7 @@ static void bleNodeRefreshMetadata()
 
   snprintf(bleNodeSignature, sizeof(bleNodeSignature), "%s", signature);
 
-  for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
-  {
-    char quantity[24] = "";
-    char unit[24] = "";
-
-    if (!bleLinkValueAt(activeBleSlot, i, NULL, quantity, unit, NULL)) break;
-
-    if (quantity[0]) snprintf(bleNodeQuantity[i], sizeof(bleNodeQuantity[i]), "%s", quantity);
-    if (unit[0]) snprintf(bleNodeUnit[i], sizeof(bleNodeUnit[i]), "%s", unit);
-  }
-
-  bleNodeValueCount = count < BLE_LINK_MAX_VALUES ? count : BLE_LINK_MAX_VALUES;
+  bleNodeValueCount = count;
 }
 
 // A node writes its unit in ASCII, because the payload has to survive a font
@@ -1346,6 +1377,8 @@ static void home_sensor_ble_event_cb(lv_event_t *e)
   const int slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
   if (!bleLinkSlotIsSubscribed(slot)) return;
 
+  // Every connected node is recorded together, so this chooses the mode rather
+  // than the sensor. The tapped one leads the readout.
   activeBleSlot = slot;
   pendingSensorMode = SENSOR_MODE_BLE;
 }
@@ -4182,29 +4215,37 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
 
   if (activeSensorMode == SENSOR_MODE_BLE)
   {
-    const int count = bleLinkValueCount(activeBleSlot);
+    const int count = bleNodeValueCount;
     if (count <= 0) return false;
 
     float values[BLE_LINK_MAX_VALUES] = { NAN, NAN, NAN };
-    uint32_t ageMs = 0;
     int read = 0;
 
+    // Each value is taken from whichever link reported it. Two sensors sample
+    // on their own clocks, so a row can mix readings up to a second apart -
+    // which is the same skew a single sensor already has between its own
+    // quantities, and well inside what a school experiment resolves.
     for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
     {
-      char quantity[24] = "";
-      char unit[24] = "";
+      uint32_t ageMs = 0;
 
-      if (!bleLinkValueAt(activeBleSlot, i, &values[i], quantity, unit, &ageMs)) break;
+      if (!bleLinkValueAt(bleValueSlot[i], bleValueIndex[i], &values[i], NULL, NULL, &ageMs))
+      {
+        continue;
+      }
 
-      if (quantity[0]) snprintf(bleNodeQuantity[i], sizeof(bleNodeQuantity[i]), "%s", quantity);
-      if (unit[0]) snprintf(bleNodeUnit[i], sizeof(bleNodeUnit[i]), "%s", unit);
+      // A node that has gone quiet leaves its column empty rather than
+      // repeating its last reading as though it were current.
+      if (ageMs > BLE_READING_MAX_AGE_MS)
+      {
+        values[i] = NAN;
+        continue;
+      }
+
       read++;
     }
 
     if (read == 0) return false;
-    if (ageMs > BLE_READING_MAX_AGE_MS) return false;
-
-    bleNodeValueCount = read;
 
     *primaryValue = values[0];
     *secondaryValue = values[1];
