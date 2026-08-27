@@ -9369,7 +9369,11 @@ void boyleUploadToIsl()
     payload += jsonEscapeString(islServiceKey);
     payload += "\",\"uniqueCode\":\"";
     payload += jsonEscapeString(directIslUniqueCode);
-    payload += "\",\"items\":[";
+
+    // The server rejects a data post without this - "Field required",
+    // transMethod. 01 is a live reading as it is taken; these points were
+    // taken earlier and are being sent together, which is 02.
+    payload += "\",\"transMethod\":\"02\",\"items\":[";
     payload += "{\"sensorType\":\"PRS\",\"sensorNicNm\":\"기압센서\",\"channelCode\":\"02\",\"sensorData\":\"";
     payload += pressure;
     payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
