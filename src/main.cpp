@@ -1067,9 +1067,15 @@ static float boyleVolumeMl[BOYLE_MAX_POINTS];
 static float boylePressureHpa[BOYLE_MAX_POINTS];
 static int boylePointCount = 0;
 // A syringe experiment runs 20 to 60 mL, so that is where the setting starts
-// and what the axis is sized for even before the first point is taken.
+// and what the volume axis covers from the first point.
+//
+// The volume axis does not begin at zero. Nothing is measured below 20 mL, and
+// starting from zero spent a third of the width on empty space. The pressure
+// axis still does: P against V only reads as a hyperbola against that
+// asymptote, and that is the whole point of the graph.
 static float boyleVolumeSetting = 20.0f;
-#define BOYLE_VOLUME_TYPICAL_MAX 60.0f
+#define BOYLE_VOLUME_MIN 20.0f
+#define BOYLE_VOLUME_MAX 60.0f
 
 static lv_obj_t *boyleScreen;
 static lv_obj_t *boyleChart;
@@ -9294,8 +9300,18 @@ void refreshBoyleScreen()
   // panel, but a hyperbola only looks like one against its asymptotes: cropped
   // to the measured range it flattens into a slightly sloped line, which is
   // exactly what made the shape hard to see.
-  float vTop = vMax * 1.15f;
-  if (vTop < BOYLE_VOLUME_TYPICAL_MAX * 1.15f) vTop = BOYLE_VOLUME_TYPICAL_MAX * 1.15f;
+  float vBottom = BOYLE_VOLUME_MIN;
+  float vTop = BOYLE_VOLUME_MAX;
+
+  // A point taken outside the usual range widens the axis rather than falling
+  // off the edge of it.
+  for (int i = 0; i < boylePointCount; i++)
+  {
+    if (boyleVolumeMl[i] < vBottom) vBottom = floorf(boyleVolumeMl[i] / 5.0f) * 5.0f;
+    if (boyleVolumeMl[i] > vTop) vTop = ceilf(boyleVolumeMl[i] / 5.0f) * 5.0f;
+  }
+
+  const float vSpan = vTop - vBottom;
   const float pTop = pMax * 1.15f;
 
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
@@ -9308,14 +9324,14 @@ void refreshBoyleScreen()
   // information anyway.
   for (int i = 0; i < BOYLE_CURVE_POINTS; i++)
   {
-    const float v = vTop * ((float)(i + 1) / (float)BOYLE_CURVE_POINTS);
+    const float v = vBottom + vSpan * ((float)i / (float)(BOYLE_CURVE_POINTS - 1));
     const float pressure = k / v;
 
     if (pressure > pTop) continue;
 
     lv_chart_set_value_by_id2(
       boyleChart, boyleCurve, i,
-      (int)lroundf(v / vTop * 1000.0f),
+      (int)lroundf((v - vBottom) / vSpan * 1000.0f),
       (int)lroundf(pressure / pTop * 1000.0f)
     );
   }
@@ -9332,7 +9348,7 @@ void refreshBoyleScreen()
 
   for (int i = 0; i < boylePointCount; i++)
   {
-    const float fx = boyleVolumeMl[i] / vTop;
+    const float fx = (boyleVolumeMl[i] - vBottom) / vSpan;
     const float fy = boylePressureHpa[i] / pTop;
 
     lv_chart_set_value_by_id2(boyleChart, boyleSeries, i,
@@ -9385,7 +9401,8 @@ void refreshBoyleScreen()
 
     if (labelBoyleXTicks[i])
     {
-      snprintf(text, sizeof(text), "%.0f", vTop * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
+      snprintf(text, sizeof(text), "%.0f",
+               vBottom + vSpan * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
       lv_label_set_text(labelBoyleXTicks[i], text);
     }
 
@@ -9406,8 +9423,8 @@ void refreshBoyleScreen()
   if (labelBoyleHint)
   {
     char note[140];
-    snprintf(note, sizeof(note), "점 %d개 · 부피 최대 %.1f mL · 압력 최대 %.0f hPa",
-             boylePointCount, vMax, pMax);
+    snprintf(note, sizeof(note), "점 %d개 · 부피 %.0f~%.0f mL",
+             boylePointCount, vBottom, vTop);
     lv_label_set_text(labelBoyleHint, note);
   }
 }
@@ -9472,7 +9489,9 @@ void createBoyleUi()
   lv_obj_t *chartCard = makePanel(boyleScreen, BOYLE_CARD_X, BOYLE_CARD_Y,
                                   BOYLE_CARD_W, BOYLE_CARD_H);
 
-  makeSmallLabel(chartCard, "부피 - 압력", 18, 12, UI_TEXT_3);
+  // Both units live in the heading. As separate axis captions the volume one
+  // sat on top of the last tick value - "부피 (mL)" and "60" in the same place.
+  makeSmallLabel(chartCard, "부피(mL) - 압력(hPa)", 18, 12, UI_TEXT_3);
 
   boyleChart = lv_chart_create(chartCard);
   lv_obj_set_size(boyleChart, BOYLE_CHART_W, BOYLE_CHART_H);
@@ -9505,9 +9524,7 @@ void createBoyleUi()
     lv_obj_set_style_text_align(labelBoyleYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
   }
 
-  makeSmallLabel(chartCard, "부피 (mL)", BOYLE_CARD_W - 100,
-                 BOYLE_CHART_Y + BOYLE_CHART_H + 8, UI_TEXT_3);
-  makeSmallLabel(chartCard, "hPa", 6, 22, UI_TEXT_3);
+
 
   for (int i = 0; i < BOYLE_MAX_POINTS; i++)
   {
