@@ -148,6 +148,9 @@ bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, u
 bool bleLinkExplore(const char *address);
 
 // True while a slot is being explored rather than read.
+// Sends the next start-command candidate when one is due. Call once a second.
+void bleLinkServiceExploration();
+
 bool bleLinkSlotIsExploring(int slot);
 
 // A one-line summary of what the exploration has found so far, for the screen.

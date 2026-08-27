@@ -12728,6 +12728,7 @@ void loop()
     // A node appears on the home grid as soon as it links, so this has to run
     // on the clock rather than when the sensor changes - the tile is how the
     // sensor gets changed.
+    bleLinkServiceExploration();
     refreshHomeBleTiles();
     refreshHomeSensorTilesFor(activeSensorMode);
 
