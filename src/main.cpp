@@ -970,6 +970,9 @@ static volatile bool pendingBleScan = false;
 static volatile int pendingBleConnectIndex = -1;
 static volatile bool pendingBleDisconnect = false;
 static volatile int pendingBleDropSlot = -1;
+// Capturing the screen has to happen with the draw engine idle, so the button
+// only asks and the loop performs it.
+static volatile bool pendingScreenImage = false;
 
 // Rows are rebuilt on every refresh, so the addresses they connect to live
 // here and the row only carries an index.
@@ -9242,6 +9245,15 @@ static const char *saveScreenImage(const char *prefix, const char **error)
     return NULL;
   }
 
+  // 1024x600 at two bytes a pixel is 1.2 MB, and it comes from PSRAM.
+  const size_t needed = (size_t)LCD_H_RES * (size_t)LCD_V_RES * 2u;
+
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < needed)
+  {
+    *error = "메모리 부족: 화면을 캡처할 수 없습니다";
+    return NULL;
+  }
+
   lv_img_dsc_t *shot = lv_snapshot_take(screen, LV_IMG_CF_TRUE_COLOR);
 
   if (shot == NULL)
@@ -9356,18 +9368,11 @@ static void boyle_image_event_cb(lv_event_t *e)
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (labelBoyleHint == NULL) return;
 
+  // Only ask. lv_snapshot_take() drives the draw engine, and calling it from
+  // inside an event - which already runs inside lv_timer_handler - re-enters
+  // that engine and hangs the board. The loop does the work with LVGL idle.
   lv_label_set_text(labelBoyleHint, "화면을 저장하는 중...");
-  lv_refr_now(NULL);
-
-  const char *error = "";
-  const char *name = saveScreenImage("boyle", &error);
-
-  char note[120];
-
-  if (name) snprintf(note, sizeof(note), "%s 저장됨", name);
-  else snprintf(note, sizeof(note), "%s", error);
-
-  lv_label_set_text(labelBoyleHint, note);
+  pendingScreenImage = true;
 }
 
 static void go_boyle_event_cb(lv_event_t *e)
@@ -13526,6 +13531,24 @@ void loop()
     bleLinkServiceExploration();
 
     if (currentLoadedScreen == boyleScreen) refreshBoyleScreen();
+
+    if (pendingScreenImage)
+    {
+      pendingScreenImage = false;
+
+      // Let the "저장하는 중" line reach the glass before the board spends a
+      // couple of seconds writing two megabytes to the card.
+      uiTimerHandler();
+
+      const char *error = "";
+      const char *name = saveScreenImage("boyle", &error);
+
+      char note[120];
+      if (name) snprintf(note, sizeof(note), "%s 저장됨", name);
+      else snprintf(note, sizeof(note), "%s", error);
+
+      if (labelBoyleHint) lv_label_set_text(labelBoyleHint, note);
+    }
     refreshHomeBleTiles();
     refreshHomeSensorTilesFor(activeSensorMode);
 
