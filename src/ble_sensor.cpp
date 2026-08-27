@@ -550,6 +550,13 @@ typedef struct
   uint32_t payloadMs;
   bool hasReading;
   uint32_t notifyCount;
+
+  // Exploration: connected to learn what the device is, not to read it.
+  bool exploring;
+  int exploreServices;
+  int exploreChrs;
+  int exploreSubscribed;
+  char exploreSummary[64];
 } BleLink;
 
 static BleLink bleLinks[BLE_LINK_MAX_NODES];
@@ -597,6 +604,7 @@ static void bleLinkClear(int slot, const char *why, bool keepName)
   link->subscribed = false;
   link->busy = false;
   link->hasReading = false;
+  link->exploring = false;
 
   if (!keepName)
   {
@@ -643,6 +651,8 @@ static int bleLinkFreeSlot()
 
 static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
                             const struct ble_gatt_svc *service, void *arg);
+static int bleExploreOnSvc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_svc *service, void *arg);
 
 // Step 4: the subscription write came back.
 static int bleLinkOnSubscribed(uint16_t conn_handle, const struct ble_gatt_error *error,
@@ -794,6 +804,13 @@ static int bleLinkOnMtu(uint16_t conn_handle, const struct ble_gatt_error *error
   if (error->status == 0) blePrintf("slot %d: MTU is %u", slot, (unsigned)mtu);
   else blePrintf("slot %d: MTU exchange failed: %d, staying at 23", slot, error->status);
 
+  if (bleLinks[slot].exploring)
+  {
+    bleLinkSetState(slot, "서비스 검색 중");
+    ble_gattc_disc_all_svcs(conn_handle, bleExploreOnSvc, arg);
+    return 0;
+  }
+
   bleLinkSetState(slot, "서비스 검색 중");
   ble_gattc_disc_svc_by_uuid(conn_handle, &kServiceUuid.u, bleLinkOnService, arg);
   return 0;
@@ -821,8 +838,16 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
       {
         // Not fatal on its own; carry on at the default size.
         bleLinkSetState(slot, "서비스 검색 중");
-        ble_gattc_disc_svc_by_uuid(event->connect.conn_handle, &kServiceUuid.u,
-                                   bleLinkOnService, arg);
+
+        if (bleLinks[slot].exploring)
+        {
+          ble_gattc_disc_all_svcs(event->connect.conn_handle, bleExploreOnSvc, arg);
+        }
+        else
+        {
+          ble_gattc_disc_svc_by_uuid(event->connect.conn_handle, &kServiceUuid.u,
+                                     bleLinkOnService, arg);
+        }
       }
 
       return 0;
@@ -834,6 +859,35 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_RX:
     {
+      if (bleLinks[slot].exploring)
+      {
+        // Print it as bytes. Which of them carry the reading, and in what
+        // order and scale, is what these dumps are for.
+        uint8_t raw[64];
+        const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        const uint16_t copy = len < sizeof(raw) ? len : (uint16_t)sizeof(raw);
+
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, copy, NULL) == 0)
+        {
+          char hex[3 * sizeof(raw) + 1];
+          int used = 0;
+          for (uint16_t i = 0; i < copy && used < (int)sizeof(hex) - 3; i++)
+          {
+            used += snprintf(hex + used, sizeof(hex) - used, "%02X ", raw[i]);
+          }
+
+          blePrintf("explore: handle %u (%u bytes) %s",
+                    (unsigned)event->notify_rx.attr_handle, (unsigned)len, hex);
+
+          snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
+                   "h%u %ubyte %s", (unsigned)event->notify_rx.attr_handle,
+                   (unsigned)len, hex);
+        }
+
+        bleLinks[slot].notifyCount++;
+        return 0;
+      }
+
       if (event->notify_rx.attr_handle != bleLinks[slot].valueHandle) return 0;
 
       BleLink *link = &bleLinks[slot];
@@ -864,6 +918,126 @@ static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
     default:
       return 0;
   }
+}
+
+// ---- exploring an unknown device ------------------------------------------
+//
+// Discovery runs across the whole attribute range in one pass per kind, rather
+// than walking service by service. It is cruder than the targeted path used
+// for this project's own nodes, and it is the right shape here: nothing is
+// known yet, so everything is worth seeing.
+
+static void bleExploreSetSummary(int slot)
+{
+  if (!bleSlotValid(slot)) return;
+
+  snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
+           "서비스 %d · 특성 %d · 구독 %d",
+           bleLinks[slot].exploreServices,
+           bleLinks[slot].exploreChrs,
+           bleLinks[slot].exploreSubscribed);
+}
+
+static int bleExploreOnDsc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+  (void)chr_val_handle;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && dsc != NULL &&
+      ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16)
+  {
+    // Subscribe to everything that can notify. Which characteristic carries
+    // the reading is exactly what is not known yet.
+    const uint8_t enableNotify[2] = { 0x01, 0x00 };
+    if (ble_gattc_write_flat(conn_handle, dsc->handle, enableNotify,
+                             sizeof(enableNotify), NULL, NULL) == 0)
+    {
+      bleLinks[slot].exploreSubscribed++;
+      blePrintf("explore: subscribed via CCCD handle %u", (unsigned)dsc->handle);
+    }
+
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleExploreSetSummary(slot);
+  bleLinks[slot].busy = false;
+  bleLinkSetState(slot, "분석 완료 · 데이터 대기");
+  blePrintf("explore: done - %d service(s), %d characteristic(s), %d subscription(s)",
+            bleLinks[slot].exploreServices, bleLinks[slot].exploreChrs,
+            bleLinks[slot].exploreSubscribed);
+  return 0;
+}
+
+static int bleExploreOnChr(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_chr *chr, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && chr != NULL)
+  {
+    char uuid[BLE_UUID_STR_LEN];
+    ble_uuid_to_str(&chr->uuid.u, uuid);
+
+    // The property bits say which characteristic is worth listening to.
+    blePrintf("explore: chr %s handle=%u props=%s%s%s%s",
+              uuid, (unsigned)chr->val_handle,
+              (chr->properties & BLE_GATT_CHR_PROP_READ) ? "read " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_WRITE) ? "write " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) ? "notify " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_INDICATE) ? "indicate" : "");
+
+    bleLinks[slot].exploreChrs++;
+    bleExploreSetSummary(slot);
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleLinkSetState(slot, "구독 중");
+  ble_gattc_disc_all_dscs(conn_handle, 1, 0xFFFF, bleExploreOnDsc, arg);
+  return 0;
+}
+
+static int bleExploreOnSvc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_svc *service, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && service != NULL)
+  {
+    char uuid[BLE_UUID_STR_LEN];
+    ble_uuid_to_str(&service->uuid.u, uuid);
+    blePrintf("explore: service %s handles %u-%u", uuid,
+              (unsigned)service->start_handle, (unsigned)service->end_handle);
+
+    bleLinks[slot].exploreServices++;
+    bleExploreSetSummary(slot);
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleLinkSetState(slot, "특성 검색 중");
+  ble_gattc_disc_all_chrs(conn_handle, 1, 0xFFFF, bleExploreOnChr, arg);
+  return 0;
+}
+
+bool bleLinkSlotIsExploring(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].exploring;
+}
+
+const char *bleLinkExploreSummary(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].exploreSummary : "";
 }
 
 bool bleLinkConnect(const char *address)
@@ -933,7 +1107,11 @@ bool bleLinkConnect(const char *address)
   bleLinks[slot].busy = true;
   bleLinks[slot].hasReading = false;
   bleLinks[slot].notifyCount = 0;
-  bleLinkSetState(slot, "연결 중");
+  bleLinks[slot].exploreServices = 0;
+  bleLinks[slot].exploreChrs = 0;
+  bleLinks[slot].exploreSubscribed = 0;
+  bleLinks[slot].exploreSummary[0] = '\0';
+  bleLinkSetState(slot, bleLinks[slot].exploring ? "분석 연결 중" : "연결 중");
 
   const int rc = ble_gap_connect(bleAddrType, &peer, 10000, NULL,
                                  bleLinkGapEvent, (void *)(intptr_t)slot);
@@ -942,6 +1120,29 @@ bool bleLinkConnect(const char *address)
   {
     blePrintf("slot %d: ble_gap_connect failed: %d", slot, rc);
     bleLinkClear(slot, "연결 실패", true);
+    return false;
+  }
+
+  return true;
+}
+
+bool bleLinkExplore(const char *address)
+{
+  bleLinkInitAll();
+
+  const int existing = bleLinkSlotForAddress(address);
+  if (existing >= 0) bleLinkDisconnectSlot(existing);
+
+  const int slot = bleLinkFreeSlot();
+  if (slot < 0) return false;
+
+  // Set before connecting: the GAP callback reads it to decide which discovery
+  // to run.
+  bleLinks[slot].exploring = true;
+
+  if (!bleLinkConnect(address))
+  {
+    bleLinks[slot].exploring = false;
     return false;
   }
 
@@ -1148,5 +1349,8 @@ bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, u
   return false;
 }
 int bleAutoLinkToSensorNode() { return 0; }
+bool bleLinkExplore(const char *address) { (void)address; return false; }
+bool bleLinkSlotIsExploring(int slot) { (void)slot; return false; }
+const char *bleLinkExploreSummary(int slot) { (void)slot; return ""; }
 
 #endif  // BLE_SENSOR_SUPPORTED

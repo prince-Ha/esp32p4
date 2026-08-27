@@ -137,6 +137,22 @@ int bleLinkValueCount(int slot);
 // node from a slow one.
 bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs);
 
+// Connects to a device that is not one of this project's nodes and reports
+// what it exposes: every service, every characteristic and its properties, and
+// then the raw bytes of anything that will notify.
+//
+// This exists because a commercial sensor's protocol cannot be guessed. A
+// wrong UUID gives a link that never delivers; a wrong byte layout gives
+// numbers that look plausible and are not, which is worse. The device is asked
+// instead.
+bool bleLinkExplore(const char *address);
+
+// True while a slot is being explored rather than read.
+bool bleLinkSlotIsExploring(int slot);
+
+// A one-line summary of what the exploration has found so far, for the screen.
+const char *bleLinkExploreSummary(int slot);
+
 // Links to every node in the last scan that advertises this project's service
 // and is not already connected, so a hub power-cycled mid-lesson comes back
 // talking to the room rather than waiting for someone to tap a list. Returns

@@ -939,6 +939,9 @@ static volatile int pendingBleDropSlot = -1;
 // Rows are rebuilt on every refresh, so the addresses they connect to live
 // here and the row only carries an index.
 static char bleRowAddress[BLE_SCAN_MAX_RESULTS][18];
+// Whether that row advertises this project's service, which decides whether a
+// tap means "connect and read" or "tell me what you are".
+static bool bleRowIsSensorNode[BLE_SCAN_MAX_RESULTS];
 static lv_obj_t *labelBleLink = NULL;
 // Scanning bit-bangs the bus, so it runs from the loop, not a callback.
 static volatile bool pendingI2cScan = false;
@@ -8721,6 +8724,7 @@ void refreshBleScreen()
     if (rowCount < BLE_SCAN_MAX_RESULTS)
     {
       snprintf(bleRowAddress[rowCount], sizeof(bleRowAddress[rowCount]), "%s", r.address);
+      bleRowIsSensorNode[rowCount] = strstr(r.services, "6e5f0001") != NULL;
       lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
       lv_obj_add_event_cb(row, ble_row_event_cb, LV_EVENT_CLICKED,
                           (void *)(intptr_t)rowCount);
@@ -8737,8 +8741,16 @@ void refreshBleScreen()
 
     const bool isSensorNode = strstr(r.services, "6e5f0001") != NULL;
 
+    const int rowSlot = bleLinkSlotForAddress(r.address);
+
     lv_obj_t *detail = lv_label_create(row);
-    lv_label_set_text(detail, isSensorNode ? "이 보드용 센서 노드" : r.address);
+
+    if (isSensorNode) lv_label_set_text(detail, "이 보드용 센서 노드");
+    else if (rowSlot >= 0 && bleLinkSlotIsExploring(rowSlot))
+      lv_label_set_text(detail, bleLinkExploreSummary(rowSlot)[0]
+                                  ? bleLinkExploreSummary(rowSlot)
+                                  : bleLinkSlotState(rowSlot));
+    else lv_label_set_text(detail, "눌러서 분석");
     lv_obj_set_style_text_font(detail, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(detail,
                                 lv_color_hex(isSensorNode ? UI_OK : UI_TEXT_3), 0);
@@ -12758,9 +12770,22 @@ void loop()
           bleNodeRefreshMetadata();
           if (activeSensorMode == SENSOR_MODE_BLE) updateActiveSensorUiLabels();
         }
-        else
+        else if (bleRowIsSensorNode[index])
         {
           bleLinkConnect(bleRowAddress[index]);
+        }
+        else
+        {
+          // Not one of this project's nodes. Connecting to read it would need
+          // a protocol nobody here knows yet, so ask the device what it has.
+          if (bleLinkExplore(bleRowAddress[index]))
+          {
+            setIslStatusText("센서 분석 중: 서비스와 특성을 확인합니다");
+          }
+          else
+          {
+            setIslStatusText("분석 실패: 연결 슬롯이 없습니다");
+          }
         }
 
         refreshBleScreen();
