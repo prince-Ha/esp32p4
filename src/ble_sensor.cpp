@@ -1094,8 +1094,15 @@ static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t l
 
   if (values > 0)
   {
-    snprintf(link->exploreSummary, sizeof(link->exploreSummary), "%.4f",
-             blePascoValue(data + 3, 0));
+    // Both readings of the same four bytes: 16.16 as the reference library
+    // decodes it, and the low half on its own. One of them is the pressure and
+    // a single known value from the sensor's own app decides which.
+    const uint16_t low = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
+
+    blePrintf("pasco: field0 fixed=%.4f low16=%u", blePascoValue(data + 3, 0), (unsigned)low);
+
+    snprintf(link->exploreSummary, sizeof(link->exploreSummary), "%.4f / %u",
+             blePascoValue(data + 3, 0), (unsigned)low);
   }
 }
 
@@ -1127,15 +1134,12 @@ static void blePascoService(int slot)
 
     default:
     {
-      // Four bytes brought back one value that does not look like a pressure,
-      // so the sensor reports more than one quantity and the interesting one
-      // is further in. Walk the request size up until the replies stop growing
-      // - the field that moves when the pressure moves is the one wanted.
-      static const uint8_t kSizes[] = { 4, 8, 12, 16, 20, 24 };
-      const int sizeCount = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
-
-      link->pascoSampleBytes = kSizes[(link->pascoStep - 2) % sizeCount];
-      link->pascoStep++;
+      // Sixteen is everything this sensor has: asking for twenty or
+      // twenty-four returns sixteen just the same. Four fields, and only the
+      // first moved when the pressure did - the other three sat at
+      // 8192.2549, 8192.2090 and 4098.8579 through the whole run, which makes
+      // them configuration rather than measurement.
+      link->pascoSampleBytes = 16;
 
       const uint8_t sample[2] = { PASCO_CMD_READ_ONE_SAMPLE, link->pascoSampleBytes };
       blePascoSend(slot, 1, sample, 2);
