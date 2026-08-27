@@ -376,6 +376,7 @@ static void bleRecordScanResult(const struct ble_gap_disc_desc *disc)
 
   BleScanResult *r = &bleScanResults[slot];
   r->rssi = disc->rssi;
+  r->addrType = disc->addr.type;
 
   if (fields.name != NULL && fields.name_len > 0)
   {
@@ -1595,10 +1596,23 @@ bool bleLinkConnect(const char *address)
   // other way round.
   for (int i = 0; i < 6; i++) peer.val[i] = (uint8_t)b[5 - i];
 
-  // A random static address has its two top bits set. Read that from the
-  // address rather than trying one type and retrying, because ble_gap_connect
-  // accepts a wrong type and then simply times out.
+  // Use the type the advertisement carried. Deducing it from the address bits
+  // only recognises random-static; a sensor using a resolvable private address
+  // is deduced wrong, and ble_gap_connect accepts a wrong type and then simply
+  // fails - which is what the temperature sensor did on every attempt while
+  // the pressure sensor, on a public address, connected first time.
   peer.type = ((peer.val[5] & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strcmp(bleScanResults[i].address, address) == 0)
+    {
+      peer.type = bleScanResults[i].addrType;
+      break;
+    }
+  }
+
+  blePrintf("connecting to %s as addr type %d", address, (int)peer.type);
 
   snprintf(bleLinks[slot].peerAddress, sizeof(bleLinks[slot].peerAddress), "%s", address);
   snprintf(bleLinks[slot].peerName, sizeof(bleLinks[slot].peerName), "%s", address);

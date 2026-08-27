@@ -55,6 +55,10 @@ typedef struct
   char address[18];    // "aa:bb:cc:dd:ee:ff"
   char services[64];   // advertised service UUIDs, comma separated
   int rssi;
+  // The address type the advertisement actually carried. Guessing it from the
+  // address bits only catches random-static; a device using a resolvable
+  // private address is guessed wrong and the connection fails.
+  uint8_t addrType;
 } BleScanResult;
 
 // Starts a scan for `durationMs`. Results accumulate until the next scan.
