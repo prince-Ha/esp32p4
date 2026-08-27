@@ -1121,9 +1121,12 @@ static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t l
                     (PASCO_PRESSURE_X1 - PASCO_PRESSURE_X2);
     const float slope = (PASCO_PRESSURE_Y1 - b) / PASCO_PRESSURE_X1;
 
-    value = (slope * (float)raw + b) * PASCO_PSI_TO_KPA;
+    // hPa, not the kPa the datasheet names: it is what the DPS310 on this
+    // board reports, what 지능형 과학실 already accepts as PRS, and what puts
+    // both pressure sensors on one scale.
+    value = (slope * (float)raw + b) * PASCO_PSI_TO_KPA * 10.0f;
     name = "압력";
-    unit = "kPa";
+    unit = "hPa";
   }
   else if (link->pascoKind == PASCO_KIND_TEMPERATURE)
   {

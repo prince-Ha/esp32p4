@@ -1055,6 +1055,30 @@ static lv_obj_t *labelSettingsWifi;
 static lv_obj_t *labelSettingsSd;
 static lv_obj_t *labelSettingsCsv;
 static lv_obj_t *labelSettingsNote;
+// 보일의 법칙
+//
+// A time series is the wrong shape for this experiment: the quantity being
+// varied is the volume, and it is set by hand, one position at a time. So a
+// point is held deliberately - set the syringe, let the reading settle, record
+// it - and the graph is pressure against volume rather than against time.
+#define BOYLE_MAX_POINTS 20
+
+static float boyleVolumeMl[BOYLE_MAX_POINTS];
+static float boylePressureHpa[BOYLE_MAX_POINTS];
+static int boylePointCount = 0;
+static float boyleVolumeSetting = 20.0f;
+
+static lv_obj_t *boyleScreen;
+static lv_obj_t *boyleChart;
+static lv_chart_series_t *boyleSeries;
+static lv_obj_t *labelBoyleNow;
+static lv_obj_t *labelBoyleVolume;
+static lv_obj_t *labelBoyleHint;
+static lv_obj_t *tableBoyle;
+static lv_obj_t *labelBarBoyleTime;
+static lv_obj_t *labelBarBoyleWifi;
+static lv_obj_t *labelBarBoyleSd;
+
 static lv_obj_t *labelDeviceNote;
 static lv_obj_t *deviceScreen;
 static lv_obj_t *labelBarDeviceTime;
@@ -1191,6 +1215,7 @@ static void go_measure_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
 static void go_ble_event_cb(lv_event_t *e);
 static void go_device_event_cb(lv_event_t *e);
+static void go_boyle_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -8184,6 +8209,7 @@ void createMeasureUi()
 
   // Secondary actions, kept quiet so they do not compete with 시작/정지.
   makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
+  makeQuietButton(measureScreen, "보일의 법칙", railX, contentTop + 288, 126, 44, go_boyle_event_cb);
   makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
   // The primary control. Start is the accent; stop is the only red on screen,
@@ -8971,6 +8997,371 @@ void createDeviceUi()
   lv_label_set_long_mode(labelDeviceNote, LV_LABEL_LONG_WRAP);
 
   createTabBar(deviceScreen, TAB_DEVICE);
+}
+
+// The pressure being measured right now, in hPa, whichever sensor is
+// providing it - a DPS310 wired to this board, or a PASCO sensor over BLE.
+// Returns false when nothing on the board is measuring a pressure.
+bool currentPressureHpa(float *out)
+{
+  if (out == NULL) return false;
+
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+    {
+      if (strcmp(bleNodeUnit[i], "hPa") != 0) continue;
+
+      float value = NAN;
+      uint32_t ageMs = 0;
+
+      if (!bleLinkValueAt(bleValueSlot[i], bleValueIndex[i], &value, NULL, NULL, &ageMs)) continue;
+      if (ageMs > BLE_READING_MAX_AGE_MS || isnan(value)) continue;
+
+      *out = value;
+      return true;
+    }
+
+    return false;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_DPS310)
+  {
+    // The idle preview keeps this current whether or not a run is going.
+    if (previewValid && !isnan(previewValues[1]))
+    {
+      *out = previewValues[1];
+      return true;
+    }
+
+    if (sampleCount > 0 && pressureValueValid(pressureHistory[sampleCount - 1]))
+    {
+      *out = pressureHistory[sampleCount - 1];
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// =====================================================
+// 보일의 법칙
+// =====================================================
+
+void refreshBoyleScreen();
+
+static void boyle_volume_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  // The step rides on the button, so one handler serves all four.
+  const int step = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+
+  boyleVolumeSetting += (float)step * 0.1f;
+
+  if (boyleVolumeSetting < 0.1f) boyleVolumeSetting = 0.1f;
+  if (boyleVolumeSetting > 200.0f) boyleVolumeSetting = 200.0f;
+
+  refreshBoyleScreen();
+}
+
+static void boyle_record_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  if (boylePointCount >= BOYLE_MAX_POINTS)
+  {
+    if (labelBoyleHint) lv_label_set_text(labelBoyleHint, "점이 가득 찼습니다. 지우고 다시 시작하세요.");
+    return;
+  }
+
+  float pressure = NAN;
+
+  if (!currentPressureHpa(&pressure))
+  {
+    if (labelBoyleHint)
+    {
+      lv_label_set_text(labelBoyleHint,
+                        "압력을 읽을 수 없습니다. 압력 센서를 선택했는지 확인하세요.");
+    }
+    return;
+  }
+
+  // Overwrite a point already taken at this volume rather than storing the
+  // same x twice: a repeat is a correction, not a second reading.
+  int slot = boylePointCount;
+
+  for (int i = 0; i < boylePointCount; i++)
+  {
+    if (fabsf(boyleVolumeMl[i] - boyleVolumeSetting) < 0.05f)
+    {
+      slot = i;
+      break;
+    }
+  }
+
+  boyleVolumeMl[slot] = boyleVolumeSetting;
+  boylePressureHpa[slot] = pressure;
+  if (slot == boylePointCount) boylePointCount++;
+
+  Serial.printf("[BOYLE] %.1f mL -> %.1f hPa (PV=%.0f)\n",
+                boyleVolumeSetting, pressure, boyleVolumeSetting * pressure);
+
+  refreshBoyleScreen();
+}
+
+static void boyle_undo_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (boylePointCount > 0) boylePointCount--;
+  refreshBoyleScreen();
+}
+
+static void boyle_clear_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  boylePointCount = 0;
+  refreshBoyleScreen();
+}
+
+static void boyle_save_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (labelBoyleHint == NULL) return;
+
+  if (boylePointCount == 0)
+  {
+    lv_label_set_text(labelBoyleHint, "저장할 점이 없습니다.");
+    return;
+  }
+
+  if (!sdReady)
+  {
+    sdReady = initSdCard();
+    updateSdStatusLabels();
+  }
+
+  if (!sdReady)
+  {
+    lv_label_set_text(labelBoyleHint, "SD 카드를 읽을 수 없습니다.");
+    return;
+  }
+
+  char path[160];
+  snprintf(path, sizeof(path), "%s/boyle.csv", MOUNT_POINT);
+
+  FILE *file = fopen(path, "w");
+
+  if (file == NULL)
+  {
+    lv_label_set_text(labelBoyleHint, "boyle.csv를 만들 수 없습니다.");
+    return;
+  }
+
+  // P x V is the whole point of the experiment, so the file carries it rather
+  // than leaving every student to work it out by hand.
+  fprintf(file, "no,volume_mL,pressure_hPa,PV\n");
+
+  for (int i = 0; i < boylePointCount; i++)
+  {
+    fprintf(file, "%d,%.2f,%.2f,%.1f\n", i + 1, boyleVolumeMl[i],
+            boylePressureHpa[i], boyleVolumeMl[i] * boylePressureHpa[i]);
+  }
+
+  fclose(file);
+
+  char note[120];
+  snprintf(note, sizeof(note), "boyle.csv 저장됨: %d개 점", boylePointCount);
+  lv_label_set_text(labelBoyleHint, note);
+}
+
+static void go_boyle_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  requestScreenSwitch(boyleScreen);
+}
+
+void refreshBoyleScreen()
+{
+  if (boyleChart == NULL) return;
+
+  if (labelBoyleVolume)
+  {
+    char text[32];
+    snprintf(text, sizeof(text), "%.1f mL", boyleVolumeSetting);
+    lv_label_set_text(labelBoyleVolume, text);
+  }
+
+  if (labelBoyleNow)
+  {
+    float pressure = NAN;
+    char text[64];
+
+    if (currentPressureHpa(&pressure)) snprintf(text, sizeof(text), "%.1f hPa", pressure);
+    else snprintf(text, sizeof(text), "---- hPa");
+
+    lv_label_set_text(labelBoyleNow, text);
+  }
+
+  // ---- the table ------------------------------------------------------------
+  if (tableBoyle)
+  {
+    lv_table_set_cell_value(tableBoyle, 0, 0, "부피(mL)");
+    lv_table_set_cell_value(tableBoyle, 0, 1, "압력(hPa)");
+    lv_table_set_cell_value(tableBoyle, 0, 2, "P×V");
+
+    for (int r = 1; r <= 8; r++)
+    {
+      // Newest first: the point just taken is the one being checked.
+      const int index = boylePointCount - r;
+      char cell[24];
+
+      if (index < 0)
+      {
+        lv_table_set_cell_value(tableBoyle, r, 0, "-");
+        lv_table_set_cell_value(tableBoyle, r, 1, "-");
+        lv_table_set_cell_value(tableBoyle, r, 2, "-");
+        continue;
+      }
+
+      snprintf(cell, sizeof(cell), "%.1f", boyleVolumeMl[index]);
+      lv_table_set_cell_value(tableBoyle, r, 0, cell);
+      snprintf(cell, sizeof(cell), "%.1f", boylePressureHpa[index]);
+      lv_table_set_cell_value(tableBoyle, r, 1, cell);
+      snprintf(cell, sizeof(cell), "%.0f", boyleVolumeMl[index] * boylePressureHpa[index]);
+      lv_table_set_cell_value(tableBoyle, r, 2, cell);
+    }
+  }
+
+  // ---- the graph ------------------------------------------------------------
+  lv_chart_set_all_value(boyleChart, boyleSeries, LV_CHART_POINT_NONE);
+
+  if (boylePointCount == 0)
+  {
+    lv_chart_refresh(boyleChart);
+    return;
+  }
+
+  float vMin = boyleVolumeMl[0], vMax = boyleVolumeMl[0];
+  float pMin = boylePressureHpa[0], pMax = boylePressureHpa[0];
+
+  for (int i = 1; i < boylePointCount; i++)
+  {
+    if (boyleVolumeMl[i] < vMin) vMin = boyleVolumeMl[i];
+    if (boyleVolumeMl[i] > vMax) vMax = boyleVolumeMl[i];
+    if (boylePressureHpa[i] < pMin) pMin = boylePressureHpa[i];
+    if (boylePressureHpa[i] > pMax) pMax = boylePressureHpa[i];
+  }
+
+  // A single point, or several at one pressure, would otherwise divide by zero.
+  if (vMax - vMin < 0.1f) { vMin -= 1.0f; vMax += 1.0f; }
+  if (pMax - pMin < 1.0f) { pMin -= 10.0f; pMax += 10.0f; }
+
+  lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
+  lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
+
+  for (int i = 0; i < boylePointCount; i++)
+  {
+    const int x = (int)lroundf((boyleVolumeMl[i] - vMin) / (vMax - vMin) * 1000.0f);
+    const int y = (int)lroundf((boylePressureHpa[i] - pMin) / (pMax - pMin) * 1000.0f);
+    lv_chart_set_value_by_id2(boyleChart, boyleSeries, i, x, y);
+  }
+
+  lv_chart_refresh(boyleChart);
+
+  if (labelBoyleHint)
+  {
+    char note[140];
+    snprintf(note, sizeof(note),
+             "점 %d개 · 부피 %.1f~%.1f mL · 압력 %.0f~%.0f hPa",
+             boylePointCount, vMin, vMax, pMin, pMax);
+    lv_label_set_text(labelBoyleHint, note);
+  }
+}
+
+void createBoyleUi()
+{
+  boyleScreen = lv_obj_create(NULL);
+  lv_obj_set_size(boyleScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(boyleScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(boyleScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(boyleScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(boyleScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  createStatusBar(boyleScreen, "", &labelBarBoyleTime, &labelBarBoyleWifi, &labelBarBoyleSd);
+
+  makeHeading(boyleScreen, "보일의 법칙", 28, 58, UI_TEXT);
+  makeQuietButton(boyleScreen, "측정 화면", 828, 60, 168, 44, go_measure_event_cb);
+
+  // ---- setting the volume ---------------------------------------------------
+  lv_obj_t *setup = makePanel(boyleScreen, 28, 104, 460, 190);
+
+  makeSmallLabel(setup, "부피를 맞추고, 값이 안정되면 기록하세요", 20, 14, UI_TEXT_3);
+
+  labelBoyleVolume = makeHeading(setup, "20.0 mL", 20, 40, UI_TEXT);
+
+  struct VolumeStep { const char *text; int step; int x; };
+  const VolumeStep steps[4] = {
+    { "-5", -50, 20 }, { "-0.5", -5, 100 }, { "+0.5", 5, 200 }, { "+5", 50, 300 }
+  };
+
+  for (int i = 0; i < 4; i++)
+  {
+    lv_obj_t *b = makeQuietButton(setup, steps[i].text, steps[i].x, 84, 76, 46,
+                                  boyle_volume_event_cb);
+    lv_obj_set_user_data(b, (void *)(intptr_t)steps[i].step);
+  }
+
+  makeSmallLabel(setup, "현재 압력", 20, 146, UI_TEXT_3);
+  labelBoyleNow = makeLabel(setup, "---- hPa", 110, 142, UI_ACCENT);
+
+  // ---- the points -----------------------------------------------------------
+  makePrimaryButton(boyleScreen, "이 부피로 기록", 28, 306, 220, 56, UI_ACCENT,
+                    boyle_record_event_cb);
+  makeQuietButton(boyleScreen, "되돌리기", 258, 306, 110, 56, boyle_undo_event_cb);
+  makeQuietButton(boyleScreen, "모두 지우기", 378, 306, 110, 56, boyle_clear_event_cb);
+
+  tableBoyle = lv_table_create(boyleScreen);
+  lv_obj_set_size(tableBoyle, 460, 152);
+  lv_obj_align(tableBoyle, LV_ALIGN_TOP_LEFT, 28, 374);
+  lv_obj_set_style_text_font(tableBoyle, FONT_KR_SMALL, 0);
+  lv_obj_set_style_border_width(tableBoyle, 0, 0);
+  lv_obj_set_style_bg_color(tableBoyle, lv_color_hex(UI_SURFACE), 0);
+  lv_table_set_col_cnt(tableBoyle, 3);
+  lv_table_set_row_cnt(tableBoyle, 9);
+  lv_table_set_col_width(tableBoyle, 0, 150);
+  lv_table_set_col_width(tableBoyle, 1, 150);
+  lv_table_set_col_width(tableBoyle, 2, 150);
+  lv_obj_clear_flag(tableBoyle, LV_OBJ_FLAG_SCROLLABLE);
+
+  // ---- pressure against volume ----------------------------------------------
+  lv_obj_t *chartCard = makePanel(boyleScreen, 504, 104, 492, 350);
+
+  makeSmallLabel(chartCard, "부피 - 압력", 18, 12, UI_TEXT_3);
+
+  boyleChart = lv_chart_create(chartCard);
+  lv_obj_set_size(boyleChart, 440, 280);
+  lv_obj_align(boyleChart, LV_ALIGN_TOP_LEFT, 26, 40);
+  lv_obj_set_style_bg_color(boyleChart, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_border_width(boyleChart, 0, 0);
+  lv_obj_set_style_line_color(boyleChart, lv_color_hex(UI_LINE), LV_PART_MAIN);
+  lv_obj_set_style_size(boyleChart, 6, LV_PART_INDICATOR);
+
+  // Scatter, because the volume is chosen rather than swept: the points do not
+  // arrive evenly spaced and must not be drawn as though they did.
+  lv_chart_set_type(boyleChart, LV_CHART_TYPE_SCATTER);
+  lv_chart_set_point_count(boyleChart, BOYLE_MAX_POINTS);
+  lv_chart_set_div_line_count(boyleChart, 5, 5);
+  boyleSeries = lv_chart_add_series(boyleChart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+
+  labelBoyleHint = makeSmallLabel(boyleScreen, "부피를 정하고 [이 부피로 기록]을 누르세요.",
+                                  504, 466, UI_TEXT_3);
+  lv_obj_set_width(labelBoyleHint, 492);
+  lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
+
+  makeQuietButton(boyleScreen, "CSV 저장", 504, 500, 150, 40, boyle_save_event_cb);
+
+  createTabBar(boyleScreen, TAB_MEASURE);
 }
 
 void createSettingsUi()
@@ -12583,6 +12974,7 @@ void setup()
   createSettingsUi();
   createBleUi();
   createDeviceUi();
+  createBoyleUi();
   createCsvUi();
   createFileViewerUi();
   createIslUi();
@@ -12774,6 +13166,8 @@ void loop()
     // on the clock rather than when the sensor changes - the tile is how the
     // sensor gets changed.
     bleLinkServiceExploration();
+
+    if (currentLoadedScreen == boyleScreen) refreshBoyleScreen();
     refreshHomeBleTiles();
     refreshHomeSensorTilesFor(activeSensorMode);
 
