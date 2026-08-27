@@ -1066,7 +1066,10 @@ static lv_obj_t *labelSettingsNote;
 static float boyleVolumeMl[BOYLE_MAX_POINTS];
 static float boylePressureHpa[BOYLE_MAX_POINTS];
 static int boylePointCount = 0;
+// A syringe experiment runs 20 to 60 mL, so that is where the setting starts
+// and what the axis is sized for even before the first point is taken.
 static float boyleVolumeSetting = 20.0f;
+#define BOYLE_VOLUME_TYPICAL_MAX 60.0f
 
 static lv_obj_t *boyleScreen;
 static lv_obj_t *boyleChart;
@@ -1079,6 +1082,17 @@ static lv_obj_t *labelBoyleHint;
 // values and a label on each measured point.
 #define BOYLE_CURVE_POINTS 60
 #define BOYLE_AXIS_TICKS 5
+
+// The graph takes most of the screen: the shape of the curve is the result of
+// the experiment, and it was being read from a panel a third of this size.
+#define BOYLE_CARD_X 344
+#define BOYLE_CARD_Y 104
+#define BOYLE_CARD_W 652
+#define BOYLE_CARD_H 430
+#define BOYLE_CHART_X 44
+#define BOYLE_CHART_Y 44
+#define BOYLE_CHART_W 586
+#define BOYLE_CHART_H 336
 
 static lv_chart_series_t *boyleCurve;
 static lv_obj_t *labelBoyleXTicks[BOYLE_AXIS_TICKS];
@@ -9280,7 +9294,8 @@ void refreshBoyleScreen()
   // panel, but a hyperbola only looks like one against its asymptotes: cropped
   // to the measured range it flattens into a slightly sloped line, which is
   // exactly what made the shape hard to see.
-  const float vTop = vMax * 1.15f;
+  float vTop = vMax * 1.15f;
+  if (vTop < BOYLE_VOLUME_TYPICAL_MAX * 1.15f) vTop = BOYLE_VOLUME_TYPICAL_MAX * 1.15f;
   const float pTop = pMax * 1.15f;
 
   lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
@@ -9311,6 +9326,10 @@ void refreshBoyleScreen()
   const lv_coord_t chartX = lv_obj_get_x(boyleChart);
   const lv_coord_t chartY = lv_obj_get_y(boyleChart);
 
+  lv_coord_t placedX[BOYLE_MAX_POINTS];
+  lv_coord_t placedY[BOYLE_MAX_POINTS];
+  int placed = 0;
+
   for (int i = 0; i < boylePointCount; i++)
   {
     const float fx = boyleVolumeMl[i] / vTop;
@@ -9322,21 +9341,39 @@ void refreshBoyleScreen()
 
     if (labelBoylePointText[i] == NULL) continue;
 
-    char text[24];
-    snprintf(text, sizeof(text), "%.1f / %.0f", boyleVolumeMl[i], boylePressureHpa[i]);
-    lv_label_set_text(labelBoylePointText[i], text);
-    lv_obj_clear_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
-
-    // Sat just above and left of the point; nudged back inside when the point
-    // is near an edge, so a label never leaves the panel.
-    lv_coord_t lx = chartX + (lv_coord_t)(fx * chartW) - 24;
-    lv_coord_t ly = chartY + chartH - (lv_coord_t)(fy * chartH) - 20;
+    // Sat just above and left of the point, nudged back inside near an edge.
+    lv_coord_t lx = chartX + (lv_coord_t)(fx * chartW) - 26;
+    lv_coord_t ly = chartY + chartH - (lv_coord_t)(fy * chartH) - 22;
 
     if (lx < chartX - 20) lx = chartX - 20;
-    if (lx > chartX + chartW - 50) lx = chartX + chartW - 50;
+    if (lx > chartX + chartW - 56) lx = chartX + chartW - 56;
     if (ly < chartY - 4) ly = chartY - 4;
 
+    // Points bunch up where the curve is flat, and labels printed on top of
+    // each other are worse than no labels: the table has every number anyway.
+    // So a label is only drawn where there is room for it.
+    bool room = true;
+
+    for (int j = 0; j < placed; j++)
+    {
+      if (labs(lx - placedX[j]) < 62 && labs(ly - placedY[j]) < 20)
+      {
+        room = false;
+        break;
+      }
+    }
+
+    if (!room) continue;
+
+    char text[24];
+    snprintf(text, sizeof(text), "%.0f / %.0f", boyleVolumeMl[i], boylePressureHpa[i]);
+    lv_label_set_text(labelBoylePointText[i], text);
+    lv_obj_clear_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_pos(labelBoylePointText[i], lx, ly);
+
+    placedX[placed] = lx;
+    placedY[placed] = ly;
+    placed++;
   }
 
   lv_chart_refresh(boyleChart);
@@ -9390,7 +9427,7 @@ void createBoyleUi()
   makeQuietButton(boyleScreen, "측정 화면", 828, 60, 168, 44, go_measure_event_cb);
 
   // ---- setting the volume ---------------------------------------------------
-  lv_obj_t *setup = makePanel(boyleScreen, 28, 104, 460, 190);
+  lv_obj_t *setup = makePanel(boyleScreen, 28, 104, 300, 190);
 
   makeSmallLabel(setup, "부피를 맞추고, 값이 안정되면 기록하세요", 20, 14, UI_TEXT_3);
 
@@ -9398,12 +9435,12 @@ void createBoyleUi()
 
   struct VolumeStep { const char *text; int step; int x; };
   const VolumeStep steps[4] = {
-    { "-5", -50, 20 }, { "-0.5", -5, 100 }, { "+0.5", 5, 200 }, { "+5", 50, 300 }
+    { "-5", -50, 18 }, { "-1", -10, 84 }, { "+1", 10, 150 }, { "+5", 50, 216 }
   };
 
   for (int i = 0; i < 4; i++)
   {
-    lv_obj_t *b = makeQuietButton(setup, steps[i].text, steps[i].x, 84, 76, 46,
+    lv_obj_t *b = makeQuietButton(setup, steps[i].text, steps[i].x, 84, 62, 46,
                                   boyle_volume_event_cb);
     lv_obj_set_user_data(b, (void *)(intptr_t)steps[i].step);
   }
@@ -9412,33 +9449,34 @@ void createBoyleUi()
   labelBoyleNow = makeLabel(setup, "---- hPa", 110, 142, UI_ACCENT);
 
   // ---- the points -----------------------------------------------------------
-  makePrimaryButton(boyleScreen, "이 부피로 기록", 28, 306, 220, 56, UI_ACCENT,
+  makePrimaryButton(boyleScreen, "이 부피로 기록", 28, 306, 300, 56, UI_ACCENT,
                     boyle_record_event_cb);
-  makeQuietButton(boyleScreen, "되돌리기", 258, 306, 110, 56, boyle_undo_event_cb);
-  makeQuietButton(boyleScreen, "모두 지우기", 378, 306, 110, 56, boyle_clear_event_cb);
+  makeQuietButton(boyleScreen, "되돌리기", 28, 370, 145, 44, boyle_undo_event_cb);
+  makeQuietButton(boyleScreen, "지우기", 183, 370, 145, 44, boyle_clear_event_cb);
 
   tableBoyle = lv_table_create(boyleScreen);
-  lv_obj_set_size(tableBoyle, 460, 152);
-  lv_obj_align(tableBoyle, LV_ALIGN_TOP_LEFT, 28, 374);
+  lv_obj_set_size(tableBoyle, 300, 118);
+  lv_obj_align(tableBoyle, LV_ALIGN_TOP_LEFT, 28, 424);
   lv_obj_set_style_text_font(tableBoyle, FONT_KR_SMALL, 0);
   lv_obj_set_style_border_width(tableBoyle, 0, 0);
   lv_obj_set_style_bg_color(tableBoyle, lv_color_hex(UI_SURFACE), 0);
   lv_table_set_col_cnt(tableBoyle, 4);
   lv_table_set_row_cnt(tableBoyle, 1);
-  lv_table_set_col_width(tableBoyle, 0, 60);
-  lv_table_set_col_width(tableBoyle, 1, 130);
-  lv_table_set_col_width(tableBoyle, 2, 130);
-  lv_table_set_col_width(tableBoyle, 3, 120);
+  lv_table_set_col_width(tableBoyle, 0, 42);
+  lv_table_set_col_width(tableBoyle, 1, 78);
+  lv_table_set_col_width(tableBoyle, 2, 90);
+  lv_table_set_col_width(tableBoyle, 3, 88);
   lv_obj_set_scrollbar_mode(tableBoyle, LV_SCROLLBAR_MODE_AUTO);
 
   // ---- pressure against volume ----------------------------------------------
-  lv_obj_t *chartCard = makePanel(boyleScreen, 504, 104, 492, 350);
+  lv_obj_t *chartCard = makePanel(boyleScreen, BOYLE_CARD_X, BOYLE_CARD_Y,
+                                  BOYLE_CARD_W, BOYLE_CARD_H);
 
   makeSmallLabel(chartCard, "부피 - 압력", 18, 12, UI_TEXT_3);
 
   boyleChart = lv_chart_create(chartCard);
-  lv_obj_set_size(boyleChart, 440, 280);
-  lv_obj_align(boyleChart, LV_ALIGN_TOP_LEFT, 26, 40);
+  lv_obj_set_size(boyleChart, BOYLE_CHART_W, BOYLE_CHART_H);
+  lv_obj_align(boyleChart, LV_ALIGN_TOP_LEFT, BOYLE_CHART_X, BOYLE_CHART_Y);
   lv_obj_set_style_bg_color(boyleChart, lv_color_hex(UI_SURFACE), 0);
   lv_obj_set_style_border_width(boyleChart, 0, 0);
   lv_obj_set_style_line_color(boyleChart, lv_color_hex(UI_LINE), LV_PART_MAIN);
@@ -9457,17 +9495,19 @@ void createBoyleUi()
   // Axis values, drawn as plain labels the way the measurement screen does.
   for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
   {
-    const int x = 26 + (i + 1) * 440 / BOYLE_AXIS_TICKS;
-    labelBoyleXTicks[i] = makeSmallLabel(chartCard, "", x - 14, 324, UI_TEXT_3);
+    const int x = BOYLE_CHART_X + (i + 1) * BOYLE_CHART_W / BOYLE_AXIS_TICKS;
+    labelBoyleXTicks[i] = makeSmallLabel(chartCard, "", x - 14, BOYLE_CHART_Y + BOYLE_CHART_H + 8,
+                                         UI_TEXT_3);
 
-    const int y = 40 + 280 - (i + 1) * 280 / BOYLE_AXIS_TICKS;
+    const int y = BOYLE_CHART_Y + BOYLE_CHART_H - (i + 1) * BOYLE_CHART_H / BOYLE_AXIS_TICKS;
     labelBoyleYTicks[i] = makeSmallLabel(chartCard, "", 0, y - 8, UI_TEXT_3);
-    lv_obj_set_width(labelBoyleYTicks[i], 24);
+    lv_obj_set_width(labelBoyleYTicks[i], BOYLE_CHART_X - 8);
     lv_obj_set_style_text_align(labelBoyleYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
   }
 
-  makeSmallLabel(chartCard, "부피 (mL)", 400, 324, UI_TEXT_3);
-  makeSmallLabel(chartCard, "hPa", 0, 22, UI_TEXT_3);
+  makeSmallLabel(chartCard, "부피 (mL)", BOYLE_CARD_W - 100,
+                 BOYLE_CHART_Y + BOYLE_CHART_H + 8, UI_TEXT_3);
+  makeSmallLabel(chartCard, "hPa", 6, 22, UI_TEXT_3);
 
   for (int i = 0; i < BOYLE_MAX_POINTS; i++)
   {
@@ -9475,16 +9515,16 @@ void createBoyleUi()
     lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
   }
 
-  labelBoyleConstant = makeSmallLabel(boyleScreen, "", 504, 466, UI_TEXT_2);
-  lv_obj_set_width(labelBoyleConstant, 492);
+  labelBoyleConstant = makeSmallLabel(boyleScreen, "", BOYLE_CARD_X, 542 - 2, UI_TEXT_2);
+  lv_obj_set_width(labelBoyleConstant, 490);
   lv_label_set_long_mode(labelBoyleConstant, LV_LABEL_LONG_CLIP);
 
   labelBoyleHint = makeSmallLabel(boyleScreen, "부피를 정하고 [이 부피로 기록]을 누르세요.",
-                                  504, 488, UI_TEXT_3);
-  lv_obj_set_width(labelBoyleHint, 492);
+                                  28, 542 - 2, UI_TEXT_3);
+  lv_obj_set_width(labelBoyleHint, 300);
   lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
 
-  makeQuietButton(boyleScreen, "CSV 저장", 838, 484, 158, 44, boyle_save_event_cb);
+  makeQuietButton(boyleScreen, "CSV 저장", 838, 60, 158, 44, boyle_save_event_cb);
 
   createTabBar(boyleScreen, TAB_MEASURE);
 }
