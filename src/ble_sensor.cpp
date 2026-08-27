@@ -1073,8 +1073,16 @@ static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t l
   const int payloadLen = len - 3;
   const int values = payloadLen / 4;
 
-  char line[128];
-  int used = snprintf(line, sizeof(line), "pasco: sample %d value(s):", values);
+  char line[192];
+  int used = snprintf(line, sizeof(line), "pasco: ask %u -> %d byte(s) [",
+                      (unsigned)link->pascoSampleBytes, payloadLen);
+
+  for (int i = 0; i < payloadLen && used < (int)sizeof(line) - 4; i++)
+  {
+    used += snprintf(line + used, sizeof(line) - used, "%02X ", data[3 + i]);
+  }
+
+  used += snprintf(line + used, sizeof(line) - used, "] =");
 
   for (int i = 0; i < values && used < (int)sizeof(line) - 16; i++)
   {
@@ -1119,8 +1127,16 @@ static void blePascoService(int slot)
 
     default:
     {
-      // A pressure sensor reports one quantity, so four bytes is the natural
-      // ask; the reply says how much actually came back.
+      // Four bytes brought back one value that does not look like a pressure,
+      // so the sensor reports more than one quantity and the interesting one
+      // is further in. Walk the request size up until the replies stop growing
+      // - the field that moves when the pressure moves is the one wanted.
+      static const uint8_t kSizes[] = { 4, 8, 12, 16, 20, 24 };
+      const int sizeCount = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
+
+      link->pascoSampleBytes = kSizes[(link->pascoStep - 2) % sizeCount];
+      link->pascoStep++;
+
       const uint8_t sample[2] = { PASCO_CMD_READ_ONE_SAMPLE, link->pascoSampleBytes };
       blePascoSend(slot, 1, sample, 2);
       link->pascoNextStepMs = millis() + 1000;
