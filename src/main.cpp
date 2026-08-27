@@ -9206,6 +9206,164 @@ static void boyle_save_event_cb(lv_event_t *e)
   lv_label_set_text(labelBoyleHint, note);
 }
 
+// Writes what is on the screen to the SD card as a BMP.
+//
+// BMP because it needs no encoder: a header and the pixels, bottom row first,
+// three bytes each. A lab report wants the whole screen rather than the graph
+// alone - the table beside it carries the numbers the graph is drawn from.
+//
+// Returns the name written, or NULL with `error` set.
+static const char *saveScreenImage(const char *prefix, const char **error)
+{
+  static char savedName[64];
+
+  if (!sdReady)
+  {
+    sdReady = initSdCard();
+    updateSdStatusLabels();
+  }
+
+  if (!sdReady)
+  {
+    *error = "SD 카드를 읽을 수 없습니다";
+    return NULL;
+  }
+
+  lv_obj_t *screen = lv_scr_act();
+  if (screen == NULL)
+  {
+    *error = "화면을 읽을 수 없습니다";
+    return NULL;
+  }
+
+  lv_img_dsc_t *shot = lv_snapshot_take(screen, LV_IMG_CF_TRUE_COLOR);
+
+  if (shot == NULL)
+  {
+    *error = "화면 캡처 실패: 메모리 부족";
+    return NULL;
+  }
+
+  const int width = shot->header.w;
+  const int height = shot->header.h;
+  const int rowBytes = width * 3;
+  const int padding = (4 - (rowBytes % 4)) % 4;
+  const uint32_t pixelBytes = (uint32_t)(rowBytes + padding) * (uint32_t)height;
+
+  // A run of these should not overwrite each other, so the name counts up.
+  static int shotNumber = 0;
+  char path[160];
+
+  for (int attempt = 0; attempt < 100; attempt++)
+  {
+    shotNumber++;
+    snprintf(savedName, sizeof(savedName), "%s_%d.bmp", prefix, shotNumber);
+    snprintf(path, sizeof(path), "%s/%s", MOUNT_POINT, savedName);
+
+    struct stat st;
+    if (stat(path, &st) != 0) break;
+  }
+
+  FILE *file = fopen(path, "wb");
+
+  if (file == NULL)
+  {
+    lv_snapshot_free(shot);
+    *error = "파일을 만들 수 없습니다";
+    return NULL;
+  }
+
+  const uint32_t offset = 14 + 40;
+  const uint32_t fileSize = offset + pixelBytes;
+
+  uint8_t header[54];
+  memset(header, 0, sizeof(header));
+
+  header[0] = 'B'; header[1] = 'M';
+  memcpy(header + 2, &fileSize, 4);
+  memcpy(header + 10, &offset, 4);
+
+  const uint32_t dibSize = 40;
+  const int32_t w32 = width;
+  const int32_t h32 = height;
+  const uint16_t planes = 1;
+  const uint16_t bpp = 24;
+
+  memcpy(header + 14, &dibSize, 4);
+  memcpy(header + 18, &w32, 4);
+  memcpy(header + 22, &h32, 4);
+  memcpy(header + 26, &planes, 2);
+  memcpy(header + 28, &bpp, 2);
+  memcpy(header + 34, &pixelBytes, 4);
+
+  bool ok = fwrite(header, 1, sizeof(header), file) == sizeof(header);
+
+  // The snapshot is RGB565; BMP wants 8 bits per channel, bottom row first.
+  const uint16_t *pixels = (const uint16_t *)shot->data;
+  uint8_t *row = (uint8_t *)heap_caps_malloc(rowBytes + padding, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (row == NULL)
+  {
+    ok = false;
+  }
+  else
+  {
+    memset(row, 0, rowBytes + padding);
+
+    for (int y = height - 1; y >= 0 && ok; y--)
+    {
+      const uint16_t *src = pixels + (size_t)y * (size_t)width;
+
+      for (int x = 0; x < width; x++)
+      {
+        const uint16_t c = src[x];
+        const uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
+        const uint8_t g = (uint8_t)(((c >> 5) & 0x3F) * 255 / 63);
+        const uint8_t b = (uint8_t)((c & 0x1F) * 255 / 31);
+
+        row[x * 3 + 0] = b;   // BMP stores blue first
+        row[x * 3 + 1] = g;
+        row[x * 3 + 2] = r;
+      }
+
+      ok = fwrite(row, 1, rowBytes + padding, file) == (size_t)(rowBytes + padding);
+    }
+
+    heap_caps_free(row);
+  }
+
+  fclose(file);
+  lv_snapshot_free(shot);
+
+  if (!ok)
+  {
+    *error = "저장 중 오류가 났습니다";
+    return NULL;
+  }
+
+  Serial.printf("[IMAGE] %s (%dx%d)\n", path, width, height);
+  return savedName;
+}
+
+static void boyle_image_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (labelBoyleHint == NULL) return;
+
+  lv_label_set_text(labelBoyleHint, "화면을 저장하는 중...");
+  lv_refr_now(NULL);
+
+  const char *error = "";
+  const char *name = saveScreenImage("boyle", &error);
+
+  char note[120];
+
+  if (name) snprintf(note, sizeof(note), "%s 저장됨", name);
+  else snprintf(note, sizeof(note), "%s", error);
+
+  lv_label_set_text(labelBoyleHint, note);
+}
+
 static void go_boyle_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -9541,7 +9699,8 @@ void createBoyleUi()
   lv_obj_set_width(labelBoyleHint, 300);
   lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
 
-  makeQuietButton(boyleScreen, "CSV 저장", 838, 60, 158, 44, boyle_save_event_cb);
+  makeQuietButton(boyleScreen, "CSV 저장", 672, 60, 148, 44, boyle_save_event_cb);
+  makeQuietButton(boyleScreen, "사진 저장", 838, 60, 158, 44, boyle_image_event_cb);
 
   createTabBar(boyleScreen, TAB_MEASURE);
 }
