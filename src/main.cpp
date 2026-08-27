@@ -6598,6 +6598,8 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == fileViewerScreen) return UI_BG;
   if (screen == islScreen) return UI_BG;
   if (screen == bleScreen) return UI_BG;
+  if (screen == deviceScreen) return UI_BG;
+  if (screen == boyleScreen) return UI_BG;
   return 0x0B1020;
 }
 
@@ -9300,6 +9302,9 @@ static bool boyleRegisterSensorTypes()
 
 void boyleUploadToIsl()
 {
+  Serial.printf("[BOYLE] upload requested: %d point(s), wifi=%d, modum=%d\n",
+                boylePointCount, wifiConnected ? 1 : 0, cloudModumConfigured() ? 1 : 0);
+
   if (labelBoyleHint == NULL) return;
 
   if (boylePointCount == 0)
@@ -9652,19 +9657,16 @@ void refreshBoyleScreen()
     }
   }
 
+  // The summary lives on its own line. It used to be written to the hint,
+  // once a second, over the top of whatever 전송 or 저장 had just reported -
+  // so a message about WiFi or a 모둠코드 was gone before it could be read,
+  // and the button looked like it had done nothing at all.
   if (labelBoyleConstant)
   {
-    char text[64];
-    snprintf(text, sizeof(text), "P×V 평균 %.0f · 곡선은 P = %.0f / V", k, k);
+    char text[110];
+    snprintf(text, sizeof(text), "점 %d개 · 부피 %.0f~%.0f mL · P×V 평균 %.0f · 곡선 P = %.0f / V",
+             boylePointCount, vBottom, vTop, k, k);
     lv_label_set_text(labelBoyleConstant, text);
-  }
-
-  if (labelBoyleHint)
-  {
-    char note[140];
-    snprintf(note, sizeof(note), "점 %d개 · 부피 %.0f~%.0f mL",
-             boylePointCount, vBottom, vTop);
-    lv_label_set_text(labelBoyleHint, note);
   }
 }
 
@@ -9680,7 +9682,7 @@ void createBoyleUi()
   createStatusBar(boyleScreen, "", &labelBarBoyleTime, &labelBarBoyleWifi, &labelBarBoyleSd);
 
   makeHeading(boyleScreen, "보일의 법칙", 28, 58, UI_TEXT);
-  makeQuietButton(boyleScreen, "측정 화면", 828, 60, 168, 44, go_measure_event_cb);
+  makeQuietButton(boyleScreen, "측정 화면", 496, 60, 164, 44, go_measure_event_cb);
 
   // ---- setting the volume ---------------------------------------------------
   lv_obj_t *setup = makePanel(boyleScreen, 28, 104, 300, 190);
@@ -9771,13 +9773,14 @@ void createBoyleUi()
     lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
   }
 
-  labelBoyleConstant = makeSmallLabel(boyleScreen, "", BOYLE_CARD_X, 542 - 2, UI_TEXT_2);
-  lv_obj_set_width(labelBoyleConstant, 490);
+  labelBoyleConstant = makeSmallLabel(boyleScreen, "", BOYLE_CARD_X, 540, UI_TEXT_2);
+  lv_obj_set_width(labelBoyleConstant, BOYLE_CARD_W);
   lv_label_set_long_mode(labelBoyleConstant, LV_LABEL_LONG_CLIP);
 
   labelBoyleHint = makeSmallLabel(boyleScreen, "부피를 정하고 [이 부피로 기록]을 누르세요.",
-                                  28, 542 - 2, UI_TEXT_3);
+                                  28, 540, UI_TEXT_3);
   lv_obj_set_width(labelBoyleHint, 300);
+  lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_DOT);
   lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
 
   makeQuietButton(boyleScreen, "CSV 저장", 672, 60, 148, 44, boyle_save_event_cb);
