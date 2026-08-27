@@ -970,9 +970,9 @@ static volatile bool pendingBleScan = false;
 static volatile int pendingBleConnectIndex = -1;
 static volatile bool pendingBleDisconnect = false;
 static volatile int pendingBleDropSlot = -1;
-// Capturing the screen has to happen with the draw engine idle, so the button
-// only asks and the loop performs it.
-static volatile bool pendingScreenImage = false;
+// Uploading blocks for as long as there are points, so the button only asks.
+static volatile bool pendingBoyleUpload = false;
+
 
 // Rows are rebuilt on every refresh, so the addresses they connect to live
 // here and the row only carries an index.
@@ -9215,164 +9215,223 @@ static void boyle_save_event_cb(lv_event_t *e)
   lv_label_set_text(labelBoyleHint, note);
 }
 
-// Writes what is on the screen to the SD card as a BMP.
+// The 지능형 과학실 helpers live with the rest of the upload code, well below
+// this screen.
+bool extractJsonStringValue(const String &json, const char *key, char *out, size_t outLen);
+bool httpPostJsonReliable(const char *url, const String &payload, String *response,
+                          const char *label, int maxAttempts, int delayMs);
+bool httpPostJsonReliableCode(const char *url, const String &payload, String *response,
+                             const char *label, const char *ok1, const char *ok2,
+                             const char *ok3);
+String jsonEscapeString(const char *text);
+void formatDirectAxisTick(uint32_t timeS, char *out, size_t outSize);
+bool directIslStartProcess(const char *modumId);
+bool directIslSetStatusOnIfNeeded();
+
+// Sends the recorded points to 지능형 과학실.
 //
-// BMP because it needs no encoder: a header and the pixels, bottom row first,
-// three bytes each. A lab report wants the whole screen rather than the graph
-// alone - the table beside it carries the numbers the graph is drawn from.
-//
-// Returns the name written, or NULL with `error` set.
-static const char *saveScreenImage(const char *prefix, const char **error)
+// The platform's data model is a value against a time, so the point number
+// stands in for the time: the points go up in the order they were taken, and
+// the volume that produced each one travels as its own sensor type alongside
+// the pressure. Whether the platform will take a volume at all is the open
+// question - the 2026-07-21 appendix has no code for one - so the candidates
+// are tried in turn the way the distance sensor's already are, and the
+// pressure goes up regardless.
+static const char *kBoyleVolumeTypes[] = { "VOLM", "VLM", "VOL", "VOLU" };
+static char boyleVolumeSensorType[8] = "";
+
+static bool boyleRegisterSensorTypes()
 {
-  static char savedName[64];
+  const int candidateCount = (int)(sizeof(kBoyleVolumeTypes) / sizeof(kBoyleVolumeTypes[0]));
 
-  if (!sdReady)
+  for (int i = 0; i <= candidateCount; i++)
   {
-    sdReady = initSdCard();
-    updateSdStatusLabels();
+    // The last pass registers pressure alone, for a platform that will not
+    // take a volume under any name.
+    const bool withVolume = i < candidateCount;
+    const char *volumeType = withVolume ? kBoyleVolumeTypes[i] : NULL;
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":";
+    payload += withVolume ? 2 : 1;
+    payload += ",\"items\":[";
+    payload += "{\"sensorType\":\"PRS\",\"sensorNicNm\":\"기압센서\",\"channelCode\":\"02\"}";
+
+    if (withVolume)
+    {
+      payload += ",{\"sensorType\":\"";
+      payload += volumeType;
+      payload += "\",\"sensorNicNm\":\"부피센서\",\"channelCode\":\"01\"}";
+    }
+
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response,
+                              "BOYLE_TYPE", 2, 700))
+    {
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      snprintf(boyleVolumeSensorType, sizeof(boyleVolumeSensorType), "%s",
+               withVolume ? volumeType : "");
+
+      if (withVolume) Serial.printf("[BOYLE] volume accepted as %s\n", volumeType);
+      else Serial.println("[BOYLE] no volume type accepted; sending pressure only");
+
+      return true;
+    }
+
+    Serial.print("[BOYLE] sensor type refused: ");
+    Serial.println(response);
   }
 
-  if (!sdReady)
+  return false;
+}
+
+void boyleUploadToIsl()
+{
+  if (labelBoyleHint == NULL) return;
+
+  if (boylePointCount == 0)
   {
-    *error = "SD 카드를 읽을 수 없습니다";
-    return NULL;
+    lv_label_set_text(labelBoyleHint, "전송할 점이 없습니다.");
+    return;
   }
 
-  lv_obj_t *screen = lv_scr_act();
-  if (screen == NULL)
+  if (!cloudModumConfigured())
   {
-    *error = "화면을 읽을 수 없습니다";
-    return NULL;
+    lv_label_set_text(labelBoyleHint, "모둠코드를 먼저 입력하세요.");
+    return;
   }
 
-  // 1024x600 at two bytes a pixel is 1.2 MB, and it comes from PSRAM.
-  const size_t needed = (size_t)LCD_H_RES * (size_t)LCD_V_RES * 2u;
-
-  if (heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) < needed)
+  if (!ensureWifiReadyForHttp("보일전송", 20000))
   {
-    *error = "메모리 부족: 화면을 캡처할 수 없습니다";
-    return NULL;
+    lv_label_set_text(labelBoyleHint, "WiFi가 연결되어 있지 않습니다.");
+    return;
   }
 
-  lv_img_dsc_t *shot = lv_snapshot_take(screen, LV_IMG_CF_TRUE_COLOR);
+  char modumId[64];
+  copyCurrentModumIdTo(modumId, sizeof(modumId));
 
-  if (shot == NULL)
+  // A fresh session: these points are one experiment, not a continuation of
+  // whatever the measurement screen was last doing.
+  resetDirectIslSessionCache("boyle upload");
+
+  if (!directIslStartProcess(modumId))
   {
-    *error = "화면 캡처 실패: 메모리 부족";
-    return NULL;
+    lv_label_set_text(labelBoyleHint, "탐구 시작 요청 실패");
+    return;
   }
 
-  const int width = shot->header.w;
-  const int height = shot->header.h;
-  const int rowBytes = width * 3;
-  const int padding = (4 - (rowBytes % 4)) % 4;
-  const uint32_t pixelBytes = (uint32_t)(rowBytes + padding) * (uint32_t)height;
-
-  // A run of these should not overwrite each other, so the name counts up.
-  static int shotNumber = 0;
-  char path[160];
-
-  for (int attempt = 0; attempt < 100; attempt++)
+  if (!boyleRegisterSensorTypes())
   {
-    shotNumber++;
-    snprintf(savedName, sizeof(savedName), "%s_%d.bmp", prefix, shotNumber);
-    snprintf(path, sizeof(path), "%s/%s", MOUNT_POINT, savedName);
-
-    struct stat st;
-    if (stat(path, &st) != 0) break;
+    lv_label_set_text(labelBoyleHint, "센서등록 실패");
+    return;
   }
 
-  FILE *file = fopen(path, "wb");
+  directIslSensorTypeOk = true;
 
-  if (file == NULL)
+  if (!directIslSetStatusOnIfNeeded())
   {
-    lv_snapshot_free(shot);
-    *error = "파일을 만들 수 없습니다";
-    return NULL;
+    lv_label_set_text(labelBoyleHint, "상태 전환 실패");
+    return;
   }
 
-  const uint32_t offset = 14 + 40;
-  const uint32_t fileSize = offset + pixelBytes;
+  int sent = 0;
 
-  uint8_t header[54];
-  memset(header, 0, sizeof(header));
-
-  header[0] = 'B'; header[1] = 'M';
-  memcpy(header + 2, &fileSize, 4);
-  memcpy(header + 10, &offset, 4);
-
-  const uint32_t dibSize = 40;
-  const int32_t w32 = width;
-  const int32_t h32 = height;
-  const uint16_t planes = 1;
-  const uint16_t bpp = 24;
-
-  memcpy(header + 14, &dibSize, 4);
-  memcpy(header + 18, &w32, 4);
-  memcpy(header + 22, &h32, 4);
-  memcpy(header + 26, &planes, 2);
-  memcpy(header + 28, &bpp, 2);
-  memcpy(header + 34, &pixelBytes, 4);
-
-  bool ok = fwrite(header, 1, sizeof(header), file) == sizeof(header);
-
-  // The snapshot is RGB565; BMP wants 8 bits per channel, bottom row first.
-  const uint16_t *pixels = (const uint16_t *)shot->data;
-  uint8_t *row = (uint8_t *)heap_caps_malloc(rowBytes + padding, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-  if (row == NULL)
+  for (int i = 0; i < boylePointCount; i++)
   {
-    ok = false;
+    char axisTick[24];
+    formatDirectAxisTick((uint32_t)(i + 1), axisTick, sizeof(axisTick));
+
+    char pressure[24];
+    char volume[24];
+    snprintf(pressure, sizeof(pressure), "%.4f", boylePressureHpa[i]);
+    snprintf(volume, sizeof(volume), "%.4f", boyleVolumeMl[i]);
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"items\":[";
+    payload += "{\"sensorType\":\"PRS\",\"sensorNicNm\":\"기압센서\",\"channelCode\":\"02\",\"sensorData\":\"";
+    payload += pressure;
+    payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+    payload += axisTick;
+    payload += "\",\"collectUnit\":\"hPa\"}";
+
+    if (boyleVolumeSensorType[0])
+    {
+      payload += ",{\"sensorType\":\"";
+      payload += boyleVolumeSensorType;
+      payload += "\",\"sensorNicNm\":\"부피센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+      payload += volume;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"mL\"}";
+    }
+
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliableCode(DIRECT_ISL_DATA_URL, payload, &response, "BOYLE_DATA",
+                                  "001", NULL, NULL))
+    {
+      break;
+    }
+
+    sent++;
+
+    // The screen says how far it has got: twenty points is twenty round trips.
+    char progress[80];
+    snprintf(progress, sizeof(progress), "전송 중 %d/%d", sent, boylePointCount);
+    lv_label_set_text(labelBoyleHint, progress);
+    uiTimerHandler();
+  }
+
+  char note[140];
+
+  if (sent == boylePointCount)
+  {
+    if (boyleVolumeSensorType[0])
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (압력 PRS · 부피 %s)",
+               sent, boyleVolumeSensorType);
+    }
+    else
+    {
+      snprintf(note, sizeof(note),
+               "전송 완료: %d개 점 · 압력만 (부피 코드를 서버가 받지 않음)", sent);
+    }
   }
   else
   {
-    memset(row, 0, rowBytes + padding);
-
-    for (int y = height - 1; y >= 0 && ok; y--)
-    {
-      const uint16_t *src = pixels + (size_t)y * (size_t)width;
-
-      for (int x = 0; x < width; x++)
-      {
-        const uint16_t c = src[x];
-        const uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
-        const uint8_t g = (uint8_t)(((c >> 5) & 0x3F) * 255 / 63);
-        const uint8_t b = (uint8_t)((c & 0x1F) * 255 / 31);
-
-        row[x * 3 + 0] = b;   // BMP stores blue first
-        row[x * 3 + 1] = g;
-        row[x * 3 + 2] = r;
-      }
-
-      ok = fwrite(row, 1, rowBytes + padding, file) == (size_t)(rowBytes + padding);
-    }
-
-    heap_caps_free(row);
+    snprintf(note, sizeof(note), "전송 중단: %d/%d개만 전송됨", sent, boylePointCount);
   }
 
-  fclose(file);
-  lv_snapshot_free(shot);
-
-  if (!ok)
-  {
-    *error = "저장 중 오류가 났습니다";
-    return NULL;
-  }
-
-  Serial.printf("[IMAGE] %s (%dx%d)\n", path, width, height);
-  return savedName;
+  lv_label_set_text(labelBoyleHint, note);
+  Serial.printf("[BOYLE] %s\n", note);
 }
 
-static void boyle_image_event_cb(lv_event_t *e)
+static void boyle_send_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (labelBoyleHint == NULL) return;
 
-  // Only ask. lv_snapshot_take() drives the draw engine, and calling it from
-  // inside an event - which already runs inside lv_timer_handler - re-enters
-  // that engine and hangs the board. The loop does the work with LVGL idle.
-  lv_label_set_text(labelBoyleHint, "화면을 저장하는 중...");
-  pendingScreenImage = true;
+  // The network work is long and blocking, so the button only asks.
+  lv_label_set_text(labelBoyleHint, "지능형 과학실로 전송 중...");
+  pendingBoyleUpload = true;
 }
 
 static void go_boyle_event_cb(lv_event_t *e)
@@ -9722,7 +9781,7 @@ void createBoyleUi()
   lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
 
   makeQuietButton(boyleScreen, "CSV 저장", 672, 60, 148, 44, boyle_save_event_cb);
-  makeQuietButton(boyleScreen, "사진 저장", 838, 60, 158, 44, boyle_image_event_cb);
+  makePrimaryButton(boyleScreen, "전송", 838, 60, 158, 44, UI_ACCENT, boyle_send_event_cb);
 
   createTabBar(boyleScreen, TAB_MEASURE);
 }
@@ -13532,22 +13591,13 @@ void loop()
 
     if (currentLoadedScreen == boyleScreen) refreshBoyleScreen();
 
-    if (pendingScreenImage)
+    if (pendingBoyleUpload)
     {
-      pendingScreenImage = false;
+      pendingBoyleUpload = false;
 
-      // Let the "저장하는 중" line reach the glass before the board spends a
-      // couple of seconds writing two megabytes to the card.
+      // Let the "전송 중" line reach the glass before the network work starts.
       uiTimerHandler();
-
-      const char *error = "";
-      const char *name = saveScreenImage("boyle", &error);
-
-      char note[120];
-      if (name) snprintf(note, sizeof(note), "%s 저장됨", name);
-      else snprintf(note, sizeof(note), "%s", error);
-
-      if (labelBoyleHint) lv_label_set_text(labelBoyleHint, note);
+      boyleUploadToIsl();
     }
     refreshHomeBleTiles();
     refreshHomeSensorTilesFor(activeSensorMode);

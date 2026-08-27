@@ -665,10 +665,7 @@
  *----------*/
 
 /*1: Enable API to take snapshot for object*/
-/* Rendering a screen into a buffer, so the board can save what is on it to the
- * SD card. The buffer comes from LVGL's allocator, which is PSRAM here, so a
- * full 1024x600 snapshot costs nothing that matters. */
-#define LV_USE_SNAPSHOT 1
+#define LV_USE_SNAPSHOT 0
 
 /*1: Enable Monkey test*/
 #define LV_USE_MONKEY   0
