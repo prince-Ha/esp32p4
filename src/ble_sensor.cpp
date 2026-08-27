@@ -567,7 +567,11 @@ typedef struct
 
   // The characteristic that takes commands, and how far through the candidate
   // list this link has got.
-  uint16_t exploreCommandHandle;
+  // Every characteristic that both takes writes and notifies. Both PASCO
+  // services have one, and the live one - the channel already streaming status
+  // - is as likely to be the way in as the silent one.
+  uint16_t exploreCommandHandles[4];
+  int exploreCommandCount;
   int exploreProbeIndex;
   unsigned long exploreNextProbeMs;
 } BleLink;
@@ -934,6 +938,19 @@ static void bleExploreSetSummary(int slot)
 
 static void bleExploreReadNext(uint16_t conn_handle, int slot);
 
+// A write that is refused says why, and the reason narrows the search: a
+// length complaint fixes the command length, "not permitted" rules the
+// characteristic out entirely.
+static int bleExploreOnWrite(uint16_t conn_handle, const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg)
+{
+  (void)conn_handle; (void)arg;
+
+  blePrintf("explore: write to handle %u -> status %d",
+            attr ? (unsigned)attr->handle : 0, error->status);
+  return 0;
+}
+
 // Openers to try on a sensor that has been connected and subscribed and still
 // says nothing.
 //
@@ -1022,7 +1039,7 @@ static void bleExploreReadNext(uint16_t conn_handle, int slot)
   {
     link->busy = false;
 
-    if (link->exploreCommandHandle != 0)
+    if (link->exploreCommandCount > 0)
     {
       link->exploreProbeIndex = 0;
       link->exploreNextProbeMs = millis();
@@ -1110,9 +1127,10 @@ static int bleExploreOnChr(uint16_t conn_handle, const struct ble_gatt_error *er
     // number, so another PASCO part lands on its own.
     if ((chr->properties & BLE_GATT_CHR_PROP_WRITE) &&
         (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) &&
-        chr->val_handle > bleLinks[slot].exploreCommandHandle)
+        bleLinks[slot].exploreCommandCount < (int)(sizeof(bleLinks[slot].exploreCommandHandles) /
+                                                   sizeof(bleLinks[slot].exploreCommandHandles[0])))
     {
-      bleLinks[slot].exploreCommandHandle = chr->val_handle;
+      bleLinks[slot].exploreCommandHandles[bleLinks[slot].exploreCommandCount++] = chr->val_handle;
     }
 
     if ((chr->properties & BLE_GATT_CHR_PROP_READ) &&
@@ -1172,17 +1190,22 @@ void bleLinkServiceExploration()
 
     if (!link->exploring) continue;
     if (link->exploreProbeIndex < 0 || link->exploreProbeIndex >= probeCount) continue;
-    if (link->exploreCommandHandle == 0) continue;
+    if (link->exploreCommandCount == 0) continue;
     if (link->connHandle == BLE_HS_CONN_HANDLE_NONE) continue;
     if ((long)(millis() - link->exploreNextProbeMs) < 0) continue;
 
     const BleProbeCommand *cmd = &kBleProbeCommands[link->exploreProbeIndex];
 
-    blePrintf("explore: trying opener %s on handle %u",
-              cmd->note, (unsigned)link->exploreCommandHandle);
+    // Each opener goes to every command-shaped characteristic; which one is
+    // the way in is part of what is being established.
+    for (int i = 0; i < link->exploreCommandCount; i++)
+    {
+      blePrintf("explore: trying opener %s on handle %u",
+                cmd->note, (unsigned)link->exploreCommandHandles[i]);
 
-    ble_gattc_write_flat(link->connHandle, link->exploreCommandHandle,
-                         cmd->bytes, cmd->len, NULL, NULL);
+      ble_gattc_write_flat(link->connHandle, link->exploreCommandHandles[i],
+                           cmd->bytes, cmd->len, bleExploreOnWrite, NULL);
+    }
 
     snprintf(link->exploreSummary, sizeof(link->exploreSummary),
              "명령 시도 %s", cmd->note);
@@ -1282,7 +1305,7 @@ bool bleLinkConnect(const char *address)
   bleLinks[slot].exploreSubscribed = 0;
   bleLinks[slot].exploreReadCount = 0;
   bleLinks[slot].exploreReadIndex = 0;
-  bleLinks[slot].exploreCommandHandle = 0;
+  bleLinks[slot].exploreCommandCount = 0;
   bleLinks[slot].exploreProbeIndex = -1;
   bleLinks[slot].exploreSummary[0] = '\0';
   bleLinkSetState(slot, bleLinks[slot].exploring ? "분석 연결 중" : "연결 중");
