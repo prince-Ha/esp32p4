@@ -1,9 +1,12 @@
 # ESP32-P4 LVGL Dashboard Firmware
 
-PlatformIO/Arduino firmware for an ESP32-P4 board driving a 1024x600 LCD
-touch dashboard for school science probes. It combines an LVGL UI, eight
-selectable sensors, SD card logging, and upload to 지능형 과학실, with Korean
-font rendering support.
+PlatformIO/Arduino firmware for an ESP32-P4 board driving a 1024x600 LCD touch
+dashboard for school science probes, used by students and teachers together.
+
+Sensors reach it three ways - wired to the board, over BLE from an ESP32 node,
+or over BLE from a commercial PASCO sensor - and from the measurement screen's
+point of view there is no difference between them. Readings go to the screen,
+to CSV on an SD card, and to 지능형 과학실.
 
 ## Features
 
@@ -25,9 +28,30 @@ font rendering support.
 
   설정 → **센서 검색** walks the I2C bus and lists what actually answers,
   which is the first thing to try when a sensor reads nothing.
+- **Tabs**: 홈 · 측정 · 기록 · 블루투스 · WiFi · 설정. 블루투스 and WiFi are
+  where a lesson actually goes wrong - a node that dropped, a network that did
+  not join - so they are one tap from anywhere rather than buried in 설정.
+- **Wireless sensors**: up to three at once over BLE, each appearing on the
+  home grid like a sensor wired to the board. Two kinds are supported:
+
+  | Kind | What it is | Reports |
+  |---|---|---|
+  | `SciNode-XXXX` | an ESP32 running [`sensor_node/`](sensor_node/) | whatever sensor is plugged into it |
+  | `Pressure 581-124` | PASCO PS-3203 | hPa |
+  | `Temperature 171-753` | PASCO PS-3201 | °C |
+
+  All connected nodes are recorded together, so pressure from one sensor and
+  temperature from another fill two columns of one experiment.
+
+- **보일의 법칙**: a second view for the pressure sensor, reached from the
+  measurement screen. The volume is set by hand and each point is held
+  deliberately - set the syringe, let the reading settle, record it - so the
+  graph is pressure against volume rather than against time, with the fitted
+  P = k/V drawn through the points and P x V beside every row.
+
 - **Data logging**: measurement sessions can be recorded to CSV on an
-  SD/SDMMC card, previewed on-device, and uploaded to the cloud in
-  real-time or batch mode over Wi-Fi/HTTP(S).
+  SD/SDMMC card, previewed on-device, and uploaded to 지능형 과학실 in
+  real-time or batch mode over Wi-Fi/HTTPS.
 - **Korean font support**: `src/korean_14.c` and `src/korean_16.c` carry the
   full Hangul block; `src/korean_24_bold.c`, `src/digits_64.c` and
   `src/digits_48.c` are subsets cut from Malgun Gothic Bold by
@@ -57,9 +81,26 @@ linked nodes appear on the 블루투스 tab with their current reading; tapping 
 makes it the node being recorded. Only one at a time is: the sample buffers,
 the CSV and the 지능형 과학실 session each describe a single experiment.
 
-The node ships sending an obvious 0-100 test ramp. Replace `readNodeSensor()`
-at the bottom of [`sensor_node/src/main.cpp`](sensor_node/src/main.cpp) with a
-real sensor read - it is the only function meant to be edited.
+The node works out for itself what is plugged into it, so swapping the sensor
+needs no code change on either board:
+
+| Address | Part | Reports |
+|---|---|---|
+| 0x76 / 0x77 | DPS310 | 온도, 기압 |
+| 0x48 | TMP117 | 정밀온도 |
+| 0x62 | SCD41 | 이산화탄소, 온도, 습도 |
+| 0x40 | INA228 | 전류, 전압, 전력 |
+| 0x29 | TSL2591 **or** VL53L1X | 조도 / 거리 |
+| - | DS18B20 | 수온 (1-Wire; the pin is searched for) |
+
+0x29 belongs to two parts, so it is settled by reading each one's ID register.
+A sensor swapped while the node is running is noticed within three seconds -
+the address stops acknowledging - and the P4 follows because every packet
+carries its own names and units.
+
+The drivers in [`sensor_node/src/sensors.cpp`](sensor_node/src/sensors.cpp) are
+the P4's own, ported to `Wire` with their register sequences and compensation
+unchanged, so a part reads the same number whichever board it hangs off.
 
 Two things to know about the payload, which is one line of
 `<time_s>,<sensor>,<value>,<unit>`:
@@ -87,6 +128,32 @@ back about 150 kB of internal RAM: building all eight screens no longer moves
 the internal figure at all. An upload also refuses, with a message, if the
 largest DMA block is under 56 kB, so a shortage says so instead of restarting
 the board. `logHeapState()` prints the figures before every POST.
+
+## PASCO wireless sensors
+
+The P4 connects to these directly; no node is involved. Their protocol is
+published in PASCO's own [BLE examples](https://github.com/phasematching/pasco-BLE-examples)
+and the `pasco-ble` library that ships the datasheets:
+
+```
+4a5c000<service>-000<char>-0000-0000-5c1e741f1c00
+  service 0 = the device, 1 = the attached sensor
+  char    2 = commands, written without response
+          3 = replies and events
+
+0x05, <bytes>  one sample
+replies begin 0xC0: status, echoed command, payload
+```
+
+The sample is two bytes of raw ADC and the reading comes from the datasheet's
+own calibration - a two-point factory fit for the PS-3203, a linear conversion
+for the PS-3201. Pressure is published in hPa rather than the datasheet's kPa,
+so it shares a scale with the DPS310 and the verified `PRS` upload code.
+
+Tapping a device on the 블루투스 tab that is not one of this project's nodes
+explores it instead: every service, every characteristic and its properties,
+and the raw bytes of anything that notifies. That is how the above was
+established, and it is what to reach for when a new make of sensor turns up.
 
 ## Hardware pinout
 
