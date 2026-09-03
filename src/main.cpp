@@ -770,11 +770,54 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define REALTIME_DIRECT_ISL_ENABLED 1
 #define DIRECT_ISL_AXIS_PADDED 1
 
-#define DIRECT_ISL_START_URL "https://api-scion.kosac.re.kr/sensorapi/startExplortProcess"
-#define DIRECT_ISL_SENSOR_TYPE_URL "https://api-scion.kosac.re.kr/sensorapi/sendSensorType"
-#define DIRECT_ISL_STATUS_URL "https://api-scion.kosac.re.kr/sensorapi/setExplortProcessStatus"
-#define DIRECT_ISL_DATA_URL "https://api-scion.kosac.re.kr/sensorapi/sendExplortData"
-#define DIRECT_ISL_STOP_URL "https://api-scion.kosac.re.kr/sensorapi/stopExplortProcess"
+// 지능형 과학실은 같은 API를 두 곳에 두고 있습니다. 시연과 점검은 테스트 서버에서
+// 하고 실제 수업은 운영 서버로 보내는데, 경로는 같고 호스트만 다릅니다. 그래서
+// 주소를 붙박이 문자열로 두지 않고 고른 호스트로 다시 조립합니다. 시연 때문에
+// 펌웨어를 다시 굽는 일이 없어야 합니다.
+#define ISL_HOST_PROD "api-scion.kosac.re.kr"
+#define ISL_HOST_TEST "testapi-scion.kosac.re.kr"
+
+static bool islUseTestServer = false;
+static char islApiHost[64] = ISL_HOST_PROD;
+
+static char islUrlStart[144];
+static char islUrlSensorType[144];
+static char islUrlStatus[144];
+static char islUrlData[144];
+static char islUrlStop[144];
+
+// 주소를 쓰는 스무 곳은 매크로 이름 그대로 남습니다. 서버를 바꾸는 일은 여기
+// 한 곳에서 끝나야 하고, 호출하는 쪽은 어느 서버인지 몰라도 됩니다.
+#define DIRECT_ISL_START_URL islUrlStart
+#define DIRECT_ISL_SENSOR_TYPE_URL islUrlSensorType
+#define DIRECT_ISL_STATUS_URL islUrlStatus
+#define DIRECT_ISL_DATA_URL islUrlData
+#define DIRECT_ISL_STOP_URL islUrlStop
+
+static void islBuildApiUrls()
+{
+  snprintf(islApiHost, sizeof(islApiHost), "%s",
+           islUseTestServer ? ISL_HOST_TEST : ISL_HOST_PROD);
+
+  struct IslEndpoint { char *slot; size_t size; const char *path; };
+
+  const IslEndpoint endpoints[] = {
+    { islUrlStart,      sizeof(islUrlStart),      "startExplortProcess" },
+    { islUrlSensorType, sizeof(islUrlSensorType), "sendSensorType" },
+    { islUrlStatus,     sizeof(islUrlStatus),     "setExplortProcessStatus" },
+    { islUrlData,       sizeof(islUrlData),       "sendExplortData" },
+    { islUrlStop,       sizeof(islUrlStop),       "stopExplortProcess" }
+  };
+
+  for (size_t i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++)
+  {
+    snprintf(endpoints[i].slot, endpoints[i].size, "https://%s/sensorapi/%s",
+             islApiHost, endpoints[i].path);
+  }
+
+  Serial.printf("[ISL] server = %s (%s)\n", islApiHost,
+                islUseTestServer ? "테스트" : "운영");
+}
 
 // HTTPS 전송 안정화 설정
 // 1초마다 HTTPS를 새로 연결하면 TLS handshake 때문에 실패할 수 있습니다.
@@ -1041,6 +1084,7 @@ static lv_obj_t *homeIslModuleTa;
 static lv_obj_t *islServiceKeyTa;
 static lv_obj_t *labelHomeIsl;
 static lv_obj_t *labelCloudMode;
+static lv_obj_t *labelIslServer;
 static lv_obj_t *homeCsvFileTa;
 static lv_obj_t *labelHomeCsv;
 static lv_obj_t *labelHomeCsvPath;
@@ -1231,6 +1275,9 @@ bool isBatchUploading();
 void requestBatchUiRefresh();
 void serviceLightweightBatchUi();
 void resetDirectIslSessionCache(const char *reason);
+// Switches server, and with it the stored key, because the two servers issue
+// their own. `persist` is false only while restoring the saved choice at boot.
+void islApplyServerChoice(bool useTest, bool persist);
 bool ensureWifiReadyForHttp(const char *context, int waitMs);
 bool wifiReadyForHttp();
 void httpCloseConnection(const char *reason);
@@ -7047,6 +7094,36 @@ static void dashboard_isl_stop_event_cb(lv_event_t *e)
   updateIslStatusLabels();
 }
 
+void updateIslServerLabel()
+{
+  if (!labelIslServer) return;
+
+  const bool haveKey = strlen(islServiceKey) > 0 &&
+                       strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0;
+
+  char text[160];
+  snprintf(text, sizeof(text), "%s / %s", islApiHost,
+           haveKey ? "인증키 있음" : "인증키 없음");
+
+  lv_label_set_text(labelIslServer, text);
+}
+
+static void dashboard_isl_server_prod_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  islApplyServerChoice(false, true);
+  setIslStatusText("전송: 운영 서버");
+  updateIslStatusLabels();
+}
+
+static void dashboard_isl_server_test_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  islApplyServerChoice(true, true);
+  setIslStatusText("전송: 테스트 서버");
+  updateIslStatusLabels();
+}
+
 static void dashboard_cloud_realtime_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -8302,7 +8379,7 @@ void createIslUi()
   makeHeading(islScreen, "전송 설정", 28, 58, UI_TEXT);
   makeSmallLabel(islScreen, "지능형 과학실 ON으로 측정값을 보내기 위한 값입니다.", 28, 92, UI_TEXT_3);
 
-  lv_obj_t *card = makePanel(islScreen, 28, 124, 968, 250);
+  lv_obj_t *card = makePanel(islScreen, 28, 124, 968, 304);
 
   makeSmallLabel(card, "인증키 (serviceKey)", 24, 18, UI_TEXT_3);
 
@@ -8359,7 +8436,18 @@ void createIslUi()
   lv_obj_set_style_text_align(labelCloudMode, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
 
-  lv_obj_t *statusCard = makePanel(islScreen, 28, 390, 968, 100);
+  // 인증키는 서버마다 따로 발급되므로 서버를 바꾸면 그 서버의 키로 함께 바뀝니다.
+  // 시연하다 수업으로 돌아올 때 운영 키를 다시 타이핑하지 않게 하려는 것입니다.
+  makeSmallLabel(card, "서버", 24, 262, UI_TEXT_3);
+  makeQuietButton(card, "운영", 120, 254, 130, 40, dashboard_isl_server_prod_event_cb);
+  makeQuietButton(card, "테스트", 260, 254, 150, 40, dashboard_isl_server_test_event_cb);
+
+  labelIslServer = makeSmallLabel(card, "", 430, 266, UI_TEXT_3);
+  lv_obj_set_width(labelIslServer, 514);
+  lv_obj_set_style_text_align(labelIslServer, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelIslServer, LV_LABEL_LONG_CLIP);
+
+  lv_obj_t *statusCard = makePanel(islScreen, 28, 438, 968, 100);
 
   makeSmallLabel(statusCard, "상태", 24, 16, UI_TEXT_3);
 
@@ -8378,6 +8466,7 @@ void createIslUi()
   createTabBar(islScreen, TAB_DEVICE);
 
   updateCloudModeLabel();
+  updateIslServerLabel();
   updateIslStatusLabels();
 }
 
@@ -10083,6 +10172,13 @@ void clearWifiCredentials()
   Serial.println("WiFi credentials cleared");
 }
 
+// 두 서버는 인증키가 다릅니다. 한 칸에 덮어쓰면 시연할 때마다 반대쪽 키를 잃으니,
+// 고른 서버의 칸에 넣습니다.
+static const char *islServiceKeyNvsName()
+{
+  return islUseTestServer ? "keyTest" : "serviceKey";
+}
+
 void saveIslServiceKey(const char *key)
 {
   if (key == NULL || strlen(key) == 0) return;
@@ -10096,7 +10192,7 @@ void saveIslServiceKey(const char *key)
     return;
   }
 
-  ret = nvs_set_str(handle, "serviceKey", key);
+  ret = nvs_set_str(handle, islServiceKeyNvsName(), key);
   if (ret == ESP_OK) ret = nvs_commit(handle);
   nvs_close(handle);
 
@@ -10111,16 +10207,61 @@ bool loadIslServiceKey()
   if (ret != ESP_OK) return false;
 
   size_t keyLen = sizeof(islServiceKey);
-  ret = nvs_get_str(handle, "serviceKey", islServiceKey, &keyLen);
+  ret = nvs_get_str(handle, islServiceKeyNvsName(), islServiceKey, &keyLen);
   nvs_close(handle);
 
   if (ret == ESP_OK && strlen(islServiceKey) > 0)
   {
-    Serial.println("NVS ISL serviceKey loaded");
+    Serial.printf("NVS ISL serviceKey loaded (%s)\n", islServiceKeyNvsName());
     return true;
   }
 
   return false;
+}
+
+void saveIslServerChoice()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READWRITE, &handle) != ESP_OK) return;
+
+  nvs_set_u8(handle, "server", islUseTestServer ? 1 : 0);
+  nvs_commit(handle);
+  nvs_close(handle);
+}
+
+void loadIslServerChoice()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return;
+
+  uint8_t stored = 0;
+  if (nvs_get_u8(handle, "server", &stored) == ESP_OK) islUseTestServer = (stored != 0);
+  nvs_close(handle);
+}
+
+void islApplyServerChoice(bool useTest, bool persist)
+{
+  islUseTestServer = useTest;
+  islBuildApiUrls();
+  if (persist) saveIslServerChoice();
+
+  // The other server's uniqueCode means nothing here, so the next 전송 시작
+  // opens a fresh 탐구 rather than posting into a session that does not exist.
+  resetDirectIslSessionCache(useTest ? "test server selected" : "production server selected");
+
+  // 이 서버의 키로 갈아탑니다. 없으면 비워 두어, 화면이 "인증키 없음"이라고
+  // 말하게 합니다. 반대쪽 서버의 키로 조용히 실패하는 것보다 낫습니다.
+  islServiceKey[0] = '\0';
+  loadIslServiceKey();
+
+  if (islServiceKeyTa)
+  {
+    const bool haveKey = strlen(islServiceKey) > 0 &&
+                         strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0;
+    lv_textarea_set_text(islServiceKeyTa, haveKey ? islServiceKey : "");
+  }
+
+  updateIslServerLabel();
 }
 
 void sanitizeIslModuleCode(const char *src, char *dst, size_t dstLen)
@@ -10332,10 +10473,6 @@ bool ensureHostedWifiStarted()
 }
 #endif
 
-// The host every upload depends on. Resolving it is the difference between a
-// usable network and one that only looks connected.
-#define ISL_API_HOST "api-scion.kosac.re.kr"
-
 // Public resolvers to fall back through when the network's own cannot answer.
 static const char *kFallbackDnsServers[] = { "8.8.8.8", "1.1.1.1" };
 
@@ -10363,7 +10500,9 @@ static bool resolvesApiHost()
   hints.ai_socktype = SOCK_STREAM;
 
   struct addrinfo *res = NULL;
-  const int rc = getaddrinfo(ISL_API_HOST, "443", &hints, &res);
+  // The host every upload depends on. Resolving it is the difference between a
+  // usable network and one that only looks connected.
+  const int rc = getaddrinfo(islApiHost, "443", &hints, &res);
 
   if (rc == 0 && res != NULL)
   {
@@ -10372,13 +10511,13 @@ static bool resolvesApiHost()
     esp_ip4_addr_t ip4;
     ip4.addr = addr->sin_addr.s_addr;
     snprintf(text, sizeof(text), IPSTR, IP2STR(&ip4));
-    Serial.printf("[DNS] %s -> %s\n", ISL_API_HOST, text);
+    Serial.printf("[DNS] %s -> %s\n", islApiHost, text);
     freeaddrinfo(res);
     return true;
   }
 
   if (res != NULL) freeaddrinfo(res);
-  Serial.printf("[DNS] %s did not resolve (rc=%d)\n", ISL_API_HOST, rc);
+  Serial.printf("[DNS] %s did not resolve (rc=%d)\n", islApiHost, rc);
   return false;
 }
 
@@ -13299,6 +13438,9 @@ void setup()
 
   initNvsStorage();
   // CSV disabled in stability build.
+  // The server choice comes first: the key that follows is the key for it.
+  loadIslServerChoice();
+  islBuildApiUrls();
   loadIslModuleCode();
   loadIslServiceKey();
 
