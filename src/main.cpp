@@ -10413,10 +10413,11 @@ void updateIslModuleCodeFromUi()
 // 막힌 이유가 정확히 그것이었습니다 - 42자가 들어가 있었고, 서버는 013으로
 // 그렇게 말했는데 화면에는 "start 응답 오류"로만 보였습니다. 붙여넣을 길을 둡니다.
 //
-//   status            지금 무엇으로 보내려 하는지
-//   key <값>          고른 서버의 인증키
-//   modum <코드>      모둠코드
-//   server prod|test  운영 / 테스트
+//   status                지금 무엇으로 보내려 하는지
+//   key <값>              고른 서버의 인증키
+//   modum <코드>          모둠코드
+//   server prod|test      운영 / 테스트
+//   mode realtime|batch   실시간 / 일괄전송
 static void handleSerialCommand(char *line)
 {
   while (*line == ' ') line++;
@@ -10437,9 +10438,40 @@ static void handleSerialCommand(char *line)
 
   if (strcmp(line, "status") == 0)
   {
-    Serial.printf("[CMD] server=%s key=%d자 modum=%s\n", islApiHost,
-                  (int)strlen(islServiceKey),
+    // 길이만으로는 어느 키인지 모릅니다 - 틀린 키와 맞는 키가 같은 길이일 수
+    // 있으니까요. 양 끝 네 글자면 눈으로 가려집니다. 전부 찍지는 않습니다.
+    const size_t keyLen = strlen(islServiceKey);
+    char ends[16] = "(없음)";
+
+    if (keyLen >= 8)
+    {
+      snprintf(ends, sizeof(ends), "%.4s...%s", islServiceKey, islServiceKey + keyLen - 4);
+    }
+
+    Serial.printf("[CMD] server=%s mode=%s key=%d자 %s modum=%s\n",
+                  islApiHost, cloudUploadModeName(), (int)keyLen, ends,
                   strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+    return;
+  }
+
+  if (strcmp(line, "mode") == 0 && arg != NULL)
+  {
+    const bool wantBatch = (strcmp(arg, "batch") == 0);
+    cloudUploadMode = wantBatch ? CLOUD_UPLOAD_BATCH : CLOUD_UPLOAD_REALTIME;
+
+    // 측정 중에 실시간으로 바꾸면 버튼과 같은 일을 해야 합니다 - 새 세션을
+    // 열지 않으면 다음 샘플이 갈 곳이 없습니다.
+    if (!wantBatch && measuring && cloudModumConfigured() && activeSensorSupportsDirectIsl())
+    {
+      resetDirectIslSessionCache("mode command");
+      clearCloudQueue();
+      queueCloudAction("start");
+    }
+
+    updateCloudModeLabel();
+    updateIslStatusLabels();
+
+    Serial.printf("[CMD] mode=%s\n", cloudUploadModeName());
     return;
   }
 
@@ -10479,7 +10511,7 @@ static void handleSerialCommand(char *line)
     return;
   }
 
-  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test");
+  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | mode realtime|batch");
 }
 
 void serviceSerialConsole()
@@ -12931,7 +12963,12 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
   {
     if (no % 10 == 0)
     {
-      setIslStatusText("일괄전송 중");
+      // "일괄전송 중"이라고 쓰면 보내는 중으로 읽힙니다. 이 모드는 측정하는
+      // 동안 아무것도 보내지 않고 쌓아 둡니다 - 버튼을 눌러야 나갑니다.
+      // 화면이 그렇게 말해야 합니다.
+      char note[96];
+      snprintf(note, sizeof(note), "일괄전송 모드: %d개 저장됨 (전송하려면 일괄전송 버튼)", no);
+      setIslStatusText(note);
       updateCloudModeLabel();
     }
     return;

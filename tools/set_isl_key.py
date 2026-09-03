@@ -12,6 +12,7 @@ Paste at the prompt rather than typing. The key goes to NVS on the board, which
 survives reflashing, so this is done once and not again.
 """
 
+import subprocess
 import sys
 import time
 
@@ -37,11 +38,36 @@ def send(link, line, quiet=False):
             print('  ' + text.strip())
 
 
+def clipboard_text():
+    """Whatever is on the Windows clipboard, or '' if it cannot be read."""
+    try:
+        out = subprocess.run(
+            ['powershell.exe', '-NoProfile', '-Command', 'Get-Clipboard'],
+            capture_output=True, text=True, timeout=10)
+        return out.stdout.strip()
+    except Exception:
+        return ''
+
+
 # getpass hides the paste, which is the wrong trade here: a key you cannot see
 # is exactly how the wrong one got onto the board. Read it plainly and show the
 # ends back, so a truncated paste is visible before it is sent.
+#
+# The key is almost always already on the clipboard - it was copied from the
+# platform to be typed in. Offering it saves the one step where characters get
+# lost, and it still has to be looked at and accepted.
+pasted = clipboard_text()
+suggestion = pasted if len(pasted) in (43, 44) and ' ' not in pasted else ''
+
+if suggestion:
+    print('클립보드에 %d자가 있습니다: %s...%s'
+          % (len(suggestion), suggestion[:6], suggestion[-6:]))
+    prompt = '이걸 쓰려면 Enter, 아니면 붙여넣고 Enter: '
+else:
+    prompt = '인증키를 붙여넣고 Enter: '
+
 try:
-    key = input('인증키를 붙여넣고 Enter: ').strip()
+    key = input(prompt).strip() or suggestion
 except (EOFError, KeyboardInterrupt):
     print('취소되었습니다.')
     raise SystemExit(1)
