@@ -775,7 +775,7 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // 주소를 붙박이 문자열로 두지 않고 고른 호스트로 다시 조립합니다. 시연 때문에
 // 펌웨어를 다시 굽는 일이 없어야 합니다.
 #define ISL_HOST_PROD "api-scion.kosac.re.kr"
-#define ISL_HOST_TEST "testapi-scion.kosac.re.kr"
+#define ISL_HOST_TEST "testapi-scion.kofac.re.kr"
 
 static bool islUseTestServer = false;
 static char islApiHost[64] = ISL_HOST_PROD;
