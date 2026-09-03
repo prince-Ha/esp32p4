@@ -11671,6 +11671,31 @@ bool directIslConfigured()
 #endif
 }
 
+// 서버는 왜 거절했는지 한국어로 말해 줍니다 - "해당 센서의 인증키가 일치하지
+// 않습니다" 같이, 다음에 무엇을 할지 알려 주는 문장으로요. 그걸 버리고
+// "응답 오류"라고 쓰면 이유를 알려고 시리얼 케이블을 꽂아야 합니다.
+static void setIslStatusFromResponse(const char *stage, const String &response)
+{
+  char code[12] = "";
+  char message[140] = "";
+
+  extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+  extractJsonStringValue(response, "\"message\"", message, sizeof(message));
+
+  char note[200];
+
+  if (strlen(message) > 0)
+  {
+    snprintf(note, sizeof(note), "%s %s: %s", stage, code[0] ? code : "?", message);
+  }
+  else
+  {
+    snprintf(note, sizeof(note), "직접전송: %s 응답 오류", stage);
+  }
+
+  setIslStatusText(note);
+}
+
 bool directIslStartProcess(const char *modumId)
 {
 #if REALTIME_DIRECT_ISL_ENABLED
@@ -11727,7 +11752,7 @@ bool directIslStartProcess(const char *modumId)
   {
     Serial.print("Direct ISL start bad response: ");
     Serial.println(response);
-    setIslStatusText("직접전송: start 응답 오류");
+    setIslStatusFromResponse("탐구 시작", response);
     return false;
   }
 
@@ -12128,7 +12153,7 @@ bool directIslSendSensorTypeIfNeeded()
 
   Serial.print("Direct ISL sensor type bad response: ");
   Serial.println(response);
-  setIslStatusText("직접전송: 센서등록 응답 오류");
+  setIslStatusFromResponse("센서등록", response);
   return false;
 #else
   return false;
@@ -12164,7 +12189,7 @@ bool directIslSetStatusOnIfNeeded()
 
   Serial.print("Direct ISL status bad response: ");
   Serial.println(response);
-  setIslStatusText("직접전송: status 응답 오류");
+  setIslStatusFromResponse("상태 전환", response);
   return false;
 #else
   return false;
