@@ -780,6 +780,11 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 static bool islUseTestServer = false;
 static char islApiHost[64] = ISL_HOST_PROD;
 
+// 지능형 과학실의 테스트 환경은 문서와 실제 사이트가 서로 다른 도메인을 가리키고
+// 있습니다 - 문서는 kofac, 로그인한 탐구는 kosac. 어느 쪽이 이 탐구의 API인지는
+// 물어봐야 알 수 있는데, 그때마다 펌웨어를 다시 구울 수는 없습니다.
+static char islTestHost[64] = ISL_HOST_TEST;
+
 static char islUrlStart[144];
 static char islUrlSensorType[144];
 static char islUrlStatus[144];
@@ -797,7 +802,7 @@ static char islUrlStop[144];
 static void islBuildApiUrls()
 {
   snprintf(islApiHost, sizeof(islApiHost), "%s",
-           islUseTestServer ? ISL_HOST_TEST : ISL_HOST_PROD);
+           islUseTestServer ? islTestHost : ISL_HOST_PROD);
 
   struct IslEndpoint { char *slot; size_t size; const char *path; };
 
@@ -10269,6 +10274,24 @@ void loadIslServerChoice()
 
   uint8_t stored = 0;
   if (nvs_get_u8(handle, "server", &stored) == ESP_OK) islUseTestServer = (stored != 0);
+
+  char host[sizeof(islTestHost)];
+  size_t hostLen = sizeof(host);
+  if (nvs_get_str(handle, "testHost", host, &hostLen) == ESP_OK && strlen(host) > 0)
+  {
+    snprintf(islTestHost, sizeof(islTestHost), "%s", host);
+  }
+
+  nvs_close(handle);
+}
+
+void saveIslTestHost()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READWRITE, &handle) != ESP_OK) return;
+
+  nvs_set_str(handle, "testHost", islTestHost);
+  nvs_commit(handle);
   nvs_close(handle);
 }
 
@@ -10417,6 +10440,7 @@ void updateIslModuleCodeFromUi()
 //   key <값>              고른 서버의 인증키
 //   modum <코드>          모둠코드
 //   server prod|test      운영 / 테스트
+//   host <주소>           테스트 서버의 호스트
 //   mode realtime|batch   실시간 / 일괄전송
 static void handleSerialCommand(char *line)
 {
@@ -10451,6 +10475,29 @@ static void handleSerialCommand(char *line)
     Serial.printf("[CMD] server=%s mode=%s key=%d자 %s modum=%s\n",
                   islApiHost, cloudUploadModeName(), (int)keyLen, ends,
                   strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+    return;
+  }
+
+  // 인증 3단계만 따로 두드려 봅니다. 측정을 시작하지 않고도 서버가 이 키와
+  // 모둠코드를 받아들이는지 알 수 있어야, 주소 후보를 빠르게 가릴 수 있습니다.
+  if (strcmp(line, "start") == 0)
+  {
+    resetDirectIslSessionCache("start command");
+    clearCloudQueue();
+    queueCloudAction("start");
+    Serial.printf("[CMD] start 요청: %s / %s\n", islApiHost, islRuntimeSerialNumber);
+    return;
+  }
+
+  if (strcmp(line, "host") == 0 && arg != NULL && *arg != '\0')
+  {
+    snprintf(islTestHost, sizeof(islTestHost), "%s", arg);
+    saveIslTestHost();
+
+    // 이 주소를 쓰려면 테스트 서버가 골라져 있어야 합니다.
+    islApplyServerChoice(true, true);
+
+    Serial.printf("[CMD] test host=%s (지금 %s)\n", islTestHost, islApiHost);
     return;
   }
 
@@ -10511,7 +10558,7 @@ static void handleSerialCommand(char *line)
     return;
   }
 
-  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | mode realtime|batch");
+  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | host <주소> | mode realtime|batch | start");
 }
 
 void serviceSerialConsole()
