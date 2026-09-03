@@ -376,6 +376,7 @@ static void bleRecordScanResult(const struct ble_gap_disc_desc *disc)
 
   BleScanResult *r = &bleScanResults[slot];
   r->rssi = disc->rssi;
+  r->addrType = disc->addr.type;
 
   if (fields.name != NULL && fields.name_len > 0)
   {
@@ -517,6 +518,1346 @@ void bleScanDumpResults()
   Serial.println("[BLE] --- end ---");
 }
 
+// =====================================================
+// Central role: linking to sensor nodes
+//
+// NimBLE drives each link as a chain of callbacks, one starting the next:
+//   connect -> agree an MTU -> discover the service -> discover the
+//   characteristic -> discover its CCCD -> write 0x0001 -> notifications
+//
+// Two of those steps are easy to leave out and both fail quietly. Without the
+// CCCD write the link looks healthy - connected, characteristic found - and no
+// reading ever arrives, because a GATT server only notifies subscribers. And
+// without the MTU exchange every notification is capped at 20 bytes, which
+// silently clips the end off a reading rather than failing.
+//
+// Each connection gets a slot. The slot index rides along as the callback
+// `arg`, so a packet from one node cannot be mistaken for another's.
+// =====================================================
+
+typedef struct
+{
+  uint16_t connHandle;
+  uint16_t valueHandle;
+  uint16_t cccdHandle;
+  uint16_t svcEndHandle;
+  bool subscribed;
+  bool busy;
+  char peerName[32];
+  char peerAddress[18];
+  char state[48];
+
+  char payload[96];
+  uint32_t payloadMs;
+  bool hasReading;
+  uint32_t notifyCount;
+
+  // Exploration: connected to learn what the device is, not to read it.
+  bool exploring;
+  int exploreServices;
+  int exploreChrs;
+  int exploreSubscribed;
+  char exploreSummary[64];
+
+  // Readable characteristics, walked one at a time after discovery. A sensor
+  // that will not stream until it is told to may still hand over its current
+  // measurement to a plain read.
+  uint16_t exploreReadHandles[16];
+  int exploreReadCount;
+  int exploreReadIndex;
+
+  // The characteristic that takes commands, and how far through the candidate
+  // list this link has got.
+  // Every characteristic that both takes writes and notifies. Both PASCO
+  // services have one, and the live one - the channel already streaming status
+  // - is as likely to be the way in as the silent one.
+  uint16_t exploreCommandHandles[4];
+  int exploreCommandCount;
+  int exploreProbeIndex;
+  unsigned long exploreNextProbeMs;
+
+  // PASCO: handles for 4a5c000<service>-000<char>-…, indexed [service][char].
+  // Service 0 is the device, 1 the sensor; characteristic 2 takes commands and
+  // 3 carries the replies.
+  uint16_t pascoHandle[2][6];
+  bool pascoPresent;
+  int pascoStep;
+  unsigned long pascoNextStepMs;
+  uint16_t pascoSensorId;
+  uint8_t pascoSampleBytes;
+  int pascoKind;
+} BleLink;
+
+static BleLink bleLinks[BLE_LINK_MAX_NODES];
+static bool bleLinksInitialised = false;
+
+static void bleLinkInitAll()
+{
+  if (bleLinksInitialised) return;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    memset(&bleLinks[i], 0, sizeof(bleLinks[i]));
+    bleLinks[i].connHandle = BLE_HS_CONN_HANDLE_NONE;
+    snprintf(bleLinks[i].state, sizeof(bleLinks[i].state), "%s", "연결 안 됨");
+  }
+
+  bleLinksInitialised = true;
+}
+
+static bool bleSlotValid(int slot)
+{
+  return slot >= 0 && slot < BLE_LINK_MAX_NODES;
+}
+
+static void bleLinkSetState(int slot, const char *text)
+{
+  if (!bleSlotValid(slot)) return;
+
+  snprintf(bleLinks[slot].state, sizeof(bleLinks[slot].state), "%s", text);
+  blePrintf("link %d (%s): %s", slot,
+            bleLinks[slot].peerName[0] ? bleLinks[slot].peerName : "-", text);
+}
+
+static void bleLinkClear(int slot, const char *why, bool keepName)
+{
+  if (!bleSlotValid(slot)) return;
+
+  BleLink *link = &bleLinks[slot];
+  const bool wasIdle = link->connHandle == BLE_HS_CONN_HANDLE_NONE && !link->busy;
+
+  link->connHandle = BLE_HS_CONN_HANDLE_NONE;
+  link->valueHandle = 0;
+  link->cccdHandle = 0;
+  link->svcEndHandle = 0;
+  link->subscribed = false;
+  link->busy = false;
+  link->hasReading = false;
+  link->exploring = false;
+
+  if (!keepName)
+  {
+    link->peerName[0] = '\0';
+    link->peerAddress[0] = '\0';
+  }
+
+  // Announcing a state that was already the state only clutters the log.
+  if (wasIdle) snprintf(link->state, sizeof(link->state), "%s", why);
+  else bleLinkSetState(slot, why);
+}
+
+static int bleLinkSlotForConn(uint16_t connHandle)
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinks[i].connHandle == connHandle) return i;
+  }
+
+  return -1;
+}
+
+int bleLinkSlotForAddress(const char *address)
+{
+  if (address == NULL) return -1;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (strcmp(bleLinks[i].peerAddress, address) == 0) return i;
+  }
+
+  return -1;
+}
+
+static int bleLinkFreeSlot()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinks[i].connHandle == BLE_HS_CONN_HANDLE_NONE && !bleLinks[i].busy) return i;
+  }
+
+  return -1;
+}
+
+static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            const struct ble_gatt_svc *service, void *arg);
+static int bleExploreOnSvc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_svc *service, void *arg);
+static void bleExploreDump(const char *what, uint16_t handle, const struct os_mbuf *om, int slot);
+static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t len);
+static void blePascoNoteCharacteristic(int slot, const struct ble_gatt_chr *chr);
+static void blePascoService(int slot);
+
+// Step 4: the subscription write came back.
+static int bleLinkOnSubscribed(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               struct ble_gatt_attr *attr, void *arg)
+{
+  (void)attr;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status != 0)
+  {
+    blePrintf("CCCD write failed on slot %d: %d", slot, error->status);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
+    return 0;
+  }
+
+  bleLinks[slot].subscribed = true;
+  bleLinks[slot].busy = false;
+  bleLinkSetState(slot, "수신 중");
+  return 0;
+}
+
+// Step 3: found the descriptors; the CCCD is 0x2902.
+static int bleLinkOnDescriptor(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+  (void)chr_val_handle;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && dsc != NULL &&
+      ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16)
+  {
+    bleLinks[slot].cccdHandle = dsc->handle;
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinks[slot].cccdHandle == 0)
+  {
+    blePrintf("slot %d: no CCCD on the measurement characteristic", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "알림 미지원 장치", true);
+    return 0;
+  }
+
+  bleLinkSetState(slot, "구독 중");
+
+  const uint8_t enableNotify[2] = { 0x01, 0x00 };
+  const int rc = ble_gattc_write_flat(conn_handle, bleLinks[slot].cccdHandle,
+                                      enableNotify, sizeof(enableNotify),
+                                      bleLinkOnSubscribed, arg);
+  if (rc != 0)
+  {
+    blePrintf("slot %d: ble_gattc_write_flat failed: %d", slot, rc);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
+  }
+
+  return 0;
+}
+
+// Step 2: found the measurement characteristic.
+static int bleLinkOnCharacteristic(uint16_t conn_handle, const struct ble_gatt_error *error,
+                                   const struct ble_gatt_chr *chr, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && chr != NULL)
+  {
+    bleLinks[slot].valueHandle = chr->val_handle;
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinks[slot].valueHandle == 0)
+  {
+    blePrintf("slot %d: measurement characteristic not found", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "측정 특성 없음", true);
+    return 0;
+  }
+
+  const int rc = ble_gattc_disc_all_dscs(conn_handle, bleLinks[slot].valueHandle,
+                                         bleLinks[slot].svcEndHandle,
+                                         bleLinkOnDescriptor, arg);
+  if (rc != 0)
+  {
+    blePrintf("slot %d: ble_gattc_disc_all_dscs failed: %d", slot, rc);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "구독 실패", true);
+  }
+
+  return 0;
+}
+
+// Step 1: found the service.
+static int bleLinkOnService(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            const struct ble_gatt_svc *service, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && service != NULL)
+  {
+    bleLinks[slot].svcEndHandle = service->end_handle;
+
+    const int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, service->start_handle,
+                                               service->end_handle, &kMeasurementUuid.u,
+                                               bleLinkOnCharacteristic, arg);
+    if (rc != 0)
+    {
+      blePrintf("slot %d: ble_gattc_disc_chrs_by_uuid failed: %d", slot, rc);
+      ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+      bleLinkClear(slot, "서비스 검색 실패", true);
+    }
+
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  if (bleLinks[slot].svcEndHandle == 0)
+  {
+    blePrintf("slot %d: sensor service not found on this device", slot);
+    ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    bleLinkClear(slot, "센서 노드가 아님", true);
+  }
+
+  return 0;
+}
+
+// Step 0: agree an MTU.
+//
+// The default ATT MTU is 23, which leaves 20 bytes for a notification. A
+// reading carrying two quantities with Korean names is well past that, and
+// without this the tail is cut off silently. Do it before subscribing, not
+// after, or the first readings still arrive at the old size.
+static int bleLinkOnMtu(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t mtu, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0) blePrintf("slot %d: MTU is %u", slot, (unsigned)mtu);
+  else blePrintf("slot %d: MTU exchange failed: %d, staying at 23", slot, error->status);
+
+  if (bleLinks[slot].exploring)
+  {
+    bleLinkSetState(slot, "서비스 검색 중");
+    ble_gattc_disc_all_svcs(conn_handle, bleExploreOnSvc, arg);
+    return 0;
+  }
+
+  bleLinkSetState(slot, "서비스 검색 중");
+  ble_gattc_disc_svc_by_uuid(conn_handle, &kServiceUuid.u, bleLinkOnService, arg);
+  return 0;
+}
+
+static int bleLinkGapEvent(struct ble_gap_event *event, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  switch (event->type)
+  {
+    case BLE_GAP_EVENT_CONNECT:
+      if (event->connect.status != 0)
+      {
+        blePrintf("slot %d: connect failed: %d", slot, event->connect.status);
+        bleLinkClear(slot, "연결 실패", true);
+        return 0;
+      }
+
+      bleLinks[slot].connHandle = event->connect.conn_handle;
+      bleLinkSetState(slot, "MTU 협상 중");
+
+      if (ble_gattc_exchange_mtu(event->connect.conn_handle, bleLinkOnMtu, arg) != 0)
+      {
+        // Not fatal on its own; carry on at the default size.
+        bleLinkSetState(slot, "서비스 검색 중");
+
+        if (bleLinks[slot].exploring)
+        {
+          ble_gattc_disc_all_svcs(event->connect.conn_handle, bleExploreOnSvc, arg);
+        }
+        else
+        {
+          ble_gattc_disc_svc_by_uuid(event->connect.conn_handle, &kServiceUuid.u,
+                                     bleLinkOnService, arg);
+        }
+      }
+
+      return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+      blePrintf("slot %d: link dropped, reason %d", slot, event->disconnect.reason);
+      bleLinkClear(slot, "연결 끊김", true);
+      return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX:
+    {
+      if (bleLinks[slot].exploring)
+      {
+        // Print it as bytes. Which of them carry the reading, and in what
+        // order and scale, is what these dumps are for.
+        bleExploreDump("notify", event->notify_rx.attr_handle, event->notify_rx.om, slot);
+        bleLinks[slot].notifyCount++;
+
+        if (bleLinks[slot].pascoPresent)
+        {
+          uint8_t raw[64];
+          const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+          const uint16_t copy = len < sizeof(raw) ? len : (uint16_t)sizeof(raw);
+
+          if (ble_hs_mbuf_to_flat(event->notify_rx.om, raw, copy, NULL) == 0)
+          {
+            blePascoHandleNotification(slot, raw, copy);
+          }
+        }
+
+        return 0;
+      }
+
+      if (event->notify_rx.attr_handle != bleLinks[slot].valueHandle) return 0;
+
+      BleLink *link = &bleLinks[slot];
+      const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+      const uint16_t copy = len < sizeof(link->payload) - 1
+                            ? len : (uint16_t)(sizeof(link->payload) - 1);
+
+      if (ble_hs_mbuf_to_flat(event->notify_rx.om, link->payload, copy, NULL) == 0)
+      {
+        link->payload[copy] = '\0';
+        link->payloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+
+        // The first packet proves the subscription took; after that one line
+        // every ten seconds shows the node is alive without burying the log.
+        if (!link->hasReading || (link->notifyCount % 10) == 0)
+        {
+          blePrintf("slot %d rx #%lu: %s", slot,
+                    (unsigned long)link->notifyCount, link->payload);
+        }
+
+        link->notifyCount++;
+        link->hasReading = true;
+      }
+
+      return 0;
+    }
+
+    default:
+      return 0;
+  }
+}
+
+// ---- exploring an unknown device ------------------------------------------
+//
+// Discovery runs across the whole attribute range in one pass per kind, rather
+// than walking service by service. It is cruder than the targeted path used
+// for this project's own nodes, and it is the right shape here: nothing is
+// known yet, so everything is worth seeing.
+
+static void bleExploreSetSummary(int slot)
+{
+  if (!bleSlotValid(slot)) return;
+
+  snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
+           "서비스 %d · 특성 %d · 구독 %d",
+           bleLinks[slot].exploreServices,
+           bleLinks[slot].exploreChrs,
+           bleLinks[slot].exploreSubscribed);
+}
+
+static void bleExploreReadNext(uint16_t conn_handle, int slot);
+
+// =====================================================
+// PASCO wireless sensors
+//
+// Their protocol is not guessable and did not need to be guessed: PASCO's own
+// BLE examples and a working ESP32 client for the AirLink both spell it out.
+//
+//   UUIDs   4a5c000<service>-000<char>-0000-0000-5c1e741f1c00
+//   service 0 = the device itself, 1 = the attached sensor
+//   char    2 = commands, written without response
+//           3 = replies and events, subscribed to
+//
+//   0x08            ask what sensor this is
+//   0x05, <bytes>   ask for one sample of that many bytes
+//
+//   replies start 0xC0: status, echoed command, then the payload
+//   events start 0x82 (sensor id) or 0x85 (device status, which is the battery
+//   stream that was arriving before any of this was understood)
+//
+// Values are 16.16 fixed point: a little-endian int32 over 65536.
+// =====================================================
+
+// Which PASCO part this is. Taken from the advertised name, which carries it
+// plainly - "Pressure 581-124", "Temperature 171-753" - and is available
+// before a single byte has been exchanged.
+#define PASCO_KIND_UNKNOWN     0
+#define PASCO_KIND_PRESSURE    1
+#define PASCO_KIND_TEMPERATURE 2
+
+// From PASCO's own datasheets, which their BLE library ships:
+//
+//   Wireless Pressure Sensor PS-3203, id 2022
+//     adc      RawDigital, 2 bytes
+//     Pressure FactoryCal on adc, params 16016,14.7,38688,34.7, kPa
+//
+//   Wireless Temperature Sensor PS-3201, id 2020
+//     RawTemperature   RawDigital, 2 bytes
+//     UncalTemperature LinearConv on it, params 0.00268127,-46.85, DegC
+//
+// The calibration points are in psi even though the measurement is published
+// as kPa, so the conversion is applied here rather than assumed away.
+#define PASCO_PRESSURE_X1 16016.0f
+#define PASCO_PRESSURE_Y1 14.7f
+#define PASCO_PRESSURE_X2 38688.0f
+#define PASCO_PRESSURE_Y2 34.7f
+#define PASCO_PSI_TO_KPA  6.894757f
+
+#define PASCO_TEMPERATURE_SLOPE  0.00268127f
+#define PASCO_TEMPERATURE_OFFSET (-46.85f)
+
+// Two bytes. That is the whole sample: the datasheet gives the sensor one
+// RawDigital measurement of two bytes and derives the reading from it. Asking
+// for sixteen returned fourteen bytes of stale buffer, which is why three of
+// the four "fields" never moved.
+#define PASCO_SAMPLE_BYTES 2
+
+#define PASCO_CMD_READ_ONE_SAMPLE 0x05
+#define PASCO_CMD_GET_SENSOR_ID   0x08
+#define PASCO_RSP_RESULT          0xC0
+#define PASCO_EVT_SENSOR_ID       0x82
+
+// Records a characteristic if it belongs to PASCO's UUID family.
+static void blePascoNoteCharacteristic(int slot, const struct ble_gatt_chr *chr)
+{
+  if (!bleSlotValid(slot) || chr == NULL) return;
+  if (chr->uuid.u.type != BLE_UUID_TYPE_128) return;
+
+  // NimBLE stores a 128-bit UUID least significant byte first, so the leading
+  // "4a5c" of the printed form sits at the top of the array.
+  const uint8_t *v = chr->uuid.u128.value;
+  if (v[15] != 0x4a || v[14] != 0x5c) return;
+
+  const uint8_t serviceId = v[12];
+  const uint8_t charId = v[10];
+
+  if (serviceId > 1 || charId > 5) return;
+
+  bleLinks[slot].pascoHandle[serviceId][charId] = chr->val_handle;
+  bleLinks[slot].pascoPresent = true;
+}
+
+static void blePascoSend(int slot, uint8_t serviceId, const uint8_t *bytes, uint8_t len)
+{
+  BleLink *link = &bleLinks[slot];
+  const uint16_t handle = link->pascoHandle[serviceId][2];
+  if (handle == 0) return;
+
+  char hex[16] = "";
+  int used = 0;
+  for (uint8_t i = 0; i < len && used < (int)sizeof(hex) - 3; i++)
+  {
+    used += snprintf(hex + used, sizeof(hex) - used, "%02X ", bytes[i]);
+  }
+
+  blePrintf("pasco: -> service %u handle %u: %s", serviceId, (unsigned)handle, hex);
+
+  // Written without a response: that is what the command characteristic
+  // offers, and asking for one is refused.
+  ble_gattc_write_no_rsp_flat(link->connHandle, handle, bytes, len);
+}
+
+// Unpacks PASCO's 16.16 fixed point.
+static float blePascoValue(const uint8_t *payload, int offset)
+{
+  const uint32_t raw =
+    (uint32_t)payload[offset] |
+    ((uint32_t)payload[offset + 1] << 8) |
+    ((uint32_t)payload[offset + 2] << 16) |
+    ((uint32_t)payload[offset + 3] << 24);
+
+  return (float)(int32_t)raw / 65536.0f;
+}
+
+static void blePascoHandleNotification(int slot, const uint8_t *data, uint16_t len)
+{
+  if (len < 1) return;
+
+  BleLink *link = &bleLinks[slot];
+  const uint8_t header = data[0];
+
+  if (header == PASCO_EVT_SENSOR_ID && len >= 3)
+  {
+    link->pascoSensorId = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+    blePrintf("pasco: sensor id 0x%04X", link->pascoSensorId);
+    return;
+  }
+
+  if (header != PASCO_RSP_RESULT || len < 3) return;
+
+  const uint8_t status = data[1];
+  const uint8_t command = data[2];
+
+  if (status != 0x00)
+  {
+    blePrintf("pasco: command 0x%02X refused, status 0x%02X", command, status);
+    return;
+  }
+
+  if (command != PASCO_CMD_READ_ONE_SAMPLE || len < 5) return;
+
+  // Two bytes of raw ADC, little endian, and the sensor's own calibration
+  // turns it into a reading.
+  const uint16_t raw = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
+
+  float value = NAN;
+  const char *name = "";
+  const char *unit = "";
+
+  if (link->pascoKind == PASCO_KIND_PRESSURE)
+  {
+    // Two-point factory calibration, exactly as PASCO computes it.
+    const float b = (PASCO_PRESSURE_X1 * PASCO_PRESSURE_Y2 -
+                     PASCO_PRESSURE_X2 * PASCO_PRESSURE_Y1) /
+                    (PASCO_PRESSURE_X1 - PASCO_PRESSURE_X2);
+    const float slope = (PASCO_PRESSURE_Y1 - b) / PASCO_PRESSURE_X1;
+
+    // hPa, not the kPa the datasheet names: it is what the DPS310 on this
+    // board reports, what 지능형 과학실 already accepts as PRS, and what puts
+    // both pressure sensors on one scale.
+    value = (slope * (float)raw + b) * PASCO_PSI_TO_KPA * 10.0f;
+    name = "압력";
+    unit = "hPa";
+  }
+  else if (link->pascoKind == PASCO_KIND_TEMPERATURE)
+  {
+    value = (float)raw * PASCO_TEMPERATURE_SLOPE + PASCO_TEMPERATURE_OFFSET;
+    name = "온도";
+    unit = "C";
+  }
+  else
+  {
+    blePrintf("pasco: raw %u from an unrecognised part", (unsigned)raw);
+    return;
+  }
+
+  blePrintf("pasco: raw %u -> %s %.4f %s", (unsigned)raw, name, value, unit);
+
+  // Written in the same shape a sensor node sends, so everything downstream -
+  // the measurement screen, the home tile, the CSV, the upload - treats a
+  // PASCO sensor as just another sensor.
+  link->notifyCount++;
+  snprintf(link->payload, sizeof(link->payload), "%lu,%s,%.4f,%s",
+           (unsigned long)link->notifyCount, name, value, unit);
+  link->payloadMs = (uint32_t)(esp_timer_get_time() / 1000);
+  link->hasReading = true;
+  link->subscribed = true;
+
+  snprintf(link->exploreSummary, sizeof(link->exploreSummary), "%s %.1f %s",
+           name, value, unit);
+  return;
+
+  const int payloadLen = len - 3;
+  const int values = payloadLen / 4;
+
+  char line[192];
+  int used = snprintf(line, sizeof(line), "pasco: ask %u -> %d byte(s) [",
+                      (unsigned)link->pascoSampleBytes, payloadLen);
+
+  for (int i = 0; i < payloadLen && used < (int)sizeof(line) - 4; i++)
+  {
+    used += snprintf(line + used, sizeof(line) - used, "%02X ", data[3 + i]);
+  }
+
+  used += snprintf(line + used, sizeof(line) - used, "] =");
+
+  for (int i = 0; i < values && used < (int)sizeof(line) - 16; i++)
+  {
+    used += snprintf(line + used, sizeof(line) - used, " %.4f",
+                     blePascoValue(data + 3, i * 4));
+  }
+
+  blePrintf("%s", line);
+
+  if (values > 0)
+  {
+    // Both readings of the same four bytes: 16.16 as the reference library
+    // decodes it, and the low half on its own. One of them is the pressure and
+    // a single known value from the sensor's own app decides which.
+    const uint16_t low = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
+
+    blePrintf("pasco: field0 fixed=%.4f low16=%u", blePascoValue(data + 3, 0), (unsigned)low);
+
+    snprintf(link->exploreSummary, sizeof(link->exploreSummary), "%.4f / %u",
+             blePascoValue(data + 3, 0), (unsigned)low);
+  }
+}
+
+// Walks the opening exchange: wake the device, ask what it is, then sample.
+static void blePascoService(int slot)
+{
+  BleLink *link = &bleLinks[slot];
+
+  if (!link->pascoPresent) return;
+  if (link->connHandle == BLE_HS_CONN_HANDLE_NONE) return;
+  if ((long)(millis() - link->pascoNextStepMs) < 0) return;
+
+  const uint8_t getId = PASCO_CMD_GET_SENSOR_ID;
+
+  (void)getId;
+
+  switch (link->pascoStep)
+  {
+    case 0:
+      // 0x08 asks what sensor is attached, which is a question for the
+      // AirLink bridge. A sensor is the thing itself and refuses it with
+      // status 0x01, so it is not asked.
+      link->pascoStep = 2;
+      bleLinkSetState(slot, "PASCO 수신 중");
+      break;
+
+    default:
+    {
+      // Sixteen is everything this sensor has: asking for twenty or
+      // twenty-four returns sixteen just the same. Four fields, and only the
+      // first moved when the pressure did - the other three sat at
+      // 8192.2549, 8192.2090 and 4098.8579 through the whole run, which makes
+      // them configuration rather than measurement.
+      link->pascoSampleBytes = PASCO_SAMPLE_BYTES;
+
+      const uint8_t sample[2] = { PASCO_CMD_READ_ONE_SAMPLE, link->pascoSampleBytes };
+      blePascoSend(slot, 1, sample, 2);
+      link->pascoNextStepMs = millis() + 1000;
+      break;
+    }
+  }
+}
+
+// A write that is refused says why, and the reason narrows the search: a
+// length complaint fixes the command length, "not permitted" rules the
+// characteristic out entirely.
+static int bleExploreOnWrite(uint16_t conn_handle, const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg)
+{
+  (void)conn_handle; (void)arg;
+
+  blePrintf("explore: write to handle %u -> status %d",
+            attr ? (unsigned)attr->handle : 0, error->status);
+  return 0;
+}
+
+// Openers to try on a sensor that stays silent once connected.
+//
+// Deliberately empty. Thirty-eight candidates were written to this sensor's
+// two command characteristics - request-shaped bytes first, then the whole
+// 0x8_ opcode range its own status frames use - and every single one was
+// accepted with status 0 and then ignored. Writes are permitted; the framing
+// is simply not one that has been guessed yet.
+//
+// Leaving a list here would mean the board writes unknown bytes into whatever
+// a student happens to tap on the 블루투스 tab, which is not a thing to ship
+// to a classroom for the sake of a search that was not converging. The
+// exploration that pays - services, characteristics, reads and notification
+// dumps - is all observation and stays.
+//
+// Fill this in when the command frame is known, from the PASCO driver that
+// already works elsewhere in this project.
+typedef struct
+{
+  const char *note;
+  uint8_t bytes[4];
+  uint8_t len;
+} BleProbeCommand;
+
+static const BleProbeCommand kBleProbeCommands[] = {
+  { NULL, { 0 }, 0 }   // placeholder: the sweep is skipped while len is 0
+};
+
+// Turns an attribute's payload into hex for the log. What the bytes mean is
+// exactly the question these dumps exist to answer.
+static void bleExploreDump(const char *what, uint16_t handle, const struct os_mbuf *om, int slot)
+{
+  uint8_t raw[64];
+  const uint16_t len = OS_MBUF_PKTLEN(om);
+  const uint16_t copy = len < sizeof(raw) ? len : (uint16_t)sizeof(raw);
+
+  if (ble_hs_mbuf_to_flat(om, raw, copy, NULL) != 0) return;
+
+  char hex[3 * sizeof(raw) + 1];
+  int used = 0;
+  for (uint16_t i = 0; i < copy && used < (int)sizeof(hex) - 3; i++)
+  {
+    used += snprintf(hex + used, sizeof(hex) - used, "%02X ", raw[i]);
+  }
+
+  blePrintf("explore: %s handle %u (%u bytes) %s", what, (unsigned)handle,
+            (unsigned)len, hex);
+
+  if (bleSlotValid(slot))
+  {
+    snprintf(bleLinks[slot].exploreSummary, sizeof(bleLinks[slot].exploreSummary),
+             "h%u %ubyte %s", (unsigned)handle, (unsigned)len, hex);
+  }
+}
+
+static int bleExploreOnRead(uint16_t conn_handle, const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && attr != NULL && attr->om != NULL)
+  {
+    bleExploreDump("read", attr->handle, attr->om, slot);
+  }
+  else if (error->status != 0)
+  {
+    blePrintf("explore: read of handle %u failed: %d",
+              (unsigned)bleLinks[slot].exploreReadHandles[bleLinks[slot].exploreReadIndex],
+              error->status);
+  }
+
+  bleLinks[slot].exploreReadIndex++;
+  bleExploreReadNext(conn_handle, slot);
+  return 0;
+}
+
+static void bleExploreReadNext(uint16_t conn_handle, int slot)
+{
+  if (!bleSlotValid(slot)) return;
+
+  BleLink *link = &bleLinks[slot];
+
+  if (link->exploreReadIndex >= link->exploreReadCount)
+  {
+    link->busy = false;
+
+    if (link->pascoPresent)
+    {
+      link->pascoStep = 0;
+      link->pascoNextStepMs = millis();
+      link->pascoSampleBytes = 4;
+      bleLinkSetState(slot, "PASCO 준비 중");
+    }
+    else if (link->exploreCommandCount > 0)
+    {
+      link->exploreProbeIndex = 0;
+      link->exploreNextProbeMs = millis();
+      bleLinkSetState(slot, "측정 시작 명령 시도 중");
+    }
+    else
+    {
+      bleLinkSetState(slot, "분석 완료 · 데이터 대기");
+    }
+
+    return;
+  }
+
+  const uint16_t handle = link->exploreReadHandles[link->exploreReadIndex];
+
+  if (ble_gattc_read(conn_handle, handle, bleExploreOnRead, (void *)(intptr_t)slot) != 0)
+  {
+    link->exploreReadIndex++;
+    bleExploreReadNext(conn_handle, slot);
+  }
+}
+
+static int bleExploreOnDsc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+  (void)chr_val_handle;
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && dsc != NULL &&
+      ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16)
+  {
+    // Subscribe to everything that can notify. Which characteristic carries
+    // the reading is exactly what is not known yet.
+    const uint8_t enableNotify[2] = { 0x01, 0x00 };
+    if (ble_gattc_write_flat(conn_handle, dsc->handle, enableNotify,
+                             sizeof(enableNotify), NULL, NULL) == 0)
+    {
+      bleLinks[slot].exploreSubscribed++;
+      blePrintf("explore: subscribed via CCCD handle %u", (unsigned)dsc->handle);
+    }
+
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleExploreSetSummary(slot);
+  blePrintf("explore: done - %d service(s), %d characteristic(s), %d subscription(s)",
+            bleLinks[slot].exploreServices, bleLinks[slot].exploreChrs,
+            bleLinks[slot].exploreSubscribed);
+
+  // Nothing may ever be notified: a sensor that waits for a start command
+  // stays silent. Read whatever is readable, which on some parts hands over
+  // the current measurement anyway.
+  bleLinkSetState(slot, "특성 읽는 중");
+  bleLinks[slot].exploreReadIndex = 0;
+  bleExploreReadNext(conn_handle, slot);
+  return 0;
+}
+
+static int bleExploreOnChr(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_chr *chr, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && chr != NULL)
+  {
+    char uuid[BLE_UUID_STR_LEN];
+    ble_uuid_to_str(&chr->uuid.u, uuid);
+
+    // The property bits say which characteristic is worth listening to.
+    // write-without-response was missing from this list, and it is the one
+    // PASCO uses for commands - so the two characteristics that matter printed
+    // with an empty property list and were passed over.
+    blePrintf("explore: chr %s handle=%u props=%s%s%s%s%s",
+              uuid, (unsigned)chr->val_handle,
+              (chr->properties & BLE_GATT_CHR_PROP_READ) ? "read " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_WRITE) ? "write " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_WRITE_NO_RSP) ? "write-nr " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) ? "notify " : "",
+              (chr->properties & BLE_GATT_CHR_PROP_INDICATE) ? "indicate" : "");
+
+    blePascoNoteCharacteristic(slot, chr);
+
+    bleLinks[slot].exploreChrs++;
+
+    // The measurement service's writable characteristic is where a request
+    // would go. Handle 44 on the pressure sensor; found by shape, not by
+    // number, so another PASCO part lands on its own.
+    if ((chr->properties & BLE_GATT_CHR_PROP_WRITE) &&
+        (chr->properties & BLE_GATT_CHR_PROP_NOTIFY) &&
+        bleLinks[slot].exploreCommandCount < (int)(sizeof(bleLinks[slot].exploreCommandHandles) /
+                                                   sizeof(bleLinks[slot].exploreCommandHandles[0])))
+    {
+      bleLinks[slot].exploreCommandHandles[bleLinks[slot].exploreCommandCount++] = chr->val_handle;
+    }
+
+    if ((chr->properties & BLE_GATT_CHR_PROP_READ) &&
+        bleLinks[slot].exploreReadCount < (int)(sizeof(bleLinks[slot].exploreReadHandles) /
+                                                sizeof(bleLinks[slot].exploreReadHandles[0])))
+    {
+      bleLinks[slot].exploreReadHandles[bleLinks[slot].exploreReadCount++] = chr->val_handle;
+    }
+
+    bleExploreSetSummary(slot);
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleLinkSetState(slot, "구독 중");
+  ble_gattc_disc_all_dscs(conn_handle, 1, 0xFFFF, bleExploreOnDsc, arg);
+  return 0;
+}
+
+static int bleExploreOnSvc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           const struct ble_gatt_svc *service, void *arg)
+{
+  const int slot = (int)(intptr_t)arg;
+  if (!bleSlotValid(slot)) return 0;
+
+  if (error->status == 0 && service != NULL)
+  {
+    char uuid[BLE_UUID_STR_LEN];
+    ble_uuid_to_str(&service->uuid.u, uuid);
+    blePrintf("explore: service %s handles %u-%u", uuid,
+              (unsigned)service->start_handle, (unsigned)service->end_handle);
+
+    bleLinks[slot].exploreServices++;
+    bleExploreSetSummary(slot);
+    return 0;
+  }
+
+  if (error->status != BLE_HS_EDONE) return 0;
+
+  bleLinkSetState(slot, "특성 검색 중");
+  ble_gattc_disc_all_chrs(conn_handle, 1, 0xFFFF, bleExploreOnChr, arg);
+  return 0;
+}
+
+// Sends the next opener, if one is due. Called once a second from the board's
+// own loop, so the radio work stays off the callback stack.
+void bleLinkServiceExploration()
+{
+  bleLinkInitAll();
+
+  const int probeCount = (int)(sizeof(kBleProbeCommands) / sizeof(kBleProbeCommands[0]));
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    BleLink *link = &bleLinks[slot];
+
+    if (!link->exploring) continue;
+
+    if (link->pascoPresent)
+    {
+      blePascoService(slot);
+      continue;
+    }
+
+    if (link->exploreProbeIndex < 0 || link->exploreProbeIndex >= probeCount) continue;
+    if (link->exploreCommandCount == 0) continue;
+    if (link->connHandle == BLE_HS_CONN_HANDLE_NONE) continue;
+    if ((long)(millis() - link->exploreNextProbeMs) < 0) continue;
+
+    const BleProbeCommand *cmd = &kBleProbeCommands[link->exploreProbeIndex];
+
+    // Nothing to send while the table is empty.
+    if (cmd->len == 0)
+    {
+      link->exploreProbeIndex = probeCount;
+      bleLinkSetState(slot, "분석 완료 · 데이터 대기");
+      continue;
+    }
+
+    // Each opener goes to every command-shaped characteristic; which one is
+    // the way in is part of what is being established.
+    for (int i = 0; i < link->exploreCommandCount; i++)
+    {
+      blePrintf("explore: trying opener %s on handle %u",
+                cmd->note, (unsigned)link->exploreCommandHandles[i]);
+
+      ble_gattc_write_flat(link->connHandle, link->exploreCommandHandles[i],
+                           cmd->bytes, cmd->len, bleExploreOnWrite, NULL);
+    }
+
+    snprintf(link->exploreSummary, sizeof(link->exploreSummary),
+             "명령 시도 %s", cmd->note);
+
+    link->exploreProbeIndex++;
+    link->exploreNextProbeMs = millis() + 1500;
+
+    if (link->exploreProbeIndex >= probeCount)
+    {
+      blePrintf("explore: all openers tried; watching for anything new");
+      bleLinkSetState(slot, "명령 시도 끝 · 응답 관찰");
+    }
+  }
+}
+
+bool bleLinkSlotIsExploring(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].exploring;
+}
+
+const char *bleLinkExploreSummary(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].exploreSummary : "";
+}
+
+bool bleLinkConnect(const char *address)
+{
+  bleLinkInitAll();
+
+  if (!bleStarted) return false;
+  if (address == NULL || strlen(address) != 17) return false;
+
+  // An address already in a slot reconnects there rather than taking a second.
+  int slot = bleLinkSlotForAddress(address);
+
+  if (slot >= 0)
+  {
+    if (bleLinks[slot].subscribed || bleLinks[slot].busy) return true;
+  }
+  else
+  {
+    slot = bleLinkFreeSlot();
+  }
+
+  if (slot < 0)
+  {
+    blePrintf("no free slot: %d nodes already connected", BLE_LINK_MAX_NODES);
+    return false;
+  }
+
+  // Scanning and connecting cannot share the radio.
+  if (bleScanning)
+  {
+    ble_gap_disc_cancel();
+    bleScanning = false;
+  }
+
+  unsigned int b[6] = { 0 };
+  if (sscanf(address, "%02x:%02x:%02x:%02x:%02x:%02x",
+             &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+  {
+    return false;
+  }
+
+  ble_addr_t peer;
+  memset(&peer, 0, sizeof(peer));
+
+  // bleFormatAddr() prints most significant byte first; NimBLE stores it the
+  // other way round.
+  for (int i = 0; i < 6; i++) peer.val[i] = (uint8_t)b[5 - i];
+
+  // Use the type the advertisement carried. Deducing it from the address bits
+  // only recognises random-static; a sensor using a resolvable private address
+  // is deduced wrong, and ble_gap_connect accepts a wrong type and then simply
+  // fails - which is what the temperature sensor did on every attempt while
+  // the pressure sensor, on a public address, connected first time.
+  peer.type = ((peer.val[5] & 0xC0) == 0xC0) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strcmp(bleScanResults[i].address, address) == 0)
+    {
+      peer.type = bleScanResults[i].addrType;
+      break;
+    }
+  }
+
+  blePrintf("connecting to %s as addr type %d", address, (int)peer.type);
+
+  snprintf(bleLinks[slot].peerAddress, sizeof(bleLinks[slot].peerAddress), "%s", address);
+  snprintf(bleLinks[slot].peerName, sizeof(bleLinks[slot].peerName), "%s", address);
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strcmp(bleScanResults[i].address, address) == 0 && bleScanResults[i].name[0])
+    {
+      snprintf(bleLinks[slot].peerName, sizeof(bleLinks[slot].peerName), "%s",
+               bleScanResults[i].name);
+      break;
+    }
+  }
+
+  bleLinks[slot].busy = true;
+  bleLinks[slot].hasReading = false;
+  bleLinks[slot].notifyCount = 0;
+  bleLinks[slot].exploreServices = 0;
+  bleLinks[slot].exploreChrs = 0;
+  bleLinks[slot].exploreSubscribed = 0;
+  bleLinks[slot].exploreReadCount = 0;
+  bleLinks[slot].exploreReadIndex = 0;
+  bleLinks[slot].exploreCommandCount = 0;
+  bleLinks[slot].exploreProbeIndex = -1;
+  bleLinks[slot].pascoPresent = false;
+  bleLinks[slot].pascoStep = 0;
+  bleLinks[slot].pascoSensorId = 0;
+  bleLinks[slot].pascoSampleBytes = PASCO_SAMPLE_BYTES;
+  memset(bleLinks[slot].pascoHandle, 0, sizeof(bleLinks[slot].pascoHandle));
+
+  bleLinks[slot].pascoKind = PASCO_KIND_UNKNOWN;
+  if (strstr(bleLinks[slot].peerName, "Pressure") != NULL)
+  {
+    bleLinks[slot].pascoKind = PASCO_KIND_PRESSURE;
+  }
+  else if (strstr(bleLinks[slot].peerName, "Temperature") != NULL)
+  {
+    bleLinks[slot].pascoKind = PASCO_KIND_TEMPERATURE;
+  }
+  bleLinks[slot].exploreSummary[0] = '\0';
+  bleLinkSetState(slot, bleLinks[slot].exploring ? "분석 연결 중" : "연결 중");
+
+  const int rc = ble_gap_connect(bleAddrType, &peer, 10000, NULL,
+                                 bleLinkGapEvent, (void *)(intptr_t)slot);
+
+  if (rc != 0)
+  {
+    blePrintf("slot %d: ble_gap_connect failed: %d", slot, rc);
+    bleLinkClear(slot, "연결 실패", true);
+    return false;
+  }
+
+  return true;
+}
+
+bool bleLinkExplore(const char *address)
+{
+  bleLinkInitAll();
+
+  const int existing = bleLinkSlotForAddress(address);
+  if (existing >= 0) bleLinkDisconnectSlot(existing);
+
+  const int slot = bleLinkFreeSlot();
+  if (slot < 0) return false;
+
+  // Set before connecting: the GAP callback reads it to decide which discovery
+  // to run.
+  bleLinks[slot].exploring = true;
+
+  if (!bleLinkConnect(address))
+  {
+    bleLinks[slot].exploring = false;
+    return false;
+  }
+
+  return true;
+}
+
+void bleLinkDisconnectSlot(int slot)
+{
+  bleLinkInitAll();
+  if (!bleSlotValid(slot)) return;
+
+  if (bleLinks[slot].connHandle != BLE_HS_CONN_HANDLE_NONE)
+  {
+    ble_gap_terminate(bleLinks[slot].connHandle, BLE_ERR_REM_USER_CONN_TERM);
+  }
+
+  bleLinkClear(slot, "연결 안 됨", false);
+}
+
+void bleLinkDisconnect()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++) bleLinkDisconnectSlot(i);
+}
+
+bool bleLinkSlotIsSubscribed(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].subscribed;
+}
+
+bool bleLinkSlotIsBusy(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) && bleLinks[slot].busy;
+}
+
+bool bleLinkIsBusy()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsBusy(i)) return true;
+  }
+
+  return false;
+}
+
+int bleLinkNodeCount()
+{
+  int count = 0;
+
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsSubscribed(i)) count++;
+  }
+
+  return count;
+}
+
+int bleLinkFirstSubscribedSlot()
+{
+  for (int i = 0; i < BLE_LINK_MAX_NODES; i++)
+  {
+    if (bleLinkSlotIsSubscribed(i)) return i;
+  }
+
+  return -1;
+}
+
+const char *bleLinkSlotName(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].peerName : "";
+}
+
+const char *bleLinkSlotState(int slot)
+{
+  bleLinkInitAll();
+  return bleSlotValid(slot) ? bleLinks[slot].state : "연결 안 됨";
+}
+
+int bleLinkValueCount(int slot)
+{
+  bleLinkInitAll();
+  if (!bleSlotValid(slot) || !bleLinks[slot].hasReading) return 0;
+
+  int commas = 0;
+  for (const char *c = bleLinks[slot].payload; *c; c++)
+  {
+    if (*c == ',') commas++;
+  }
+
+  // One timestamp then groups of three. An incomplete trailing group - which
+  // is what a too-small MTU produces - is not counted, so a clipped packet
+  // yields fewer values rather than a wrong one.
+  int groups = commas / 3;
+  if (groups > BLE_LINK_MAX_VALUES) groups = BLE_LINK_MAX_VALUES;
+  return groups;
+}
+
+bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs)
+{
+  if (index < 0 || index >= bleLinkValueCount(slot)) return false;
+
+  const BleLink *link = &bleLinks[slot];
+
+  char work[sizeof(link->payload)];
+  snprintf(work, sizeof(work), "%s", link->payload);
+
+  char *fields[1 + 3 * BLE_LINK_MAX_VALUES];
+  const int maxFields = (int)(sizeof(fields) / sizeof(fields[0]));
+  int found = 0;
+  char *cursor = work;
+
+  fields[found++] = cursor;
+
+  while (*cursor && found < maxFields)
+  {
+    if (*cursor == ',')
+    {
+      *cursor = '\0';
+      fields[found++] = cursor + 1;
+    }
+    cursor++;
+  }
+
+  const int base = 1 + index * 3;   // field 0 is the node's own timestamp
+  if (base + 2 >= found) return false;
+
+  if (name) snprintf(name, 24, "%s", fields[base]);
+  if (value) *value = strtof(fields[base + 1], NULL);
+  if (unit) snprintf(unit, 24, "%s", fields[base + 2]);
+
+  if (ageMs)
+  {
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    *ageMs = now - link->payloadMs;
+  }
+
+  return true;
+}
+
+// bleFormatServices() prints a 128-bit UUID as its leading four bytes, which
+// is enough to tell this project's nodes from anything else in the room.
+#define BLE_SENSOR_SERVICE_TAG "6e5f0001"
+
+int bleAutoLinkToSensorNode()
+{
+  bleLinkInitAll();
+
+  int started = 0;
+
+  for (int i = 0; i < bleScanCount; i++)
+  {
+    if (strstr(bleScanResults[i].services, BLE_SENSOR_SERVICE_TAG) == NULL) continue;
+
+    const int existing = bleLinkSlotForAddress(bleScanResults[i].address);
+    if (existing >= 0 && (bleLinks[existing].subscribed || bleLinks[existing].busy)) continue;
+
+    if (bleLinkFreeSlot() < 0 && existing < 0) break;
+
+    blePrintf("auto-linking to %s (%s, %d dBm)",
+              bleScanResults[i].name[0] ? bleScanResults[i].name : "(unnamed)",
+              bleScanResults[i].address, bleScanResults[i].rssi);
+
+    if (bleLinkConnect(bleScanResults[i].address)) started++;
+  }
+
+  return started;
+}
+
 #else  // BLE_SENSOR_SUPPORTED
 
 bool bleSensorBegin(const char *deviceName) { (void)deviceName; return false; }
@@ -535,5 +1876,27 @@ bool bleScanResultAt(int index, BleScanResult *out) { (void)index; (void)out; re
 void bleScanDumpResults() {}
 bool bleScanResultIsCandidate(const BleScanResult *r) { (void)r; return false; }
 int bleScanCandidateCount() { return 0; }
+bool bleLinkConnect(const char *address) { (void)address; return false; }
+void bleLinkDisconnectSlot(int slot) { (void)slot; }
+void bleLinkDisconnect() {}
+int bleLinkNodeCount() { return 0; }
+int bleLinkFirstSubscribedSlot() { return -1; }
+bool bleLinkSlotIsSubscribed(int slot) { (void)slot; return false; }
+bool bleLinkSlotIsBusy(int slot) { (void)slot; return false; }
+bool bleLinkIsBusy() { return false; }
+int bleLinkSlotForAddress(const char *address) { (void)address; return -1; }
+const char *bleLinkSlotName(int slot) { (void)slot; return ""; }
+const char *bleLinkSlotState(int slot) { (void)slot; return "지원 안 함"; }
+int bleLinkValueCount(int slot) { (void)slot; return 0; }
+bool bleLinkValueAt(int slot, int index, float *value, char *name, char *unit, uint32_t *ageMs)
+{
+  (void)slot; (void)index; (void)value; (void)name; (void)unit; (void)ageMs;
+  return false;
+}
+int bleAutoLinkToSensorNode() { return 0; }
+bool bleLinkExplore(const char *address) { (void)address; return false; }
+void bleLinkServiceExploration() {}
+bool bleLinkSlotIsExploring(int slot) { (void)slot; return false; }
+const char *bleLinkExploreSummary(int slot) { (void)slot; return ""; }
 
 #endif  // BLE_SENSOR_SUPPORTED
