@@ -7102,8 +7102,18 @@ void updateIslServerLabel()
                        strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0;
 
   char text[160];
-  snprintf(text, sizeof(text), "%s / %s", islApiHost,
-           haveKey ? "인증키 있음" : "인증키 없음");
+
+  // 글자 수를 보여 줍니다. 가려진 칸에 44자를 넣다 보면 한두 자가 빠지는데,
+  // 그러면 서버는 "인증키가 일치하지 않습니다"라고만 하고 어디가 틀렸는지는
+  // 말해 주지 않습니다. 길이는 화면에서 바로 셀 수 있습니다.
+  if (haveKey)
+  {
+    snprintf(text, sizeof(text), "%s / 인증키 %d자", islApiHost, (int)strlen(islServiceKey));
+  }
+  else
+  {
+    snprintf(text, sizeof(text), "%s / 인증키 없음", islApiHost);
+  }
 
   lv_label_set_text(labelIslServer, text);
 }
@@ -10200,19 +10210,42 @@ void saveIslServiceKey(const char *key)
   else Serial.println("NVS ISL serviceKey save failed");
 }
 
-bool loadIslServiceKey()
+static bool islReadServiceKeySlot(const char *name)
 {
   nvs_handle_t handle;
-  esp_err_t ret = nvs_open("isl_cfg", NVS_READONLY, &handle);
-  if (ret != ESP_OK) return false;
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return false;
 
-  size_t keyLen = sizeof(islServiceKey);
-  ret = nvs_get_str(handle, islServiceKeyNvsName(), islServiceKey, &keyLen);
+  char stored[sizeof(islServiceKey)];
+  stored[0] = '\0';
+
+  size_t keyLen = sizeof(stored);
+  esp_err_t ret = nvs_get_str(handle, name, stored, &keyLen);
   nvs_close(handle);
 
-  if (ret == ESP_OK && strlen(islServiceKey) > 0)
+  if (ret != ESP_OK || strlen(stored) == 0) return false;
+
+  snprintf(islServiceKey, sizeof(islServiceKey), "%s", stored);
+  return true;
+}
+
+bool loadIslServiceKey()
+{
+  if (islReadServiceKeySlot(islServiceKeyNvsName()))
   {
     Serial.printf("NVS ISL serviceKey loaded (%s)\n", islServiceKeyNvsName());
+    return true;
+  }
+
+  // 운영과 테스트가 같은 인증키를 쓰는 경우가 있습니다. 고른 서버 칸이 비었다고
+  // 마흔 글자를 다시 타이핑하게 만드느니 반대쪽 칸의 키를 가져와 이 칸에도 넣어
+  // 둡니다. 키가 정말 다른 서버라면 그쪽이 거절해서 알려 줍니다 - 조용히 비어
+  // 있는 것보다 나은 실패입니다.
+  const char *other = islUseTestServer ? "serviceKey" : "keyTest";
+
+  if (islReadServiceKeySlot(other))
+  {
+    Serial.printf("NVS ISL serviceKey carried over from %s\n", other);
+    saveIslServiceKey(islServiceKey);
     return true;
   }
 
@@ -10249,8 +10282,8 @@ void islApplyServerChoice(bool useTest, bool persist)
   // opens a fresh 탐구 rather than posting into a session that does not exist.
   resetDirectIslSessionCache(useTest ? "test server selected" : "production server selected");
 
-  // 이 서버의 키로 갈아탑니다. 없으면 비워 두어, 화면이 "인증키 없음"이라고
-  // 말하게 합니다. 반대쪽 서버의 키로 조용히 실패하는 것보다 낫습니다.
+  // 이 서버의 키로 갈아탑니다. 그 칸이 비어 있으면 loadIslServiceKey()가
+  // 반대쪽 키를 가져옵니다.
   islServiceKey[0] = '\0';
   loadIslServiceKey();
 
@@ -10376,6 +10409,102 @@ void updateIslModuleCodeFromUi()
   islApiConfigured = cloudModumConfigured();
 }
 
+// 44자짜리 인증키를 가려진 터치 키보드로 넣다 보면 글자가 빠집니다. 오늘 전송이
+// 막힌 이유가 정확히 그것이었습니다 - 42자가 들어가 있었고, 서버는 013으로
+// 그렇게 말했는데 화면에는 "start 응답 오류"로만 보였습니다. 붙여넣을 길을 둡니다.
+//
+//   status            지금 무엇으로 보내려 하는지
+//   key <값>          고른 서버의 인증키
+//   modum <코드>      모둠코드
+//   server prod|test  운영 / 테스트
+static void handleSerialCommand(char *line)
+{
+  while (*line == ' ') line++;
+  if (*line == '\0') return;
+
+  char *arg = strchr(line, ' ');
+
+  if (arg != NULL)
+  {
+    *arg = '\0';
+    arg++;
+    while (*arg == ' ') arg++;
+
+    // 붙여넣기에 딸려 오는 꼬리 공백은 키의 일부가 아닙니다.
+    size_t end = strlen(arg);
+    while (end > 0 && (arg[end - 1] == ' ' || arg[end - 1] == '\t')) arg[--end] = '\0';
+  }
+
+  if (strcmp(line, "status") == 0)
+  {
+    Serial.printf("[CMD] server=%s key=%d자 modum=%s\n", islApiHost,
+                  (int)strlen(islServiceKey),
+                  strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+    return;
+  }
+
+  if (strcmp(line, "key") == 0 && arg != NULL && *arg != '\0')
+  {
+    snprintf(islServiceKey, sizeof(islServiceKey), "%s", arg);
+    saveIslServiceKey(islServiceKey);
+
+    // 키가 바뀌었으면 앞 서버에서 받은 uniqueCode는 남의 것입니다.
+    resetDirectIslSessionCache("service key changed");
+
+    if (islServiceKeyTa) lv_textarea_set_text(islServiceKeyTa, islServiceKey);
+    updateIslServerLabel();
+
+    Serial.printf("[CMD] %s 인증키 저장: %d자\n", islApiHost, (int)strlen(islServiceKey));
+    return;
+  }
+
+  if (strcmp(line, "modum") == 0 && arg != NULL && *arg != '\0')
+  {
+    sanitizeIslModuleCode(arg, islRuntimeSerialNumber, sizeof(islRuntimeSerialNumber));
+    saveIslModuleCode(islRuntimeSerialNumber);
+    resetDirectIslSessionCache("modum code changed");
+
+    if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
+    if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+    updateIslStatusLabels();
+
+    Serial.printf("[CMD] 모둠코드 저장: %s\n", islRuntimeSerialNumber);
+    return;
+  }
+
+  if (strcmp(line, "server") == 0 && arg != NULL)
+  {
+    islApplyServerChoice(strcmp(arg, "test") == 0, true);
+    Serial.printf("[CMD] server=%s key=%d자\n", islApiHost, (int)strlen(islServiceKey));
+    return;
+  }
+
+  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test");
+}
+
+void serviceSerialConsole()
+{
+  static char line[192];
+  static size_t used = 0;
+
+  while (Serial.available() > 0)
+  {
+    const char c = (char)Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c != '\n')
+    {
+      if (used < sizeof(line) - 1) line[used++] = c;
+      continue;
+    }
+
+    line[used] = '\0';
+    used = 0;
+    handleSerialCommand(line);
+  }
+}
+
 void updateIslStatusLabels()
 {
   updateDashboardIslLabels();
@@ -10408,6 +10537,11 @@ bool ensureEspHostedTransport()
 #endif
 }
 
+#if HAS_IDF_WIFI
+// Defined with the rest of the WiFi failure reporting, below.
+static void wifiEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data);
+#endif
+
 bool ensureHostedWifiStarted()
 {
 #if !HAS_ESP_HOSTED
@@ -10439,6 +10573,9 @@ bool ensureHostedWifiStarted()
     {
       wifiStaNetif = esp_netif_create_default_wifi_sta();
     }
+
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                        wifiEventHandler, NULL, NULL);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&cfg);
@@ -10591,6 +10728,73 @@ void verifyDnsOrFallback()
 #endif
 }
 
+// The C6 says why it dropped us, in an event nobody was listening to. Twelve
+// seconds of silence followed by "timeout" cannot tell a wrong password from a
+// network that is not on the air, and those need opposite fixes.
+static volatile int lastWifiDisconnectReason = 0;
+
+static const char *wifiDisconnectReasonText(int reason)
+{
+  switch (reason)
+  {
+    case 0:   return "";
+    case 201: return "그 이름의 네트워크가 보이지 않습니다 (5GHz 전용이거나 범위 밖)";
+    case 202: return "비밀번호가 맞지 않습니다";
+    case 15:  return "비밀번호가 맞지 않습니다 (4-way handshake 실패)";
+    case 205: return "공유기가 응답하다 끊었습니다 (신호가 약합니다)";
+    case 203: return "공유기가 접속을 거절했습니다";
+    case 2:   return "인증이 만료되었습니다";
+    case 4:   return "연결이 만료되었습니다";
+    case 8:   return "공유기가 연결을 끊었습니다";
+    default:  return "공유기가 연결을 끊었습니다";
+  }
+}
+
+#if HAS_IDF_WIFI
+static void wifiEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+  (void)arg;
+
+  if (base != WIFI_EVENT || id != WIFI_EVENT_STA_DISCONNECTED) return;
+
+  wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)data;
+  if (event == NULL) return;
+
+  lastWifiDisconnectReason = (int)event->reason;
+
+  Serial.printf("[WIFI] disconnected: reason %d - %s\n", (int)event->reason,
+                wifiDisconnectReasonText((int)event->reason));
+}
+#endif
+
+int c6WifiScan(WifiNetworkInfo *results, int maxResults);
+
+// True when a network of this name is on the air, and says how loud it is.
+// Asked only after a failure, to separate "wrong password" from "not there".
+static bool wifiSsidIsVisible(const char *ssid, int *rssiOut)
+{
+#if HAS_IDF_WIFI
+  WifiNetworkInfo found[WIFI_SCAN_MAX];
+  const int count = c6WifiScan(found, WIFI_SCAN_MAX);
+
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(found[i].ssid, ssid) == 0)
+    {
+      if (rssiOut) *rssiOut = found[i].rssi;
+      return true;
+    }
+  }
+
+  Serial.printf("[WIFI] %s not among the %d networks on the air\n", ssid, count);
+  return false;
+#else
+  (void)ssid;
+  (void)rssiOut;
+  return true;
+#endif
+}
+
 bool c6WifiConnect(const char *ssid, const char *password)
 {
   if (ssid == NULL || strlen(ssid) == 0)
@@ -10618,6 +10822,8 @@ bool c6WifiConnect(const char *ssid, const char *password)
   }
 
   esp_wifi_disconnect();
+
+  lastWifiDisconnectReason = 0;
 
   esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifiConfig);
   if (ret != ESP_OK)
@@ -10669,13 +10875,43 @@ bool c6WifiConnect(const char *ssid, const char *password)
       }
 
       Serial.println("WiFi connected, but DHCP IP is not assigned yet");
+      setIslStatusText("WiFi: 접속했지만 IP를 못 받았습니다");
       return false;
     }
 
     delay(100);
   }
 
-  Serial.println("WiFi connect timeout");
+  // Twelve seconds gone. The C6 usually said why while we were waiting; if it
+  // said nothing at all, the network is most likely not on the air, so ask.
+  const int reason = lastWifiDisconnectReason;
+  char note[160];
+
+  if (reason != 0)
+  {
+    Serial.printf("WiFi connect failed: reason %d - %s\n", reason,
+                  wifiDisconnectReasonText(reason));
+    snprintf(note, sizeof(note), "WiFi: %s", wifiDisconnectReasonText(reason));
+  }
+  else
+  {
+    int rssi = 0;
+
+    if (wifiSsidIsVisible(ssid, &rssi))
+    {
+      Serial.printf("WiFi connect timeout; %s is on the air at %d dBm\n", ssid, rssi);
+      snprintf(note, sizeof(note),
+               "WiFi: %s는 보이는데(%d dBm) 접속이 안 됩니다 - 비밀번호를 확인하세요",
+               ssid, rssi);
+    }
+    else
+    {
+      snprintf(note, sizeof(note),
+               "WiFi: %s가 보이지 않습니다 - 이 보드는 2.4GHz만 됩니다", ssid);
+    }
+  }
+
+  setIslStatusText(note);
   return false;
 #else
 #if HAS_ARDUINO_WIFI
@@ -11407,6 +11643,13 @@ bool directIslStartProcess(const char *modumId)
 {
 #if REALTIME_DIRECT_ISL_ENABLED
   if (!ensureWifiReadyForHttp("직접전송", 20000)) return false;
+
+  // 전송이 안 될 때 물어볼 것이 셋뿐입니다: 어느 서버인가, 키가 있는가,
+  // 모둠코드가 있는가. 세 답을 한 줄로 남깁니다.
+  Serial.printf("[ISL] start: host=%s key=%d자 modum=%s\n",
+                islApiHost, (int)strlen(islServiceKey),
+                strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+
   if (!directIslConfigured())
   {
     setIslStatusText("직접전송: serviceKey/모둠코드 필요");
@@ -13678,6 +13921,8 @@ void loop()
     uiTimerHandler();
     servicePendingScreenSwitch();
   }
+
+  serviceSerialConsole();
 
   // Sensor initialization and WiFi commands run outside LVGL callbacks.
   servicePendingSensorMode();
