@@ -359,7 +359,19 @@ static const BleIslMapping kBleIslMappings[] = {
   // registers with exactly these, so a node carrying one looks the same to the
   // platform as the local part.
   { "ppm",  "CTRT", "이산화탄소센서", "01", "ppm" },
-  { "%",    "HMDT", "습도센서",       "01", "%" }
+  { "%",    "HMDT", "습도센서",       "01", "%" },
+
+  // 노드가 낼 수 있는 나머지 단위 전부. 이 표에 없는 단위는 "전송 미지원"이
+  // 되어, 센서를 갈아 끼운 사람에게는 보드가 고장난 것처럼 보입니다 -
+  // 조도로 바꾸자마자 전송이 멈춘 것이 정확히 그것이었습니다. 노드가 sensors.cpp
+  // 에서 쓰는 단위 문자열과 한 줄씩 맞춰 둡니다.
+  //
+  // 조도와 거리 코드는 보드에 직접 꽂았을 때 쓰는 것과 같은 것을 씁니다.
+  { "lx",   "ILM",  "조도센서",       "01", "lx" },
+  { "mm",   "DITC", "거리센서",       "01", "mm" },
+  { "A",    "ECRT", "전류센서",       "01", "A" },
+  { "V",    "VOLT", "전압센서",       "01", "V" },
+  { "W",    "EPOW", "전력센서",       "01", "W" }
 };
 
 // Pulls the active node's quantity names, units and count out of its last
@@ -1537,8 +1549,6 @@ static void board_restart_event_cb(lv_event_t *e)
 static void dashboard_isl_save_event_cb(lv_event_t *e);
 static void dashboard_isl_start_event_cb(lv_event_t *e);
 static void dashboard_isl_stop_event_cb(lv_event_t *e);
-static void dashboard_cloud_realtime_event_cb(lv_event_t *e);
-static void dashboard_cloud_batch_event_cb(lv_event_t *e);
 static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e);
 static void dashboard_csv_mount_event_cb(lv_event_t *e);
 static void dashboard_csv_toggle_event_cb(lv_event_t *e);
@@ -5630,8 +5640,7 @@ void updateCloudModeLabel()
     snprintf(
       text,
       sizeof(text),
-      "방식: %s / 저장 %d개 / 전송중 %d/%d",
-      cloudUploadModeName(),
+      "저장 %d개 / 전송중 %d/%d",
       sampleCount,
       batchUploadProgressSent,
       batchUploadProgressTotal
@@ -5642,8 +5651,7 @@ void updateCloudModeLabel()
     snprintf(
       text,
       sizeof(text),
-      "방식: %s / 저장 %d개 / 일괄전송 %d/%d / 실시간간격 %d초",
-      cloudUploadModeName(),
+      "저장 %d개 / 일괄전송 %d/%d / 실시간간격 %d초",
       sampleCount,
       batchUploadProgressSent,
       batchUploadProgressTotal,
@@ -7139,96 +7147,6 @@ static void dashboard_isl_server_test_event_cb(lv_event_t *e)
   updateIslStatusLabels();
 }
 
-static void dashboard_cloud_realtime_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (isBatchUploading())
-  {
-    setIslStatusText("일괄전송 중: 실시간 전환 무시");
-    return;
-  }
-
-  updateIslModuleCodeFromUi();
-  cloudUploadMode = CLOUD_UPLOAD_REALTIME;
-
-  if (measuring)
-  {
-    // 일괄전송에서 실시간으로 전환하면 이후 새 샘플부터 실시간 전송한다.
-    // 과거에 모아둔 값은 자동으로 섞어 보내지 않는다.
-    clearCloudQueue();
-    if (!activeSensorSupportsDirectIsl())
-    {
-      setIslStatusText("현재 센서: 보드 측정 모드 / ON 전송 미지원");
-    }
-    else if (cloudModumConfigured())
-    {
-      resetDirectIslSessionCache("realtime mode switch");
-      queueCloudAction("start");
-      setIslStatusText("직접전송: 실시간 전환 - 새 세션 시작");
-    }
-    else
-    {
-      setIslStatusText("전송: 실시간 전환 - 모둠코드 필요");
-    }
-  }
-  else
-  {
-    setIslStatusText("전송: 실시간 전송 모드");
-  }
-
-  updateCloudModeLabel();
-  updateIslStatusLabels();
-}
-
-static void dashboard_cloud_batch_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (isBatchUploading())
-  {
-    setIslStatusText("일괄전송 중: 모드 전환 무시");
-    return;
-  }
-
-  updateIslModuleCodeFromUi();
-
-  bool wasRealtimeMeasuring = measuring && cloudUploadMode == CLOUD_UPLOAD_REALTIME;
-  cloudUploadMode = CLOUD_UPLOAD_BATCH;
-
-  if (wasRealtimeMeasuring)
-  {
-    // 핵심 수정:
-    // 실시간 구간은 이미 지능형과학실/Google Sheets로 전송된 값이 있으므로
-    // 일괄전송 전환 시점 이후의 새 샘플만 일괄전송 대상으로 삼는다.
-    // 여기서 stop을 보내면 지능형과학실 세션이 꼬일 수 있으므로 즉시 stop하지 않는다.
-    // 최종 stop은 [일괄] 전송 완료 후 한 번만 보낸다.
-    batchUploadStartIndex = sampleCount;
-    // 실시간 그래프 세션은 즉시 정리하고, 이후부터 보드 내부에만 저장한다.
-    // batch 전송은 나중에 [일괄전송] 버튼에서 처리한다.
-    if (activeSensorSupportsDirectIsl())
-    {
-      queueCloudAction("stop");
-      setIslStatusText("일괄전송 전환: 실시간 정지 요청");
-    }
-    else
-    {
-      setIslStatusText("현재 센서: 일괄 직접전송 코드 미설정");
-    }
-  }
-  else if (measuring)
-  {
-    setIslStatusText("일괄전송 측정 중");
-  }
-  else
-  {
-    // 정지 상태에서 일괄전송을 선택하면 새 실험 구간 전체를 보낼 수 있게 0부터 시작한다.
-    batchUploadStartIndex = 0;
-    setIslStatusText("일괄전송 모드");
-  }
-
-  updateCloudModeLabel();
-  updateIslStatusLabels();
-}
-
 static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
 {
   // V3 DEBUG: 버튼 callback 자체가 들어오는지 가장 먼저 확인합니다.
@@ -7337,7 +7255,8 @@ static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
     if (labelStatus) lv_label_set_text(labelStatus, "정지");
   }
 
-  cloudUploadMode = CLOUD_UPLOAD_BATCH;
+  // 여기서 모드를 바꾸지 않습니다. 위에서 측정을 이미 멈췄으니 새 샘플은 오지
+  // 않고, 이 업로드가 끝나면 보드는 그대로 실시간 상태로 남아 있어야 합니다.
 
   // 현재까지 누적된 전체 샘플을 보냅니다.
   batchUploadStartIndex = 0;
@@ -8441,10 +8360,13 @@ void createIslUi()
   makePrimaryButton(card, "저장", 600, 128, 150, 46, UI_ACCENT, dashboard_isl_save_event_cb);
   makeQuietButton(card, "전송 시작", 760, 128, 184, 46, dashboard_isl_start_event_cb);
 
-  makeSmallLabel(card, "전송 방식", 24, 194, UI_TEXT_3);
-  makeQuietButton(card, "실시간", 120, 186, 130, 40, dashboard_cloud_realtime_event_cb);
-  makeQuietButton(card, "일괄전송", 260, 186, 150, 40, dashboard_cloud_batch_event_cb);
-  makeQuietButton(card, "전송 중지", 420, 186, 150, 40, dashboard_isl_stop_event_cb);
+  // 전송 방식은 더 이상 고르는 것이 아닙니다. 측정하면 실시간으로 나가고,
+  // 일괄전송은 측정 화면의 버튼을 누른 그때 한 번만 일어납니다. 모드가 남아
+  // 있으면 측정은 되는데 아무것도 안 나가는 상태가 생기고, 그건 보드가 고장난
+  // 것처럼 보입니다.
+  makeSmallLabel(card, "전송", 24, 194, UI_TEXT_3);
+  makeQuietButton(card, "전송 중지", 120, 186, 150, 40, dashboard_isl_stop_event_cb);
+  makeSmallLabel(card, "측정을 시작하면 실시간으로 전송됩니다.", 290, 196, UI_TEXT_3);
 
   labelCloudMode = makeSmallLabel(card, "", 588, 198, UI_TEXT_3);
   lv_obj_set_width(labelCloudMode, 356);
@@ -10441,7 +10363,7 @@ void updateIslModuleCodeFromUi()
 //   modum <코드>          모둠코드
 //   server prod|test      운영 / 테스트
 //   host <주소>           테스트 서버의 호스트
-//   mode realtime|batch   실시간 / 일괄전송
+//   start                 인증 3단계만 실행
 static void handleSerialCommand(char *line)
 {
   while (*line == ' ') line++;
@@ -10501,64 +10423,7 @@ static void handleSerialCommand(char *line)
     return;
   }
 
-  if (strcmp(line, "mode") == 0 && arg != NULL)
-  {
-    const bool wantBatch = (strcmp(arg, "batch") == 0);
-    cloudUploadMode = wantBatch ? CLOUD_UPLOAD_BATCH : CLOUD_UPLOAD_REALTIME;
-
-    // 측정 중에 실시간으로 바꾸면 버튼과 같은 일을 해야 합니다 - 새 세션을
-    // 열지 않으면 다음 샘플이 갈 곳이 없습니다.
-    if (!wantBatch && measuring && cloudModumConfigured() && activeSensorSupportsDirectIsl())
-    {
-      resetDirectIslSessionCache("mode command");
-      clearCloudQueue();
-      queueCloudAction("start");
-    }
-
-    updateCloudModeLabel();
-    updateIslStatusLabels();
-
-    Serial.printf("[CMD] mode=%s\n", cloudUploadModeName());
-    return;
-  }
-
-  if (strcmp(line, "key") == 0 && arg != NULL && *arg != '\0')
-  {
-    snprintf(islServiceKey, sizeof(islServiceKey), "%s", arg);
-    saveIslServiceKey(islServiceKey);
-
-    // 키가 바뀌었으면 앞 서버에서 받은 uniqueCode는 남의 것입니다.
-    resetDirectIslSessionCache("service key changed");
-
-    if (islServiceKeyTa) lv_textarea_set_text(islServiceKeyTa, islServiceKey);
-    updateIslServerLabel();
-
-    Serial.printf("[CMD] %s 인증키 저장: %d자\n", islApiHost, (int)strlen(islServiceKey));
-    return;
-  }
-
-  if (strcmp(line, "modum") == 0 && arg != NULL && *arg != '\0')
-  {
-    sanitizeIslModuleCode(arg, islRuntimeSerialNumber, sizeof(islRuntimeSerialNumber));
-    saveIslModuleCode(islRuntimeSerialNumber);
-    resetDirectIslSessionCache("modum code changed");
-
-    if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
-    if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
-    updateIslStatusLabels();
-
-    Serial.printf("[CMD] 모둠코드 저장: %s\n", islRuntimeSerialNumber);
-    return;
-  }
-
-  if (strcmp(line, "server") == 0 && arg != NULL)
-  {
-    islApplyServerChoice(strcmp(arg, "test") == 0, true);
-    Serial.printf("[CMD] server=%s key=%d자\n", islApiHost, (int)strlen(islServiceKey));
-    return;
-  }
-
-  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | host <주소> | mode realtime|batch | start");
+  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | host <주소> | start");
 }
 
 void serviceSerialConsole()
