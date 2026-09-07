@@ -5285,6 +5285,17 @@ lv_obj_t *makeArrowButton(lv_obj_t *parent, const char *text, int x, int y, int 
   return btn;
 }
 
+// 화면마다 한 줄씩 손으로 적어 두면 나중에 만든 화면이 빠집니다. 보일의 법칙과
+// 설정, 블루투스 화면의 시계와 WiFi 표시가 멈춰 있던 것이 그 때문이었습니다 -
+// 라벨은 만들어졌는데 갱신 목록에 이름이 없었습니다. 상태바가 스스로 등록하면
+// 빠질 수가 없습니다.
+#define STATUS_BAR_MAX 12
+
+static lv_obj_t *statusBarTime[STATUS_BAR_MAX];
+static lv_obj_t *statusBarWifi[STATUS_BAR_MAX];
+static lv_obj_t *statusBarSd[STATUS_BAR_MAX];
+static int statusBarCount = 0;
+
 void createStatusBar(
   lv_obj_t *parent,
   const char *title,
@@ -5340,6 +5351,14 @@ void createStatusBar(
   lv_obj_set_style_text_font(*wifiLabel, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(UI_TEXT_3), 0);
   lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -64, 0);
+
+  if (statusBarCount < STATUS_BAR_MAX)
+  {
+    statusBarTime[statusBarCount] = *timeLabel;
+    statusBarWifi[statusBarCount] = *wifiLabel;
+    statusBarSd[statusBarCount] = *sdLabel;
+    statusBarCount++;
+  }
 }
 
 // Green when the thing is actually working, muted grey otherwise.
@@ -5354,27 +5373,14 @@ void updateStatusBars()
   String nowText = getCurrentDateTimeText();
   String shortTime = nowText.substring(0, 16);
 
-  if (labelBarHomeTime) lv_label_set_text(labelBarHomeTime, shortTime.c_str());
-  if (labelBarMeasureTime) lv_label_set_text(labelBarMeasureTime, shortTime.c_str());
-  if (labelBarSettingsTime) lv_label_set_text(labelBarSettingsTime, shortTime.c_str());
-  if (labelBarIslTime) lv_label_set_text(labelBarIslTime, shortTime.c_str());
-  if (labelBarCsvTime) lv_label_set_text(labelBarCsvTime, shortTime.c_str());
-  if (labelBarFileViewerTime) lv_label_set_text(labelBarFileViewerTime, shortTime.c_str());
-
-  setStatusIconState(labelBarHomeWifi, wifiConnected);
-  setStatusIconState(labelBarMeasureWifi, wifiConnected);
-  setStatusIconState(labelBarSettingsWifi, wifiConnected);
-  setStatusIconState(labelBarIslWifi, wifiConnected);
-  setStatusIconState(labelBarCsvWifi, wifiConnected);
-  setStatusIconState(labelBarFileViewerWifi, wifiConnected);
-
   const bool sdActive = sdReady && csvLoggingEnabled;
-  setStatusIconState(labelBarHomeSd, sdActive);
-  setStatusIconState(labelBarMeasureSd, sdActive);
-  setStatusIconState(labelBarSettingsSd, sdActive);
-  setStatusIconState(labelBarIslSd, sdActive);
-  setStatusIconState(labelBarCsvSd, sdActive);
-  setStatusIconState(labelBarFileViewerSd, sdActive);
+
+  for (int i = 0; i < statusBarCount; i++)
+  {
+    if (statusBarTime[i]) lv_label_set_text(statusBarTime[i], shortTime.c_str());
+    setStatusIconState(statusBarWifi[i], wifiConnected);
+    setStatusIconState(statusBarSd[i], sdActive);
+  }
 }
 
 lv_obj_t *makeInfoLabel(lv_obj_t *parent, const char *text, int w)
@@ -9382,6 +9388,15 @@ void boyleUploadToIsl()
 
   for (int i = 0; i < boylePointCount; i++)
   {
+    // 숫자를 보내기 전에 씁니다. 보낸 뒤에 쓰면 첫 왕복이 끝날 때까지 화면이
+    // 조용하고, 그 사이가 사용자에게는 아무 일도 안 일어나는 시간입니다.
+    // 두 번 돌리는 것은 LVGL이 한 번은 그리고 한 번은 내보내기 때문입니다.
+    char progress[80];
+    snprintf(progress, sizeof(progress), "전송 중 %d/%d", i + 1, boylePointCount);
+    lv_label_set_text(labelBoyleHint, progress);
+    uiTimerHandler();
+    uiTimerHandler();
+
     char axisTick[24];
     formatDirectAxisTick((uint32_t)(i + 1), axisTick, sizeof(axisTick));
 
@@ -9427,12 +9442,6 @@ void boyleUploadToIsl()
     }
 
     sent++;
-
-    // The screen says how far it has got: twenty points is twenty round trips.
-    char progress[80];
-    snprintf(progress, sizeof(progress), "전송 중 %d/%d", sent, boylePointCount);
-    lv_label_set_text(labelBoyleHint, progress);
-    uiTimerHandler();
   }
 
   char note[140];
@@ -10217,6 +10226,8 @@ void saveIslTestHost()
   nvs_close(handle);
 }
 
+bool loadIslModuleCode();
+
 void islApplyServerChoice(bool useTest, bool persist)
 {
   islUseTestServer = useTest;
@@ -10239,7 +10250,16 @@ void islApplyServerChoice(bool useTest, bool persist)
     lv_textarea_set_text(islServiceKeyTa, haveKey ? islServiceKey : "");
   }
 
+  // 탐구도 서버 소속입니다. 운영의 모둠코드를 테스트 서버에 보내봐야 그 탐구가
+  // 없으니, 서버를 바꾸면 모둠코드도 그 서버의 것으로 함께 바뀌어야 합니다.
+  islRuntimeSerialNumber[0] = '\0';
+  loadIslModuleCode();
+
+  if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
+  if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+
   updateIslServerLabel();
+  updateIslStatusLabels();
 }
 
 void sanitizeIslModuleCode(const char *src, char *dst, size_t dstLen)
@@ -10259,6 +10279,13 @@ void sanitizeIslModuleCode(const char *src, char *dst, size_t dstLen)
   dst[j] = '\0';
 }
 
+// 탐구는 서버마다 따로 만들어지므로 모둠코드도 서버마다 다릅니다 - 운영의
+// 탐구와 테스트의 탐구는 다른 수업입니다. 인증키와 같은 이유로 칸을 나눕니다.
+static const char *islModumNvsName()
+{
+  return islUseTestServer ? "moduleTest" : "module";
+}
+
 void saveIslModuleCode(const char *code)
 {
   if (code == NULL || strlen(code) == 0) return;
@@ -10272,7 +10299,7 @@ void saveIslModuleCode(const char *code)
     return;
   }
 
-  ret = nvs_set_str(handle, "module", code);
+  ret = nvs_set_str(handle, islModumNvsName(), code);
   if (ret == ESP_OK) ret = nvs_commit(handle);
   nvs_close(handle);
 
@@ -10287,13 +10314,28 @@ bool loadIslModuleCode()
   if (ret != ESP_OK) return false;
 
   size_t codeLen = sizeof(islRuntimeSerialNumber);
-  ret = nvs_get_str(handle, "module", islRuntimeSerialNumber, &codeLen);
+  ret = nvs_get_str(handle, islModumNvsName(), islRuntimeSerialNumber, &codeLen);
   nvs_close(handle);
 
   if (ret == ESP_OK && strlen(islRuntimeSerialNumber) > 0)
   {
-    Serial.print("NVS ISL module loaded: ");
-    Serial.println(islRuntimeSerialNumber);
+    Serial.printf("NVS ISL module loaded (%s): %s\n", islModumNvsName(), islRuntimeSerialNumber);
+    return true;
+  }
+
+  // 이 서버 칸이 비어 있으면 반대쪽 것을 빌려 씁니다. 틀린 코드라면 서버가
+  // 거절하고 그 이유가 화면에 나오니, 빈 칸으로 두는 것보다 낫습니다.
+  const char *other = islUseTestServer ? "module" : "moduleTest";
+
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return false;
+
+  codeLen = sizeof(islRuntimeSerialNumber);
+  ret = nvs_get_str(handle, other, islRuntimeSerialNumber, &codeLen);
+  nvs_close(handle);
+
+  if (ret == ESP_OK && strlen(islRuntimeSerialNumber) > 0)
+  {
+    Serial.printf("NVS ISL module carried over from %s: %s\n", other, islRuntimeSerialNumber);
     return true;
   }
 
@@ -10420,6 +10462,41 @@ static void handleSerialCommand(char *line)
     islApplyServerChoice(true, true);
 
     Serial.printf("[CMD] test host=%s (지금 %s)\n", islTestHost, islApiHost);
+    return;
+  }
+
+  if (strcmp(line, "key") == 0 && arg != NULL && *arg != '\0')
+  {
+    snprintf(islServiceKey, sizeof(islServiceKey), "%s", arg);
+    saveIslServiceKey(islServiceKey);
+    resetDirectIslSessionCache("service key changed");
+
+    if (islServiceKeyTa) lv_textarea_set_text(islServiceKeyTa, islServiceKey);
+    updateIslServerLabel();
+
+    Serial.printf("[CMD] %s 인증키 저장: %d자\n", islApiHost, (int)strlen(islServiceKey));
+    return;
+  }
+
+  if (strcmp(line, "modum") == 0 && arg != NULL && *arg != '\0')
+  {
+    sanitizeIslModuleCode(arg, islRuntimeSerialNumber, sizeof(islRuntimeSerialNumber));
+    saveIslModuleCode(islRuntimeSerialNumber);
+    resetDirectIslSessionCache("modum code changed");
+
+    if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
+    if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+    updateIslStatusLabels();
+
+    Serial.printf("[CMD] %s 모둠코드 저장: %s\n", islApiHost, islRuntimeSerialNumber);
+    return;
+  }
+
+  if (strcmp(line, "server") == 0 && arg != NULL)
+  {
+    islApplyServerChoice(strcmp(arg, "test") == 0, true);
+    Serial.printf("[CMD] server=%s key=%d자 modum=%s\n", islApiHost,
+                  (int)strlen(islServiceKey), islRuntimeSerialNumber);
     return;
   }
 
