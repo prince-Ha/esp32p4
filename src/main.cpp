@@ -1232,8 +1232,11 @@ static const CondPreset kCondPresets[] = {
       0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1, NULL, NULL },
     { "부피", "mL", "volume_mL", COND_SRC_MANUAL, { COND_ALIAS_END },
       1.0f, 200.0f, 1.0f, 5.0f, 30.0f, 1, "VOLM", "부피센서" },
+    // Both axes follow the data: a syringe in a water bath moves a few
+    // tenths of a millilitre over a few degrees, and against 0..35 mL that
+    // is a flat line.
     COND_FIT_LINEAR, COND_DERIVED_RATIO, "V/T(K)", "V_over_TK", 273.15f,
-    NAN, NAN, 10.0f, 0.0f, NAN, 5.0f },
+    NAN, NAN, 10.0f, NAN, NAN, 1.0f },
 
   // 일반: any number the student controls, against whatever the lead node
   // reports first - distance against mass, light against angle, and so on.
@@ -9325,9 +9328,24 @@ static void condComputeFit(const CondPreset *P, int pi, CondFit *fit)
   }
 }
 
+// A grid step for a range: 1, 2 or 5 times a power of ten, such that the
+// range covers roughly two to five steps. Never finer than 0.1.
+static float condNiceStep(float range)
+{
+  if (!(range > 0.0f)) return 0.1f;
+
+  const float raw = range / 4.0f;
+  const float magnitude = powf(10.0f, floorf(log10f(raw)));
+  const float r = raw / magnitude;
+  const float step = (r < 1.5f ? 1.0f : (r < 3.5f ? 2.0f : (r < 7.5f ? 5.0f : 10.0f))) * magnitude;
+
+  return step < 0.1f ? 0.1f : step;
+}
+
 // The axis a set of values is drawn on: the preset's range, widened to the
 // grid by any point outside it; or, when the preset leaves it to the data,
-// the data's range rounded out to the grid.
+// the data's range rounded out to a grid fine enough to show it - the
+// preset's step is then only the coarsest grid allowed.
 static CondAxis condAxisRange(float presetMin, float presetMax, float step,
                               const float *values, int n, bool stretchTop)
 {
@@ -9344,6 +9362,12 @@ static CondAxis condAxisRange(float presetMin, float presetMax, float step,
   }
 
   if (isnan(dataMin)) { dataMin = 0.0f; dataMax = 0.0f; }
+
+  if (isnan(presetMin) && isnan(presetMax))
+  {
+    const float nice = condNiceStep(dataMax - dataMin);
+    if (nice < step) step = nice;
+  }
 
   axis.lo = isnan(presetMin) ? floorf(dataMin / step) * step : presetMin;
 
