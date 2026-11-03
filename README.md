@@ -68,9 +68,10 @@ to 지능형 과학실.
   All connected nodes are recorded together, so pressure from one sensor and
   temperature from another fill two columns of one experiment.
 
-- **Data logging**: measurement sessions can be recorded to CSV on an
-  SD/SDMMC card, previewed on-device, and uploaded to 지능형 과학실 in
-  real-time or batch mode over Wi-Fi/HTTPS.
+- **Data logging**: 기록 → 저장하기 writes everything measured so far to the
+  SD card as `log_<date>_<time>.csv` (the card is mounted on demand); every
+  reading also goes to 지능형 과학실 in real time over Wi-Fi/HTTPS, with
+  일괄전송 to resend a whole run.
 - **Korean font support**: `src/korean_14.c` and `src/korean_16.c` carry the
   full Hangul block; `src/korean_24_bold.c`, `src/digits_64.c` and
   `src/digits_48.c` are subsets cut from Malgun Gothic Bold by
