@@ -162,9 +162,9 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 #define SENSOR_MODE_INA228    7
 #define SENSOR_MODE_ENCODER   8
 
-// A sensor on another board, reached over BLE. It has no tile on the home
-// grid because it is not wired to this board: it is chosen on the 블루투스
-// screen, where it was connected.
+// A sensor on another board, reached over BLE. This is how every sensor
+// reaches the board now: the home screen shows the linked nodes, and the
+// wired modes above remain as a fallback chosen on the 설정 screen.
 #define SENSOR_MODE_BLE       9
 
 // A node publishes once a second. Past this the link is up but the node has
@@ -219,7 +219,7 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 // Datasheet fixed scalings.
 #define INA228_VBUS_LSB_V   0.0001953125f
 #define INA228_POWER_LSB_K  3.2f
-#define ACTIVE_SENSOR_DEFAULT SENSOR_MODE_DPS310
+#define ACTIVE_SENSOR_DEFAULT SENSOR_MODE_BLE
 
 #define DS18B20_DQ_GPIO GPIO_NUM_2
 #define DS18B20_CONVERT_MS 1000
@@ -955,6 +955,9 @@ void servicePendingScreenSwitch();
 void servicePendingWifiCommand();
 void servicePendingSensorMode();
 void activateScreenNow(lv_obj_t *screen);
+void refreshHomeNodeCards();
+void syncWiredSensorDropdown();
+void refreshConditionScreen();
 
 // =====================================================
 // 화면 객체
@@ -1031,7 +1034,7 @@ static volatile int pendingBleConnectIndex = -1;
 static volatile bool pendingBleDisconnect = false;
 static volatile int pendingBleDropSlot = -1;
 // Uploading blocks for as long as there are points, so the button only asks.
-static volatile bool pendingBoyleUpload = false;
+static volatile bool pendingConditionUpload = false;
 
 
 // Rows are rebuilt on every refresh, so the addresses they connect to live
@@ -1065,27 +1068,44 @@ static lv_obj_t *labelFileViewerPageInfo;
 
 
 
-// Home sensor grid, kept so the selected tile can follow the active sensor.
-// Eight sensors wired to the board, plus a tile for each connected BLE node.
-// A node is chosen exactly the way a local sensor is, because from the
-// measurement screen's point of view there is no difference between them.
-#define HOME_LOCAL_TILE_COUNT 8
-#define HOME_SENSOR_TILE_COUNT (HOME_LOCAL_TILE_COUNT + BLE_LINK_MAX_NODES)
+// Home screen. Every sensor arrives over BLE now, so the grid of wired-sensor
+// tiles is gone: one card per linked node, laid out by position so the single
+// "센서 연결" card always follows the linked ones, and two cards for the two
+// ways of measuring.
+#define HOME_NODE_CARD_COUNT BLE_LINK_MAX_NODES
+#define HOME_NODE_CARD_ROWS BLE_LINK_MAX_VALUES
 // The group code is edited in a modal sheet rather than in place: the keyboard
 // covers the lower third of the screen, so an inline field would either sit
-// under the keyboard or have to displace the sensor grid.
+// under the keyboard or have to displace the cards.
 static lv_obj_t *homeCodeEditor;
 static lv_obj_t *labelHomeModumCode;
 
-static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
-static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
-static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeNodeCards[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardName[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardState[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardQty[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+static lv_obj_t *homeNodeCardNum[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+static lv_obj_t *homeNodeCardUnit[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+// The slot shown at each position, or -1 for the "센서 연결" card.
+static int homeNodeCardSlot[HOME_NODE_CARD_COUNT];
+static lv_obj_t *labelHomeSensorSummary;
+static lv_obj_t *labelHomeModeTimeDetail;
+static lv_obj_t *labelHomeModeConditionDetail;
+static lv_obj_t *labelHomeReady;
 
-// -1 for a sensor on this board; otherwise the BLE slot the tile stands for.
-static int homeSensorTileSlot[HOME_SENSOR_TILE_COUNT];
-static lv_obj_t *homeSensorTileName[HOME_SENSOR_TILE_COUNT];
-static lv_obj_t *homeSensorTileDetail[HOME_SENSOR_TILE_COUNT];
-static lv_obj_t *homeSensorTileUnit[HOME_SENSOR_TILE_COUNT];
+// 설정: the sensors wired to this board, kept reachable as a fallback. The
+// dropdown's rows map to modes through this table, so adding a part is one
+// line in each.
+static lv_obj_t *wiredSensorDropdown;
+static const int kWiredSensorModes[] = {
+  SENSOR_MODE_BLE, SENSOR_MODE_DPS310, SENSOR_MODE_DS18B20, SENSOR_MODE_SCD41,
+  SENSOR_MODE_TSL2591, SENSOR_MODE_TMP117, SENSOR_MODE_VL53L1X, SENSOR_MODE_INA228,
+  SENSOR_MODE_ENCODER
+};
+#define WIRED_SENSOR_OPTION_COUNT ((int)(sizeof(kWiredSensorModes) / sizeof(kWiredSensorModes[0])))
+static const char *kWiredSensorOptions =
+  "블루투스 노드 (기본)\n온도 · 기압 (DPS310)\n수온 (DS18B20)\n이산화탄소 (SCD41)\n"
+  "조도 (TSL2591)\n정밀 온도 (TMP117)\n거리 (VL53L1X)\n전압 · 전류 (INA228)\n회전 (엔코더)";
 
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
@@ -1119,66 +1139,187 @@ static lv_obj_t *labelSettingsWifi;
 static lv_obj_t *labelSettingsSd;
 static lv_obj_t *labelSettingsCsv;
 static lv_obj_t *labelSettingsNote;
-// 보일의 법칙
+// 조건 측정
 //
-// A time series is the wrong shape for this experiment: the quantity being
-// varied is the volume, and it is set by hand, one position at a time. So a
-// point is held deliberately - set the syringe, let the reading settle, record
-// it - and the graph is pressure against volume rather than against time.
-#define BOYLE_MAX_POINTS 20
+// A time series is the wrong shape for a gas-law experiment: the quantity
+// being varied is set by hand, one position at a time, and a point is taken
+// when the student decides the reading has settled. So this screen records on
+// a tap rather than on a clock, and plots one quantity against another rather
+// than against time. Which two, and how they are expected to relate, is a row
+// in kCondPresets - 보일 (V by hand, P read, P = k/V), 샤를 (T read, V by
+// hand, V = a + bT) and a general row for any condition against whatever the
+// lead node reports. A new experiment is one more row.
+#define COND_MAX_POINTS   20
+#define COND_CURVE_POINTS 60
+#define COND_AXIS_TICKS   5
+#define COND_MAX_ALIASES  4
 
-static float boyleVolumeMl[BOYLE_MAX_POINTS];
-static float boylePressureHpa[BOYLE_MAX_POINTS];
-static int boylePointCount = 0;
-// A syringe experiment runs 20 to 60 mL, so that is where the setting starts
-// and what the volume axis covers from the first point.
-//
-// The volume axis does not begin at zero. Nothing is measured below 20 mL, and
-// starting from zero spent a third of the width on empty space. The pressure
-// axis still does: P against V only reads as a hyperbola against that
-// asymptote, and that is the whole point of the graph.
-static float boyleVolumeSetting = 20.0f;
-#define BOYLE_VOLUME_MIN 20.0f
-#define BOYLE_VOLUME_MAX 60.0f
+// Where a variable's number comes from.
+#define COND_SRC_MANUAL      0   // set by hand with the stepper
+#define COND_SRC_SENSOR      1   // looked up by unit across every linked node
+#define COND_SRC_SENSOR_ANY  2   // the lead node's first quantity, whatever it is
 
-// Neither axis starts at zero. A hyperbola reads as one against its
-// asymptotes, but nothing here is measured below 20 mL or much below
-// atmospheric pressure, and a panel spent on ground the experiment never
-// visits costs more resolution than the shape is worth.
-#define BOYLE_PRESSURE_MIN 950.0f
+#define COND_FIT_NONE     0
+#define COND_FIT_INVERSE  1   // y = k / x,   k = mean(x*y)
+#define COND_FIT_LINEAR   2   // y = a + b x, least squares
 
-static lv_obj_t *boyleScreen;
-static lv_obj_t *boyleChart;
-static lv_chart_series_t *boyleSeries;
-static lv_obj_t *labelBoyleNow;
-static lv_obj_t *labelBoyleVolume;
-static lv_obj_t *labelBoyleHint;
+#define COND_DERIVED_NONE     0
+#define COND_DERIVED_PRODUCT  1   // x * y             (P×V)
+#define COND_DERIVED_RATIO    2   // y / (x + offset)  (V/T with T in kelvin)
 
-// The fitted P = k/V, drawn densely enough to read as a curve, plus the tick
-// values and a label on each measured point.
-#define BOYLE_CURVE_POINTS 60
-#define BOYLE_AXIS_TICKS 5
+// A unit as a node writes it, and how to bring it to the variable's own unit:
+// value = raw * scale + offset. A PASCO sensor says kPa where the axis is hPa.
+typedef struct
+{
+  const char *unit;
+  float scale;
+  float offset;
+} CondUnitAlias;
+
+typedef struct
+{
+  const char *name;        // 부피 - drawn in the full-range face
+  const char *unit;        // the variable's own unit: mL, hPa, ℃; "" when none
+  const char *csvName;     // ASCII column heading
+  uint8_t source;          // COND_SRC_*
+  CondUnitAlias aliases[COND_MAX_ALIASES];   // sensor only; NULL-terminated
+  // Manual variables only.
+  float minValue, maxValue, stepSmall, stepLarge, defaultValue;
+  uint8_t decimals;        // for the readout, the table and the CSV
+  // Upload. A sensor variable maps through kBleIslMappings by its unit; a
+  // manual one needs a code of its own or is not sent.
+  const char *islType;
+  const char *islNickname;
+} CondVariable;
+
+typedef struct
+{
+  const char *title;          // literal, so it may use the heading face
+  const char *hint;
+  const char *recordText;     // 이 부피로 기록
+  const char *csvFile;        // boyle -> /sdcard/boyle.csv
+  CondVariable x;
+  CondVariable y;
+  uint8_t fit;                // COND_FIT_*
+  uint8_t derived;            // COND_DERIVED_*
+  const char *derivedName;    // P×V - table column and summary
+  const char *derivedCsvName;
+  float derivedOffsetX;       // 273.15 for a ratio against kelvin
+  // Axis defaults. NAN = take it from the data. The step is the grid a point
+  // outside the default range widens the axis to.
+  float xAxisMin, xAxisMax, xAxisStep;
+  float yAxisMin, yAxisMax, yAxisStep;
+} CondPreset;
+
+#define COND_ALIAS_END { NULL, 0.0f, 0.0f }
+
+static const CondPreset kCondPresets[] = {
+  // 보일: V set by hand, P read, P = k/V. A syringe experiment runs 20 to
+  // 60 mL, so that is the axis from the first point; the pressure axis starts
+  // at 950 hPa because nothing is measured much below atmospheric, and a
+  // hyperbola still reads as one over that range.
+  { "보일의 법칙", "부피 맞추고 압력 안정되면 기록", "이 부피로 기록", "boyle",
+    { "부피", "mL", "volume_mL", COND_SRC_MANUAL, { COND_ALIAS_END },
+      1.0f, 200.0f, 1.0f, 5.0f, 20.0f, 1, "VOLM", "부피센서" },
+    { "압력", "hPa", "pressure_hPa", COND_SRC_SENSOR,
+      { { "hPa", 1.0f, 0.0f }, { "kPa", 10.0f, 0.0f }, COND_ALIAS_END },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1, NULL, NULL },
+    COND_FIT_INVERSE, COND_DERIVED_PRODUCT, "P×V", "PV", 0.0f,
+    20.0f, 60.0f, 5.0f, 950.0f, NAN, 50.0f },
+
+  // 샤를: T read, V read off the syringe and set by hand, V = a + bT. The
+  // intercept where V would reach zero is the lesson's payoff.
+  { "샤를의 법칙", "온도 안정되면 부피 맞춰 기록", "이 온도로 기록", "charles",
+    { "온도", "℃", "temperature_C", COND_SRC_SENSOR,
+      { { "C", 1.0f, 0.0f }, { "℃", 1.0f, 0.0f }, { "degC", 1.0f, 0.0f }, { "K", 1.0f, -273.15f } },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1, NULL, NULL },
+    { "부피", "mL", "volume_mL", COND_SRC_MANUAL, { COND_ALIAS_END },
+      1.0f, 200.0f, 1.0f, 5.0f, 30.0f, 1, "VOLM", "부피센서" },
+    COND_FIT_LINEAR, COND_DERIVED_RATIO, "V/T(K)", "V_over_TK", 273.15f,
+    NAN, NAN, 10.0f, 0.0f, NAN, 5.0f },
+
+  // 일반: any number the student controls, against whatever the lead node
+  // reports first - distance against mass, light against angle, and so on.
+  { "일반 조건", "조건 정하고 값 안정되면 기록", "이 조건으로 기록", "condition",
+    { "조건", "", "condition", COND_SRC_MANUAL, { COND_ALIAS_END },
+      -1000.0f, 1000.0f, 1.0f, 10.0f, 1.0f, 0, NULL, NULL },
+    { "측정값", "", "value", COND_SRC_SENSOR_ANY, { COND_ALIAS_END },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2, NULL, NULL },
+    COND_FIT_NONE, COND_DERIVED_NONE, NULL, NULL, 0.0f,
+    NAN, NAN, 1.0f, NAN, NAN, 1.0f }
+};
+#define COND_PRESET_COUNT ((int)(sizeof(kCondPresets) / sizeof(kCondPresets[0])))
+#define COND_PRESET_BOYLE 0
+
+// Points live per preset, so switching presets loses nothing: a class that
+// has taken fifteen Boyle points can look at the 샤를 screen and come back.
+static int condPresetIndex = COND_PRESET_BOYLE;
+static float condX[COND_PRESET_COUNT][COND_MAX_POINTS];
+static float condY[COND_PRESET_COUNT][COND_MAX_POINTS];
+static int condPointCount[COND_PRESET_COUNT];
+static float condManual[COND_PRESET_COUNT];
+// 일반: what the lead node's first quantity was called when the first point
+// was taken, so the rest of the run is refused if the sensor changes.
+static char condAnyName[24] = "";
+static char condAnyUnit[24] = "";
+static char condAnyNode[32] = "";
+// Which node fed the sensor variable last, for the line under the live value.
+static char condSourceNode[32] = "";
+// The table and chart are rebuilt only when a point changes, not every second.
+static bool condDirty = true;
+
+typedef struct
+{
+  bool valid;
+  float k;            // INVERSE: y = k / x
+  float a, b;         // LINEAR: y = a + b x
+  float derivedMean;
+} CondFit;
+
+typedef struct { float lo, hi, span; } CondAxis;
+
+// The volume-code probe that 보일의 법칙 already did: the 2026-07-21 appendix
+// has no code for a volume, so the candidates are tried in turn.
+static const char *kCondVolumeTypes[] = { "VOLM", "VLM", "VOL", "VOLU" };
+static char condVolumeSensorType[8] = "";
+// The preset whose points 전송 asked for; the screen may be on another one by
+// the time the loop gets to it.
+static int condUploadPreset = 0;
+
+static lv_obj_t *conditionScreen;
+static lv_obj_t *conditionChart;
+static lv_chart_series_t *conditionSeries;
+static lv_chart_series_t *conditionCurve;
+static lv_obj_t *conditionPresetBtn[COND_PRESET_COUNT];
+static lv_obj_t *conditionStepBtn[4];
+static lv_obj_t *conditionRecordBtn;
+static lv_obj_t *labelConditionHint;
+static lv_obj_t *labelConditionManualCaption;
+static lv_obj_t *labelConditionManual;
+static lv_obj_t *labelConditionSensorCaption;
+static lv_obj_t *labelConditionSensorNow;
+static lv_obj_t *labelConditionSensorNode;
+static lv_obj_t *labelConditionChartTitle;
+static lv_obj_t *labelConditionXTicks[COND_AXIS_TICKS];
+static lv_obj_t *labelConditionYTicks[COND_AXIS_TICKS];
+static lv_obj_t *labelConditionPointText[COND_MAX_POINTS];
+static lv_obj_t *labelConditionSummary;
+static lv_obj_t *labelConditionNote;
+static lv_obj_t *tableCondition;
+static lv_obj_t *labelBarConditionTime;
+static lv_obj_t *labelBarConditionWifi;
+static lv_obj_t *labelBarConditionSd;
 
 // The graph takes most of the screen: the shape of the curve is the result of
-// the experiment, and it was being read from a panel a third of this size.
-#define BOYLE_CARD_X 344
-#define BOYLE_CARD_Y 104
-#define BOYLE_CARD_W 652
-#define BOYLE_CARD_H 430
-#define BOYLE_CHART_X 44
-#define BOYLE_CHART_Y 44
-#define BOYLE_CHART_W 586
-#define BOYLE_CHART_H 336
-
-static lv_chart_series_t *boyleCurve;
-static lv_obj_t *labelBoyleXTicks[BOYLE_AXIS_TICKS];
-static lv_obj_t *labelBoyleYTicks[BOYLE_AXIS_TICKS];
-static lv_obj_t *labelBoylePointText[BOYLE_MAX_POINTS];
-static lv_obj_t *labelBoyleConstant;
-static lv_obj_t *tableBoyle;
-static lv_obj_t *labelBarBoyleTime;
-static lv_obj_t *labelBarBoyleWifi;
-static lv_obj_t *labelBarBoyleSd;
+// the experiment.
+#define COND_CARD_X 344
+#define COND_CARD_Y 104
+#define COND_CARD_W 652
+#define COND_CARD_H 408
+#define COND_CHART_X 56
+#define COND_CHART_Y 44
+#define COND_CHART_W 574
+#define COND_CHART_H 310
 
 static lv_obj_t *labelDeviceNote;
 static lv_obj_t *deviceScreen;
@@ -1319,7 +1460,7 @@ static void go_measure_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
 static void go_ble_event_cb(lv_event_t *e);
 static void go_device_event_cb(lv_event_t *e);
-static void go_boyle_event_cb(lv_event_t *e);
+static void go_condition_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -1340,85 +1481,197 @@ bool saveMeasurementBackupToNvs(bool force);
 void updateChartAutoScale();
 void clearChart();
 
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 const char *sensorDetailText(int mode);
 
-// Node tiles carry the node's own name and whatever it is currently
-// reporting, so the home grid says the same thing whether a sensor is wired to
-// this board or three metres away on another one.
-void refreshHomeBleTiles()
+// One card per linked node, by position: the first linked node takes the
+// first card whichever slot it holds, and the one card after the last node
+// offers the connection. Runs on the 1 Hz clock, because a node appearing is
+// exactly the event the home screen exists to show.
+//
+// The state on a card is about the data, not the link. A node can stay
+// connected and go quiet, and that is the case a teacher needs to see from
+// the back of the room.
+void refreshHomeNodeCards()
 {
-  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  if (homeNodeCards[0] == NULL) return;
+
+  int position = 0;
+  int linked = 0;
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES && position < HOME_NODE_CARD_COUNT; slot++)
   {
-    const int i = HOME_LOCAL_TILE_COUNT + slot;
-    if (homeSensorTiles[i] == NULL) continue;
+    const bool live = bleLinkSlotIsSubscribed(slot);
+    const bool busy = bleLinkSlotIsBusy(slot);
+    if (!live && !busy) continue;
 
-    if (!bleLinkSlotIsSubscribed(slot))
+    const int p = position++;
+    if (live) linked++;
+    homeNodeCardSlot[p] = slot;
+
+    lv_obj_t *card = homeNodeCards[p];
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_SURFACE), 0);
+
+    // The node's own name, in the full-range face: the heading subset is cut
+    // from this file's literals and cannot know it.
+    const char *name = bleLinkSlotName(slot);
+    lv_obj_set_style_text_font(homeNodeCardName[p], FONT_KR, 0);
+    lv_label_set_text(homeNodeCardName[p], (name && name[0]) ? name : "연결 중...");
+    lv_obj_set_style_text_color(homeNodeCardName[p], lv_color_hex(UI_TEXT), 0);
+
+    bool anyFresh = false;
+    const int count = live ? bleLinkValueCount(slot) : 0;
+
+    for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
     {
-      lv_obj_add_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
-      continue;
-    }
-
-    lv_obj_clear_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
-
-    if (homeSensorTileName[i]) lv_label_set_text(homeSensorTileName[i], bleLinkSlotName(slot));
-
-    char units[64] = "";
-    const int count = bleLinkValueCount(slot);
-
-    for (int v = 0; v < count && v < BLE_LINK_MAX_VALUES; v++)
-    {
+      float value = NAN;
       char quantity[24] = "";
       char unit[24] = "";
-      if (!bleLinkValueAt(slot, v, NULL, quantity, unit, NULL)) break;
+      uint32_t ageMs = 0;
+      const bool have = i < count && bleLinkValueAt(slot, i, &value, quantity, unit, &ageMs);
 
-      char entry[32];
-      snprintf(entry, sizeof(entry), "%s%s", units[0] ? " · " : "", bleDisplayUnit(unit));
-      strncat(units, entry, sizeof(units) - strlen(units) - 1);
+      if (!have)
+      {
+        lv_obj_add_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
+
+      const bool fresh = ageMs <= BLE_READING_MAX_AGE_MS && !isnan(value);
+      if (fresh) anyFresh = true;
+
+      // Digits only in the 24 px face; the quantity and unit are the node's
+      // words and go in the full-range faces beside it.
+      char number[24];
+      if (fresh) snprintf(number, sizeof(number), "%.1f", value);
+      else snprintf(number, sizeof(number), "----");
+
+      lv_label_set_text(homeNodeCardQty[p][i], quantity[0] ? quantity : "값");
+      lv_label_set_text(homeNodeCardNum[p][i], number);
+      lv_label_set_text(homeNodeCardUnit[p][i], bleDisplayUnit(unit));
+      lv_obj_clear_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (homeSensorTileUnit[i]) lv_label_set_text(homeSensorTileUnit[i], units);
-    if (homeSensorTileDetail[i]) lv_label_set_text(homeSensorTileDetail[i], "블루투스 노드");
-  }
-}
+    const char *state = "연결 중";
+    uint32_t stateColor = UI_TEXT_3;
 
-// Move the "선택됨" state onto the tile for `mode`.
-void refreshHomeSensorTilesFor(int mode)
-{
-  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+    if (live && anyFresh) { state = "수신 중"; stateColor = UI_OK; }
+    else if (live) { state = "응답 없음"; stateColor = UI_DANGER; }
+
+    lv_label_set_text(homeNodeCardState[p], state);
+    lv_obj_set_style_text_color(homeNodeCardState[p], lv_color_hex(stateColor), 0);
+  }
+
+  // The one card after the nodes: how to get another one.
+  if (position < HOME_NODE_CARD_COUNT)
   {
-    if (homeSensorTiles[i] == NULL) continue;
+    const int p = position++;
+    homeNodeCardSlot[p] = -1;
 
-    // Every node tile carries SENSOR_MODE_BLE, so the mode alone would light
-    // all of them up. Only the slot being recorded is selected.
-    bool selected = homeSensorTileModes[i] == mode;
-    if (selected && homeSensorTileSlot[i] >= 0) selected = homeSensorTileSlot[i] == activeBleSlot;
+    lv_obj_t *card = homeNodeCards[p];
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_ACCENT_TINT), 0);
 
-    styleSensorTile(homeSensorTiles[i], homeSensorTileMarks[i], selected);
+    lv_obj_set_style_text_font(homeNodeCardName[p], FONT_KR_HEAD, 0);
+    lv_label_set_text(homeNodeCardName[p], bleEnabled ? "+ 센서 연결" : "블루투스 켜기");
+    lv_obj_set_style_text_color(homeNodeCardName[p], lv_color_hex(UI_ACCENT), 0);
+    lv_label_set_text(homeNodeCardState[p], "");
+
+    for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
+    {
+      lv_obj_add_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // The explanation sits where a node's first reading would.
+    lv_label_set_text(homeNodeCardQty[p][0],
+                      bleEnabled ? "눌러서 블루투스 화면으로 갑니다"
+                                 : "꺼져 있습니다 · 켠 뒤 다시 시작하세요");
+    lv_obj_clear_flag(homeNodeCardQty[p][0], LV_OBJ_FLAG_HIDDEN);
   }
-}
 
-void refreshHomeSensorTiles()
-{
-  refreshHomeSensorTilesFor(activeSensorMode);
+  for (; position < HOME_NODE_CARD_COUNT; position++)
+  {
+    homeNodeCardSlot[position] = -1;
+    lv_obj_add_flag(homeNodeCards[position], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- the lines of text around the cards -----------------------------------
+  const bool wired = activeSensorMode != SENSOR_MODE_BLE;
+
+  if (labelHomeSensorSummary)
+  {
+    char text[160];
+
+    if (wired)
+    {
+      snprintf(text, sizeof(text), "유선 센서 사용 중: %s · 설정 탭에서 바꿀 수 있습니다",
+               activeMeasurementTitle());
+    }
+    else if (!bleEnabled)
+    {
+      snprintf(text, sizeof(text), "블루투스가 꺼져 있습니다 · 블루투스 탭에서 켜고 다시 시작하세요");
+    }
+    else if (linked == 0)
+    {
+      snprintf(text, sizeof(text), "연결된 센서 없음 · 블루투스 탭에서 센서를 누르면 연결됩니다");
+    }
+    else
+    {
+      snprintf(text, sizeof(text), "연결된 센서 %d개 · 시간 측정은 모두 함께 기록됩니다", linked);
+    }
+
+    lv_label_set_text(labelHomeSensorSummary, text);
+  }
+
+  const bool haveSensor = linked > 0 || wired;
+
+  if (labelHomeModeTimeDetail)
+  {
+    lv_label_set_text(labelHomeModeTimeDetail,
+                      haveSensor ? "예: 식어가는 물의 온도 · 1초마다 자동 기록" : "센서를 먼저 연결하세요");
+    lv_obj_set_style_text_color(labelHomeModeTimeDetail,
+                                lv_color_hex(haveSensor ? UI_TEXT_3 : UI_DANGER), 0);
+  }
+
+  if (labelHomeModeConditionDetail)
+  {
+    lv_label_set_text(labelHomeModeConditionDetail,
+                      haveSensor ? "보일의 법칙 · 샤를의 법칙 · 일반 조건" : "센서를 먼저 연결하세요");
+    lv_obj_set_style_text_color(labelHomeModeConditionDetail,
+                                lv_color_hex(haveSensor ? UI_TEXT_3 : UI_DANGER), 0);
+  }
+
+  // What stands between this board and a recorded, uploaded lesson - the
+  // worst problem first, and a green line when there is none.
+  if (labelHomeReady)
+  {
+    const char *text = "WiFi 연결됨 · 과학실 전송 준비";
+    uint32_t color = UI_OK;
+
+    if (!haveSensor) { text = "센서를 연결하세요"; color = UI_DANGER; }
+    else if (!cloudModumConfigured()) { text = "모둠코드를 입력하세요"; color = UI_DANGER; }
+    else if (!wifiConnected) { text = "WiFi 없음 · SD 카드에만 저장됩니다"; color = UI_TEXT_2; }
+
+    lv_label_set_text(labelHomeReady, text);
+    lv_obj_set_style_text_color(labelHomeReady, lv_color_hex(color), 0);
+  }
 }
 
 void refreshHomeSensorLabels()
 {
   char buf[96];
 
-  refreshHomeSensorTiles();
+  refreshHomeNodeCards();
 
   if (labelHomeSensorMode)
   {
     snprintf(buf, sizeof(buf), "선택: %s", activeMeasurementTitle());
     lv_label_set_text(labelHomeSensorMode, buf);
-  }
-
-  if (labelHomeSensorStatus)
-  {
-    snprintf(buf, sizeof(buf), "상태: %s", dpsReady ? "준비" : "인식 실패");
-    lv_label_set_text(labelHomeSensorStatus, buf);
   }
 
   if (labelHomeRecovery)
@@ -1442,74 +1695,34 @@ void refreshHomeSensorLabels()
   }
 }
 
-static void home_sensor_dps_event_cb(lv_event_t *e)
+static void home_node_card_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_DPS310;
+
+  // Both kinds of card lead to the 블루투스 screen: that is where a node is
+  // connected, dropped, or made the lead one. The home screen only shows.
+  requestScreenSwitch(bleScreen);
 }
 
-static void home_sensor_water_event_cb(lv_event_t *e)
+static void wired_sensor_dropdown_event_cb(lv_event_t *e)
 {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_DS18B20;
-}
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
 
-static void home_sensor_co2_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_SCD41;
-}
+  const int index = (int)lv_dropdown_get_selected(lv_event_get_target(e));
+  if (index < 0 || index >= WIRED_SENSOR_OPTION_COUNT) return;
 
-static void home_sensor_light_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_TSL2591;
-}
+  const int mode = kWiredSensorModes[index];
+  if (mode == activeSensorMode) return;
 
-static void home_sensor_tmp117_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_TMP117;
-}
+  if (measuring)
+  {
+    setIslStatusText("측정 정지 후 센서 변경");
+    // The control must not claim a change that was refused.
+    syncWiredSensorDropdown();
+    return;
+  }
 
-static void home_sensor_vl53_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_VL53L1X;
-}
-
-static void home_sensor_ina228_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_INA228;
-}
-
-static void home_sensor_encoder_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_ENCODER;
-}
-
-static void home_sensor_ble_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-
-  const int slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-  if (!bleLinkSlotIsSubscribed(slot)) return;
-
-  // Every connected node is recorded together, so this chooses the mode rather
-  // than the sensor. The tapped one leads the readout.
-  activeBleSlot = slot;
-  pendingSensorMode = SENSOR_MODE_BLE;
+  pendingSensorMode = mode;
 }
 
 void servicePendingSensorMode()
@@ -1527,13 +1740,14 @@ void servicePendingSensorMode()
   uiInputLocked = true;
   ignoreTouchUntilMs = millis() + 200;
 
-  // Move the selection and paint it before switching sensors. Bringing a
-  // sensor up probes I2C and can block for a second or more, and doing that
-  // first made the tap feel unacknowledged.
-  refreshHomeSensorTilesFor(mode);
+  // Paint before switching sensors. Bringing a sensor up probes I2C and can
+  // block for a second or more, and doing that first made the tap feel
+  // unacknowledged.
   lv_refr_now(NULL);
 
   setActiveSensorMode(mode);
+  // Whether or not the switch was accepted - a batch upload refuses it.
+  syncWiredSensorDropdown();
   uiInputLocked = false;
   ignoreTouchUntilMs = millis() + 200;
 }
@@ -1557,15 +1771,6 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e);
 static void csv_viewer_prev_event_cb(lv_event_t *e);
 static void csv_viewer_next_event_cb(lv_event_t *e);
 static void sd_file_item_event_cb(lv_event_t *e);
-static void home_sensor_dps_event_cb(lv_event_t *e);
-static void home_sensor_water_event_cb(lv_event_t *e);
-static void home_sensor_co2_event_cb(lv_event_t *e);
-static void home_sensor_light_event_cb(lv_event_t *e);
-static void home_sensor_tmp117_event_cb(lv_event_t *e);
-static void home_sensor_vl53_event_cb(lv_event_t *e);
-static void home_sensor_ina228_event_cb(lv_event_t *e);
-static void home_sensor_encoder_event_cb(lv_event_t *e);
-static void home_sensor_ble_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
 void sanitizeBasicFileName(const char *input, char *out, size_t outSize);
@@ -1600,7 +1805,6 @@ void applyRestoredMeasurementToUi();
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
 lv_obj_t *makeTableNavButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 
 #if HAS_IDF_WIFI
 static bool idfWifiStarted = false;
@@ -4449,7 +4653,10 @@ void setActiveSensorMode(int mode)
 
   if (labelStatus)
   {
-    lv_label_set_text(labelStatus, dpsReady ? "준비" : "센서 초기화 실패");
+    // A node is not initialised, it is linked or not; "초기화 실패" was the
+    // wrong word for a board that had simply not been given a node yet.
+    lv_label_set_text(labelStatus, dpsReady ? "준비"
+                                   : (mode == SENSOR_MODE_BLE ? "노드 연결 대기" : "센서 초기화 실패"));
   }
 
   updateActiveSensorUiLabels();
@@ -4465,6 +4672,7 @@ void setActiveSensorMode(int mode)
   clearChart();
   chartUiDirty = true;
   refreshHomeSensorLabels();
+  syncWiredSensorDropdown();
 
   if (activeSensorMode == SENSOR_MODE_SCD41)
   {
@@ -5070,75 +5278,92 @@ lv_obj_t *makeQuietButton(lv_obj_t *parent, const char *text, int x, int y,
   return btn;
 }
 
-// Selection styling lives here so it can be re-applied when the active sensor
-// changes, rather than being baked in when the tile is built.
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
+// A card the size of a fingertip's comfortable target, pressed-tint feedback,
+// no border: the same surface the panels use, but tappable.
+static lv_obj_t *makeCardButton(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t cb)
 {
-  if (tile == NULL) return;
-
-  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
-  lv_obj_set_style_border_width(tile, selected ? 2 : 0, 0);
-  lv_obj_set_style_border_color(tile, lv_color_hex(UI_ACCENT), 0);
-
-  if (mark == NULL) return;
-
-  if (selected) lv_obj_clear_flag(mark, LV_OBJ_FLAG_HIDDEN);
-  else lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *card = lv_btn_create(parent);
+  lv_obj_set_size(card, w, h);
+  lv_obj_align(card, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(card, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(UI_ACCENT_SOFT), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 16, 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_set_style_outline_width(card, 0, 0);
+  lv_obj_set_style_shadow_width(card, 0, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, NULL);
+  return card;
 }
 
-// Sensor tile. Named by the quantity it measures, not the part number, and
-// large enough that a fingertip cannot reach two of them at once. The caller
-// keeps `markOut` so the selected state can be moved later.
-lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
-                         const char *detail, int x, int y, int w, int h,
-                         bool selected, lv_event_cb_t cb, lv_obj_t **markOut,
-                         lv_obj_t **nameOut = NULL, lv_obj_t **detailOut = NULL,
-                         lv_obj_t **unitOut = NULL)
+// A home card for one BLE node: its name, whether data is arriving, and up to
+// three live readings. Everything on it is written at runtime by
+// refreshHomeNodeCards(); the card itself is built empty and hidden.
+lv_obj_t *makeHomeNodeCard(lv_obj_t *parent, int position, int x, int y, int w, int h)
 {
-  lv_obj_t *tile = lv_btn_create(parent);
-  lv_obj_set_size(tile, w, h);
-  lv_obj_align(tile, LV_ALIGN_TOP_LEFT, x, y);
-  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(tile, 16, 0);
-  lv_obj_set_style_outline_width(tile, 0, 0);
-  lv_obj_set_style_shadow_width(tile, 0, 0);
-  lv_obj_set_style_pad_all(tile, 0, 0);
-  lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_event_cb(tile, cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *card = makeCardButton(parent, x, y, w, h, home_node_card_event_cb);
 
-  lv_obj_t *nameLabel = lv_label_create(tile);
-  lv_label_set_text(nameLabel, name);
-  lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
-  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 18, 16);
+  homeNodeCardName[position] = makeLabel(card, "", 16, 12, UI_TEXT);
+  lv_obj_set_width(homeNodeCardName[position], 196);
+  lv_label_set_long_mode(homeNodeCardName[position], LV_LABEL_LONG_DOT);
 
-  lv_obj_t *detailLabel = lv_label_create(tile);
-  lv_label_set_text(detailLabel, detail ? detail : "");
-  lv_obj_set_style_text_color(detailLabel, lv_color_hex(UI_TEXT_4), 0);
-  lv_obj_set_style_text_font(detailLabel, FONT_KR_SMALL, 0);
-  lv_obj_set_width(detailLabel, w - 36);
-  lv_label_set_long_mode(detailLabel, LV_LABEL_LONG_CLIP);
-  lv_obj_align(detailLabel, LV_ALIGN_TOP_LEFT, 18, 50);
+  homeNodeCardState[position] = makeSmallLabel(card, "", 0, 0, UI_TEXT_3);
+  lv_obj_set_width(homeNodeCardState[position], 84);
+  lv_obj_set_style_text_align(homeNodeCardState[position], LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_align(homeNodeCardState[position], LV_ALIGN_TOP_RIGHT, -16, 15);
 
-  lv_obj_t *unitLabel = lv_label_create(tile);
-  lv_label_set_text(unitLabel, unit);
-  lv_obj_set_style_text_color(unitLabel, lv_color_hex(UI_TEXT_3), 0);
-  lv_obj_set_style_text_font(unitLabel, FONT_KR_SMALL, 0);
-  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 18, -14);
+  for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
+  {
+    const int rowY = 44 + i * 30;
 
-  lv_obj_t *mark = lv_label_create(tile);
-  lv_label_set_text(mark, "선택됨");
-  lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
-  lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
-  lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
+    homeNodeCardQty[position][i] = makeSmallLabel(card, "", 16, rowY + 7, UI_TEXT_3);
+    lv_obj_set_width(homeNodeCardQty[position][i], 280);
+    lv_label_set_long_mode(homeNodeCardQty[position][i], LV_LABEL_LONG_CLIP);
 
-  styleSensorTile(tile, mark, selected);
+    // Digits only, so the 24 px subset face is safe here.
+    homeNodeCardNum[position][i] = lv_label_create(card);
+    lv_label_set_text(homeNodeCardNum[position][i], "");
+    lv_obj_set_style_text_font(homeNodeCardNum[position][i], FONT_KR_HEAD, 0);
+    lv_obj_set_style_text_color(homeNodeCardNum[position][i], lv_color_hex(UI_TEXT), 0);
+    lv_obj_set_width(homeNodeCardNum[position][i], 128);
+    lv_obj_set_style_text_align(homeNodeCardNum[position][i], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(homeNodeCardNum[position][i], LV_LABEL_LONG_CLIP);
+    lv_obj_align(homeNodeCardNum[position][i], LV_ALIGN_TOP_LEFT, 102, rowY);
 
-  if (markOut != NULL) *markOut = mark;
-  if (nameOut != NULL) *nameOut = nameLabel;
-  if (detailOut != NULL) *detailOut = detailLabel;
-  if (unitOut != NULL) *unitOut = unitLabel;
-  return tile;
+    homeNodeCardUnit[position][i] = makeLabel(card, "", 238, rowY + 5, UI_TEXT_2);
+    lv_obj_set_width(homeNodeCardUnit[position][i], 58);
+    lv_label_set_long_mode(homeNodeCardUnit[position][i], LV_LABEL_LONG_CLIP);
+  }
+
+  lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
+  return card;
+}
+
+// One of the two ways to measure. The title is a literal, so it may use the
+// heading face; the lines under it say what the mode is for in a student's
+// words, and the right edge carries an arrow so the card reads as a door.
+lv_obj_t *makeModeCard(lv_obj_t *parent, const char *title, const char *line2,
+                       lv_obj_t **detailOut, int x, int y, int w, int h, lv_event_cb_t cb)
+{
+  lv_obj_t *card = makeCardButton(parent, x, y, w, h, cb);
+
+  makeHeading(card, title, 20, 18, UI_TEXT);
+  makeLabel(card, line2, 20, 56, UI_TEXT_2);
+
+  lv_obj_t *detail = makeSmallLabel(card, "", 20, 86, UI_TEXT_3);
+  lv_obj_set_width(detail, w - 80);
+  lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+  if (detailOut) *detailOut = detail;
+
+  lv_obj_t *arrow = lv_label_create(card);
+  lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_font(arrow, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(arrow, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, -20, 0);
+
+  return card;
 }
 
 // Bottom tab bar, identical on every screen so "back" is always in one place.
@@ -6210,7 +6435,10 @@ bool restoreMeasurementBackupFromNvs()
       activeSensorMode != SENSOR_MODE_SCD41 &&
       activeSensorMode != SENSOR_MODE_TSL2591 &&
       activeSensorMode != SENSOR_MODE_TMP117 &&
-      activeSensorMode != SENSOR_MODE_VL53L1X)
+      activeSensorMode != SENSOR_MODE_VL53L1X &&
+      activeSensorMode != SENSOR_MODE_INA228 &&
+      activeSensorMode != SENSOR_MODE_ENCODER &&
+      activeSensorMode != SENSOR_MODE_BLE)
   {
     activeSensorMode = ACTIVE_SENSOR_DEFAULT;
   }
@@ -6665,7 +6893,7 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == islScreen) return UI_BG;
   if (screen == bleScreen) return UI_BG;
   if (screen == deviceScreen) return UI_BG;
-  if (screen == boyleScreen) return UI_BG;
+  if (screen == conditionScreen) return UI_BG;
   return 0x0B1020;
 }
 
@@ -6738,6 +6966,7 @@ static const char *screenName(lv_obj_t *screen)
   if (screen == settingsScreen) return "wifi";
   if (screen == deviceScreen) return "device";
   if (screen == islScreen) return "isl";
+  if (screen == conditionScreen) return "condition";
   if (screen == fileViewerScreen) return "fileviewer";
   return screen == NULL ? "(null)" : "(unknown)";
 }
@@ -6779,6 +7008,15 @@ void prepareScreenContent(lv_obj_t *screen)
     {
       lv_label_set_text(labelSettingsWifi, wifiConnected ? "WiFi: 연결됨" : "WiFi: 연결 안 됨");
     }
+  }
+  else if (screen == deviceScreen)
+  {
+    syncWiredSensorDropdown();
+  }
+  else if (screen == conditionScreen)
+  {
+    condDirty = true;
+    refreshConditionScreen();
   }
   else if (screen == islScreen)
   {
@@ -7952,114 +8190,43 @@ void createHomeUi()
   );
 
   // =====================================================
-  // The home screen asks one question: which sensor?
-  // Everything else — WiFi detail, upload mode, restart — lives one tap away
-  // in Settings, so a student meets six choices instead of fifteen controls.
+  // The home screen answers two questions: is my sensor on, and which kind of
+  // measurement am I doing. Every sensor arrives over BLE, so the top row is
+  // one card per linked node with its live numbers; below it, two cards for
+  // the two ways of measuring. Nothing here selects a sensor - a node is
+  // connected and chosen on the 블루투스 screen, and in a time measurement
+  // every linked node is recorded together.
   // =====================================================
-  makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
+  makeHeading(homeScreen, "센서", 28, 58, UI_TEXT);
 
-  // Seven tiles on a 4x2 grid. Narrower than the old 3x2 at 231 px, but still
-  // twice the width of a fingertip, and it keeps the grid to two rows so the
-  // group code and 측정 시작 stay where they were.
-  // Three rows now: eight sensors on this board and up to three BLE nodes.
-  // The tiles lose 14 px of height to make room, which the group code panel
-  // and 측정 시작 below give back by moving down.
-  const int tileW = 231;
-  const int tileH = 98;
-  const int tileGapX = 14;
-  const int tileGapY = 10;
-  const int tileLeft = 28;
-  const int tileTop = 120;
-  const int tileCols = 4;
+  labelHomeSensorSummary = makeSmallLabel(homeScreen, "", 96, 66, UI_TEXT_3);
+  lv_obj_set_width(labelHomeSensorSummary, 900);
+  lv_label_set_long_mode(labelHomeSensorSummary, LV_LABEL_LONG_DOT);
 
-  struct SensorTileSpec
+  const int cardW = 312;
+  const int cardGap = 16;
+
+  for (int p = 0; p < HOME_NODE_CARD_COUNT; p++)
   {
-    const char *name;
-    const char *unit;
-    int mode;
-    lv_event_cb_t cb;
-  };
-
-  // Named by the quantity measured, not the part number: a student reads
-  // "이산화탄소", not "SCD41".
-  const SensorTileSpec tiles[HOME_LOCAL_TILE_COUNT] = {
-    { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
-    { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
-    { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
-    { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
-    { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
-    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb },
-    { "전압 · 전류", "V · A · W", SENSOR_MODE_INA228, home_sensor_ina228_event_cb },
-    { "회전",        "° · °/s",   SENSOR_MODE_ENCODER, home_sensor_encoder_event_cb }
-  };
-
-  for (int i = 0; i < HOME_LOCAL_TILE_COUNT; i++)
-  {
-    const int col = i % tileCols;
-    const int row = i / tileCols;
-
-    homeSensorTileModes[i] = tiles[i].mode;
-    homeSensorTileSlot[i] = -1;
-    homeSensorTiles[i] = makeSensorTile(
-      homeScreen,
-      tiles[i].name,
-      tiles[i].unit,
-      sensorDetailText(tiles[i].mode),
-      tileLeft + col * (tileW + tileGapX),
-      tileTop + row * (tileH + tileGapY),
-      tileW,
-      tileH,
-      activeSensorMode == tiles[i].mode,
-      tiles[i].cb,
-      &homeSensorTileMarks[i]
-    );
+    homeNodeCardSlot[p] = -1;
+    homeNodeCards[p] = makeHomeNodeCard(homeScreen, p, 28 + p * (cardW + cardGap), 100, cardW, 136);
   }
 
-  // A tile per BLE slot, hidden until something is connected to it.
-  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
-  {
-    const int i = HOME_LOCAL_TILE_COUNT + slot;
-    const int col = i % tileCols;
-    const int row = i / tileCols;
+  makeHeading(homeScreen, "측정 방법", 28, 252, UI_TEXT);
 
-    homeSensorTileModes[i] = SENSOR_MODE_BLE;
-    homeSensorTileSlot[i] = slot;
-    homeSensorTiles[i] = makeSensorTile(
-      homeScreen,
-      "블루투스",
-      "",
-      "연결된 노드 없음",
-      tileLeft + col * (tileW + tileGapX),
-      tileTop + row * (tileH + tileGapY),
-      tileW,
-      tileH,
-      false,
-      home_sensor_ble_event_cb,
-      &homeSensorTileMarks[i],
-      &homeSensorTileName[i],
-      &homeSensorTileDetail[i],
-      &homeSensorTileUnit[i]
-    );
+  makeModeCard(homeScreen, "시간 측정", "시간에 따라 자동으로 기록합니다",
+               &labelHomeModeTimeDetail, 28, 290, 476, 120, go_measure_event_cb);
+  makeModeCard(homeScreen, "조건 측정", "조건을 맞추고 누를 때마다 한 점씩 기록합니다",
+               &labelHomeModeConditionDetail, 520, 290, 476, 120, go_condition_event_cb);
 
-    lv_obj_set_user_data(homeSensorTiles[i], (void *)(intptr_t)slot);
-    lv_obj_add_flag(homeSensorTiles[i], LV_OBJ_FLAG_HIDDEN);
-  }
-
-  // The selected tile already carries 선택됨, so no "선택: ..." line here.
+  // There is no selected tile any more, and no status line beside one.
   labelHomeSensorMode = NULL;
-
-  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 440, UI_TEXT_2);
-  lv_obj_set_width(labelHomeSensorStatus, 392);
-  lv_obj_set_style_text_align(labelHomeSensorStatus, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
+  labelHomeSensorStatus = NULL;
 
   // =====================================================
   // Group code: show the saved value, and only raise the keyboard on 변경.
-  // The old screen kept an always-open text field plus a save button.
   // =====================================================
-  // Resting state: the saved code is read-only text. Editing happens in a
-  // modal sheet, opened by 변경.
-  lv_obj_t *codePanel = makePanel(homeScreen, 28, 458, 604, 72);
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 430, 604, 72);
 
   makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
 
@@ -8069,8 +8236,13 @@ void createHomeUi()
 
   makeQuietButton(codePanel, "변경", 486, 18, 100, 38, home_code_open_event_cb);
 
-  // The one primary action on this screen.
-  makePrimaryButton(homeScreen, "측정 시작", 652, 458, 344, 72, UI_ACCENT, go_measure_event_cb);
+  // The 측정 시작 button that used to sit here is the two mode cards now; its
+  // place says what is still missing before a lesson can be recorded.
+  lv_obj_t *readyPanel = makePanel(homeScreen, 652, 430, 344, 72);
+  makeSmallLabel(readyPanel, "준비 상태", 18, 12, UI_TEXT_3);
+  labelHomeReady = makeLabel(readyPanel, "", 18, 34, UI_TEXT);
+  lv_obj_set_width(labelHomeReady, 308);
+  lv_label_set_long_mode(labelHomeReady, LV_LABEL_LONG_CLIP);
 
   // Upload mode and queue counts belong in Settings, not on the home screen.
   labelCloudMode = NULL;
@@ -8268,7 +8440,7 @@ void createMeasureUi()
 
   // Secondary actions, kept quiet so they do not compete with 시작/정지.
   makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
-  makeQuietButton(measureScreen, "보일의 법칙", railX, contentTop + 288, 126, 44, go_boyle_event_cb);
+  makeQuietButton(measureScreen, "조건 측정", railX, contentTop + 288, 126, 44, go_condition_event_cb);
   makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
   // The primary control. Start is the accent; stop is the only red on screen,
@@ -9031,6 +9203,23 @@ void createBleUi()
   createTabBar(bleScreen, TAB_BLE);
 }
 
+// The dropdown follows the active mode, not the other way round: a change is
+// requested through pendingSensorMode like any other, and this is what makes
+// the control agree with the board afterwards.
+void syncWiredSensorDropdown()
+{
+  if (wiredSensorDropdown == NULL) return;
+
+  for (int i = 0; i < WIRED_SENSOR_OPTION_COUNT; i++)
+  {
+    if (kWiredSensorModes[i] == activeSensorMode)
+    {
+      lv_dropdown_set_selected(wiredSensorDropdown, (uint16_t)i);
+      return;
+    }
+  }
+}
+
 // 설정: what is left once WiFi and 블루투스 have tabs of their own - the
 // device itself.
 void createDeviceUi()
@@ -9052,7 +9241,7 @@ void createDeviceUi()
 
   makeHeading(deviceScreen, "설정", 28, 58, UI_TEXT);
 
-  lv_obj_t *card = makePanel(deviceScreen, 28, 104, 968, 240);
+  lv_obj_t *card = makePanel(deviceScreen, 28, 104, 968, 250);
 
   makeSmallLabel(card, "센서", 20, 16, UI_TEXT_3);
   makeQuietButton(card, "센서 검색", 20, 44, 180, 52, i2c_scan_event_cb);
@@ -9066,51 +9255,128 @@ void createDeviceUi()
 
   makeQuietButton(card, "다시 시작", 788, 138, 160, 52, board_restart_event_cb);
 
-  labelDeviceNote = makeSmallLabel(deviceScreen, "", 28, 360, UI_TEXT_3);
+  // The sensors wired to this board, as a fallback. The home screen no longer
+  // offers them: every sensor is expected over Bluetooth now, but the port is
+  // still there and so are the drivers.
+  makeSmallLabel(card, "유선 센서 (예비)", 20, 212, UI_TEXT_3);
+
+  wiredSensorDropdown = lv_dropdown_create(card);
+  lv_obj_set_size(wiredSensorDropdown, 400, 48);
+  lv_obj_align(wiredSensorDropdown, LV_ALIGN_TOP_LEFT, 216, 196);
+  lv_dropdown_set_options_static(wiredSensorDropdown, kWiredSensorOptions);
+  lv_obj_set_style_text_font(wiredSensorDropdown, FONT_KR, 0);
+  // The arrow is a symbol glyph the Korean face does not carry.
+  lv_obj_set_style_text_font(wiredSensorDropdown, &lv_font_montserrat_16, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(wiredSensorDropdown, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_border_width(wiredSensorDropdown, 0, 0);
+  lv_obj_set_style_radius(wiredSensorDropdown, 10, 0);
+  lv_obj_set_style_text_color(wiredSensorDropdown, lv_color_hex(UI_TEXT), 0);
+  lv_obj_add_event_cb(wiredSensorDropdown, wired_sensor_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // The list exists from the constructor in LVGL 8.3, so it can be styled now.
+  // Nine rows at 16 px would be a thumb-wide strip; the line spacing makes
+  // each one a target, and the height cap keeps it on the screen.
+  lv_obj_t *wiredList = lv_dropdown_get_list(wiredSensorDropdown);
+  if (wiredList)
+  {
+    lv_obj_set_style_text_font(wiredList, FONT_KR, 0);
+    lv_obj_set_style_text_line_space(wiredList, 20, 0);
+    lv_obj_set_style_max_height(wiredList, 300, 0);
+  }
+
+  lv_obj_t *wiredNote = makeSmallLabel(card, "보드에 꽂은 센서로 잴 때만 고릅니다.", 632, 212, UI_TEXT_3);
+  lv_obj_set_width(wiredNote, 316);
+  lv_label_set_long_mode(wiredNote, LV_LABEL_LONG_DOT);
+
+  syncWiredSensorDropdown();
+
+  labelDeviceNote = makeSmallLabel(deviceScreen, "", 28, 366, UI_TEXT_3);
   lv_obj_set_width(labelDeviceNote, 968);
   lv_label_set_long_mode(labelDeviceNote, LV_LABEL_LONG_WRAP);
 
   createTabBar(deviceScreen, TAB_DEVICE);
 }
 
-// The pressure being measured right now, in hPa, whichever sensor is
-// providing it - a DPS310 wired to this board, or a PASCO sensor over BLE.
-// Returns false when nothing on the board is measuring a pressure.
-bool currentPressureHpa(float *out)
-{
-  if (out == NULL) return false;
+// =====================================================
+// 조건 측정
+// =====================================================
 
-  if (activeSensorMode == SENSOR_MODE_BLE)
+static const CondPreset *condPreset()
+{
+  return &kCondPresets[condPresetIndex];
+}
+
+// The variable a preset reads from a sensor, or NULL when both are by hand.
+static const CondVariable *condSensorVariable(const CondPreset *P)
+{
+  if (P->x.source != COND_SRC_MANUAL) return &P->x;
+  if (P->y.source != COND_SRC_MANUAL) return &P->y;
+  return NULL;
+}
+
+static const CondVariable *condManualVariable(const CondPreset *P)
+{
+  if (P->x.source == COND_SRC_MANUAL) return &P->x;
+  if (P->y.source == COND_SRC_MANUAL) return &P->y;
+  return NULL;
+}
+
+// Reads a variable that comes from a node. The lead slot is tried first, then
+// every other one, and every quantity each reports, comparing the node's unit
+// with the variable's aliases - so a PASCO sensor saying kPa and a node
+// saying hPa both feed 압력, brought to one unit. Only a fresh value counts.
+//
+// This walks bleLinkValueAt() directly rather than the measurement screen's
+// three-value readout, which is capped across nodes: a CO2 node reporting
+// three quantities would otherwise hide a pressure sensor in the next slot.
+static bool condReadFromNodes(const CondVariable *v, float *out,
+                              char *nodeOut, size_t nodeOutSize,
+                              char *nameOut, char *unitOut, size_t textSize)
+{
+  for (int pass = 0; pass <= BLE_LINK_MAX_NODES; pass++)
   {
-    for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+    const int slot = pass == 0 ? activeBleSlot : pass - 1;
+    if (pass > 0 && slot == activeBleSlot) continue;
+    if (slot < 0 || slot >= BLE_LINK_MAX_NODES) continue;
+    if (!bleLinkSlotIsSubscribed(slot)) continue;
+
+    const int count = bleLinkValueCount(slot);
+
+    for (int i = 0; i < count; i++)
     {
-      if (strcmp(bleNodeUnit[i], "hPa") != 0) continue;
+      // 일반 takes the first thing a node says and nothing else.
+      if (v->source == COND_SRC_SENSOR_ANY && i > 0) break;
 
       float value = NAN;
+      char quantity[24] = "";
+      char unit[24] = "";
       uint32_t ageMs = 0;
 
-      if (!bleLinkValueAt(bleValueSlot[i], bleValueIndex[i], &value, NULL, NULL, &ageMs)) continue;
-      if (ageMs > BLE_READING_MAX_AGE_MS || isnan(value)) continue;
+      if (!bleLinkValueAt(slot, i, &value, quantity, unit, &ageMs)) break;
+      if (isnan(value) || ageMs > BLE_READING_MAX_AGE_MS) continue;
 
-      *out = value;
-      return true;
-    }
+      float scale = 1.0f;
+      float offset = 0.0f;
+      bool matched = v->source == COND_SRC_SENSOR_ANY;
 
-    return false;
-  }
+      if (v->source == COND_SRC_SENSOR)
+      {
+        for (int a = 0; a < COND_MAX_ALIASES && v->aliases[a].unit != NULL; a++)
+        {
+          if (strcmp(v->aliases[a].unit, unit) != 0) continue;
+          matched = true;
+          scale = v->aliases[a].scale;
+          offset = v->aliases[a].offset;
+          break;
+        }
+      }
 
-  if (activeSensorMode == SENSOR_MODE_DPS310)
-  {
-    // The idle preview keeps this current whether or not a run is going.
-    if (previewValid && !isnan(previewValues[1]))
-    {
-      *out = previewValues[1];
-      return true;
-    }
+      if (!matched) continue;
 
-    if (sampleCount > 0 && pressureValueValid(pressureHistory[sampleCount - 1]))
-    {
-      *out = pressureHistory[sampleCount - 1];
+      *out = value * scale + offset;
+      if (nodeOut) snprintf(nodeOut, nodeOutSize, "%s", bleLinkSlotName(slot));
+      if (nameOut) snprintf(nameOut, textSize, "%s", quantity);
+      if (unitOut) snprintf(unitOut, textSize, "%s", unit);
       return true;
     }
   }
@@ -9118,94 +9384,413 @@ bool currentPressureHpa(float *out)
   return false;
 }
 
-// =====================================================
-// 보일의 법칙
-// =====================================================
-
-void refreshBoyleScreen();
-
-static void boyle_volume_event_cb(lv_event_t *e)
+// A sensor wired to this board, chosen on the 설정 screen, can feed a
+// variable too: the idle preview holds its latest readings.
+static bool condReadFromWired(const CondVariable *v, float *out,
+                              char *nameOut, char *unitOut, size_t textSize)
 {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (activeSensorMode == SENSOR_MODE_BLE || !previewValid) return false;
 
-  // The step rides on the button, so one handler serves all four.
-  const int step = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  const char *units[2] = { activePrimaryUnit(), activeSecondaryUnit() };
+  const char *names[2] = { activePrimaryName(), activeSecondaryName() };
 
-  boyleVolumeSetting += (float)step * 0.1f;
+  for (int i = 0; i < 2; i++)
+  {
+    const float value = previewValues[i];
+    if (isnan(value)) continue;
+    // The second preview slot is a pressure only for the DPS310; an SCD41
+    // puts its temperature there, which the pressure range would reject.
+    if (i == 1 && activeSensorHasPressure() && !pressureValueValid(value)) continue;
+    if (v->source == COND_SRC_SENSOR_ANY && i > 0) break;
 
-  if (boyleVolumeSetting < 0.1f) boyleVolumeSetting = 0.1f;
-  if (boyleVolumeSetting > 200.0f) boyleVolumeSetting = 200.0f;
+    float scale = 1.0f;
+    float offset = 0.0f;
+    bool matched = v->source == COND_SRC_SENSOR_ANY;
 
-  refreshBoyleScreen();
+    if (v->source == COND_SRC_SENSOR)
+    {
+      for (int a = 0; a < COND_MAX_ALIASES && v->aliases[a].unit != NULL; a++)
+      {
+        if (strcmp(v->aliases[a].unit, units[i]) != 0) continue;
+        matched = true;
+        scale = v->aliases[a].scale;
+        offset = v->aliases[a].offset;
+        break;
+      }
+    }
+
+    if (!matched) continue;
+
+    *out = value * scale + offset;
+    if (nameOut) snprintf(nameOut, textSize, "%s", names[i]);
+    if (unitOut) snprintf(unitOut, textSize, "%s", units[i]);
+    return true;
+  }
+
+  return false;
 }
 
-static void boyle_record_event_cb(lv_event_t *e)
+// The current number for a variable, wherever it comes from. `nodeOut` names
+// the node it came from, or the board itself.
+static bool condReadVariable(const CondVariable *v, float *out,
+                             char *nodeOut, size_t nodeOutSize,
+                             char *nameOut, char *unitOut, size_t textSize)
+{
+  if (v->source == COND_SRC_MANUAL)
+  {
+    *out = condManual[condPresetIndex];
+    if (nodeOut) nodeOut[0] = 0;
+    if (nameOut) snprintf(nameOut, textSize, "%s", v->name);
+    if (unitOut) snprintf(unitOut, textSize, "%s", v->unit);
+    return true;
+  }
+
+  if (condReadFromNodes(v, out, nodeOut, nodeOutSize, nameOut, unitOut, textSize)) return true;
+
+  if (condReadFromWired(v, out, nameOut, unitOut, textSize))
+  {
+    if (nodeOut) snprintf(nodeOut, nodeOutSize, "%s", "보드 센서");
+    return true;
+  }
+
+  return false;
+}
+
+// The variable's own unit for display: a preset's, or for 일반 whatever the
+// node said when the run began (or is saying now, before the first point).
+static const char *condDisplayUnit(const CondVariable *v)
+{
+  if (v->source == COND_SRC_SENSOR_ANY)
+  {
+    return bleDisplayUnit(condAnyUnit);
+  }
+
+  return v->unit;
+}
+
+static const char *condDisplayName(const CondVariable *v)
+{
+  if (v->source == COND_SRC_SENSOR_ANY && condAnyName[0]) return condAnyName;
+  return v->name;
+}
+
+static int condDecimals(const CondVariable *v)
+{
+  return v->decimals;
+}
+
+static float condDerivedValue(const CondPreset *P, float x, float y)
+{
+  if (P->derived == COND_DERIVED_PRODUCT) return x * y;
+
+  if (P->derived == COND_DERIVED_RATIO)
+  {
+    const float d = x + P->derivedOffsetX;
+    return fabsf(d) < 1e-6f ? NAN : y / d;
+  }
+
+  return NAN;
+}
+
+// The fit through the points, in the shape the preset expects.
+static void condComputeFit(const CondPreset *P, int pi, CondFit *fit)
+{
+  memset(fit, 0, sizeof(*fit));
+  fit->k = NAN;
+  fit->a = NAN;
+  fit->b = NAN;
+  fit->derivedMean = NAN;
+
+  const int n = condPointCount[pi];
+  if (n == 0) return;
+
+  if (P->derived != COND_DERIVED_NONE)
+  {
+    float sum = 0.0f;
+    int used = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+      const float d = condDerivedValue(P, condX[pi][i], condY[pi][i]);
+      if (isnan(d)) continue;
+      sum += d;
+      used++;
+    }
+
+    if (used > 0) fit->derivedMean = sum / (float)used;
+  }
+
+  if (P->fit == COND_FIT_INVERSE)
+  {
+    float sum = 0.0f;
+    int used = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+      if (fabsf(condX[pi][i]) < 1e-6f) continue;
+      sum += condX[pi][i] * condY[pi][i];
+      used++;
+    }
+
+    if (used > 0)
+    {
+      fit->k = sum / (float)used;
+      fit->valid = true;
+    }
+  }
+  else if (P->fit == COND_FIT_LINEAR && n >= 2)
+  {
+    float xm = 0.0f;
+    float ym = 0.0f;
+
+    for (int i = 0; i < n; i++)
+    {
+      xm += condX[pi][i];
+      ym += condY[pi][i];
+    }
+
+    xm /= (float)n;
+    ym /= (float)n;
+
+    float sxx = 0.0f;
+    float sxy = 0.0f;
+
+    for (int i = 0; i < n; i++)
+    {
+      sxx += (condX[pi][i] - xm) * (condX[pi][i] - xm);
+      sxy += (condX[pi][i] - xm) * (condY[pi][i] - ym);
+    }
+
+    // Two readings at the same temperature give no slope at all.
+    if (sxx > 1e-6f)
+    {
+      fit->b = sxy / sxx;
+      fit->a = ym - fit->b * xm;
+      fit->valid = true;
+    }
+  }
+}
+
+// The axis a set of values is drawn on: the preset's range, widened to the
+// grid by any point outside it; or, when the preset leaves it to the data,
+// the data's range rounded out to the grid.
+static CondAxis condAxisRange(float presetMin, float presetMax, float step,
+                              const float *values, int n, bool stretchTop)
+{
+  CondAxis axis;
+  if (step <= 0.0f) step = 1.0f;
+
+  float dataMin = NAN;
+  float dataMax = NAN;
+
+  for (int i = 0; i < n; i++)
+  {
+    if (isnan(dataMin) || values[i] < dataMin) dataMin = values[i];
+    if (isnan(dataMax) || values[i] > dataMax) dataMax = values[i];
+  }
+
+  if (isnan(dataMin)) { dataMin = 0.0f; dataMax = 0.0f; }
+
+  axis.lo = isnan(presetMin) ? floorf(dataMin / step) * step : presetMin;
+
+  if (isnan(presetMax))
+  {
+    // Some headroom above the highest point, so it does not sit on the edge.
+    const float top = stretchTop ? dataMax + 0.1f * (dataMax - axis.lo) : dataMax;
+    axis.hi = ceilf(top / step) * step;
+  }
+  else
+  {
+    axis.hi = presetMax;
+  }
+
+  if (dataMin < axis.lo) axis.lo = floorf(dataMin / step) * step;
+  if (dataMax > axis.hi) axis.hi = ceilf(dataMax / step) * step;
+  if (axis.hi - axis.lo < step) axis.hi = axis.lo + step;
+
+  axis.span = axis.hi - axis.lo;
+  return axis;
+}
+
+static void condSetNote(const char *text)
+{
+  if (labelConditionNote) lv_label_set_text(labelConditionNote, text);
+}
+
+// ---- buttons -----------------------------------------------------------------
+
+static void condition_preset_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-  if (boylePointCount >= BOYLE_MAX_POINTS)
+  const int index = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (index < 0 || index >= COND_PRESET_COUNT) return;
+
+  // Points are kept per preset, so this is a change of view, not of data.
+  condPresetIndex = index;
+  condDirty = true;
+  condSetNote("");
+  refreshConditionScreen();
+}
+
+static void condition_step_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const CondVariable *v = condManualVariable(P);
+  if (v == NULL) return;
+
+  // The index rides on the button; the size of the step is the preset's, so
+  // one set of four buttons serves every experiment.
+  const int index = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  const float steps[4] = { -v->stepLarge, -v->stepSmall, v->stepSmall, v->stepLarge };
+  if (index < 0 || index > 3) return;
+
+  float value = condManual[condPresetIndex] + steps[index];
+  if (value < v->minValue) value = v->minValue;
+  if (value > v->maxValue) value = v->maxValue;
+  condManual[condPresetIndex] = value;
+
+  refreshConditionScreen();
+}
+
+static void condition_record_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+
+  if (n >= COND_MAX_POINTS)
   {
-    if (labelBoyleHint) lv_label_set_text(labelBoyleHint, "점이 가득 찼습니다. 지우고 다시 시작하세요.");
+    condSetNote("점이 가득 찼습니다. 지우고 다시 시작하세요.");
     return;
   }
 
-  float pressure = NAN;
+  float x = NAN;
+  float y = NAN;
+  char name[24] = "";
+  char unit[24] = "";
 
-  if (!currentPressureHpa(&pressure))
+  const CondVariable *sensorVar = condSensorVariable(P);
+
+  if (!condReadVariable(&P->x, &x, NULL, 0, name, unit, sizeof(name)) ||
+      !condReadVariable(&P->y, &y, NULL, 0, name, unit, sizeof(name)))
   {
-    if (labelBoyleHint)
-    {
-      lv_label_set_text(labelBoyleHint,
-                        "압력을 읽을 수 없습니다. 압력 센서를 선택했는지 확인하세요.");
-    }
+    char note[120];
+    snprintf(note, sizeof(note), "%s 값을 읽을 수 없습니다. 센서가 연결되어 있는지 확인하세요.",
+             sensorVar ? sensorVar->name : "센서");
+    condSetNote(note);
     return;
   }
 
-  // Overwrite a point already taken at this volume rather than storing the
-  // same x twice: a repeat is a correction, not a second reading.
-  int slot = boylePointCount;
-
-  for (int i = 0; i < boylePointCount; i++)
+  // 일반 records whatever the node says, so the run has to remember what that
+  // was: a second quantity in the same column would be two experiments.
+  if (sensorVar && sensorVar->source == COND_SRC_SENSOR_ANY)
   {
-    if (fabsf(boyleVolumeMl[i] - boyleVolumeSetting) < 0.05f)
+    // Two nodes with the same unit are still two sensors: a run that began
+    // on one must not quietly continue on the other when the first goes quiet.
+    float again = NAN;
+    char node[32] = "";
+    condReadVariable(sensorVar, &again, node, sizeof(node), NULL, NULL, 0);
+
+    if (n == 0)
     {
-      slot = i;
-      break;
+      snprintf(condAnyName, sizeof(condAnyName), "%s", name);
+      snprintf(condAnyUnit, sizeof(condAnyUnit), "%s", unit);
+      snprintf(condAnyNode, sizeof(condAnyNode), "%s", node);
+    }
+    else if (strcmp(condAnyUnit, unit) != 0 || strcmp(condAnyNode, node) != 0)
+    {
+      char note[140];
+      snprintf(note, sizeof(note), "%s의 값이 아닙니다. 그 센서를 다시 연결하거나, 지우기 후 기록하세요.",
+               condAnyNode[0] ? condAnyNode : "처음 센서");
+      condSetNote(note);
+      return;
     }
   }
 
-  boyleVolumeMl[slot] = boyleVolumeSetting;
-  boylePressureHpa[slot] = pressure;
-  if (slot == boylePointCount) boylePointCount++;
+  // A repeat at a condition the student set is a correction, not a second
+  // reading - but only when the condition is the one set by hand. In 샤를 the
+  // temperature is what varies, and two readings at one volume are both real.
+  int slot = n;
 
-  Serial.printf("[BOYLE] %.1f mL -> %.1f hPa (PV=%.0f)\n",
-                boyleVolumeSetting, pressure, boyleVolumeSetting * pressure);
-
-  refreshBoyleScreen();
-}
-
-static void boyle_undo_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (boylePointCount > 0) boylePointCount--;
-  refreshBoyleScreen();
-}
-
-static void boyle_clear_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  boylePointCount = 0;
-  refreshBoyleScreen();
-}
-
-static void boyle_save_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (labelBoyleHint == NULL) return;
-
-  if (boylePointCount == 0)
+  if (P->x.source == COND_SRC_MANUAL)
   {
-    lv_label_set_text(labelBoyleHint, "저장할 점이 없습니다.");
+    for (int i = 0; i < n; i++)
+    {
+      if (fabsf(condX[pi][i] - x) < 0.05f)
+      {
+        slot = i;
+        break;
+      }
+    }
+  }
+
+  condX[pi][slot] = x;
+  condY[pi][slot] = y;
+  if (slot == n) condPointCount[pi] = n + 1;
+
+  Serial.printf("[COND] %s: %s %.3f -> %s %.3f (%s %.3f)\n", P->title,
+                condDisplayName(&P->x), x, condDisplayName(&P->y), y,
+                P->derivedName ? P->derivedName : "-", condDerivedValue(P, x, y));
+
+  condDirty = true;
+  condSetNote(slot == n ? "" : "같은 조건의 점을 새 값으로 바꿨습니다.");
+  refreshConditionScreen();
+}
+
+static void condition_undo_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int pi = condPresetIndex;
+  if (condPointCount[pi] > 0) condPointCount[pi]--;
+
+  if (condPointCount[pi] == 0 && condSensorVariable(condPreset()) != NULL &&
+      condSensorVariable(condPreset())->source == COND_SRC_SENSOR_ANY)
+  {
+    condAnyName[0] = 0;
+    condAnyUnit[0] = 0;
+    condAnyNode[0] = 0;
+  }
+
+  condDirty = true;
+  refreshConditionScreen();
+}
+
+static void condition_clear_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  condPointCount[condPresetIndex] = 0;
+
+  const CondVariable *sensorVar = condSensorVariable(condPreset());
+  if (sensorVar && sensorVar->source == COND_SRC_SENSOR_ANY)
+  {
+    condAnyName[0] = 0;
+    condAnyUnit[0] = 0;
+    condAnyNode[0] = 0;
+  }
+
+  condDirty = true;
+  condSetNote("");
+  refreshConditionScreen();
+}
+
+static void condition_save_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+
+  if (n == 0)
+  {
+    condSetNote("저장할 점이 없습니다.");
     return;
   }
 
@@ -9217,36 +9802,44 @@ static void boyle_save_event_cb(lv_event_t *e)
 
   if (!sdReady)
   {
-    lv_label_set_text(labelBoyleHint, "SD 카드를 읽을 수 없습니다.");
+    condSetNote("SD 카드를 읽을 수 없습니다.");
     return;
   }
 
   char path[160];
-  snprintf(path, sizeof(path), "%s/boyle.csv", MOUNT_POINT);
+  snprintf(path, sizeof(path), "%s/%s.csv", MOUNT_POINT, P->csvFile);
 
   FILE *file = fopen(path, "w");
 
   if (file == NULL)
   {
-    lv_label_set_text(labelBoyleHint, "boyle.csv를 만들 수 없습니다.");
+    char note[120];
+    snprintf(note, sizeof(note), "%s.csv를 만들 수 없습니다.", P->csvFile);
+    condSetNote(note);
     return;
   }
 
-  // P x V is the whole point of the experiment, so the file carries it rather
-  // than leaving every student to work it out by hand.
-  fprintf(file, "no,volume_mL,pressure_hPa,PV\n");
+  // The derived column is the whole point of the experiment, so the file
+  // carries it rather than leaving every student to work it out by hand.
+  if (P->derivedCsvName) fprintf(file, "no,%s,%s,%s\n", P->x.csvName, P->y.csvName, P->derivedCsvName);
+  else fprintf(file, "no,%s,%s\n", P->x.csvName, P->y.csvName);
 
-  for (int i = 0; i < boylePointCount; i++)
+  for (int i = 0; i < n; i++)
   {
-    fprintf(file, "%d,%.2f,%.2f,%.1f\n", i + 1, boyleVolumeMl[i],
-            boylePressureHpa[i], boyleVolumeMl[i] * boylePressureHpa[i]);
+    fprintf(file, "%d,%.*f,%.*f", i + 1,
+            condDecimals(&P->x) + 1, condX[pi][i],
+            condDecimals(&P->y) + 1, condY[pi][i]);
+
+    if (P->derivedCsvName) fprintf(file, ",%.4f", condDerivedValue(P, condX[pi][i], condY[pi][i]));
+
+    fprintf(file, "\n");
   }
 
   fclose(file);
 
   char note[120];
-  snprintf(note, sizeof(note), "boyle.csv 저장됨: %d개 점", boylePointCount);
-  lv_label_set_text(labelBoyleHint, note);
+  snprintf(note, sizeof(note), "%s.csv 저장됨: %d개 점", P->csvFile, n);
+  condSetNote(note);
 }
 
 // The 지능형 과학실 helpers live with the rest of the upload code, well below
@@ -9262,28 +9855,129 @@ void formatDirectAxisTick(uint32_t timeS, char *out, size_t outSize);
 bool directIslStartProcess(const char *modumId);
 bool directIslSetStatusOnIfNeeded();
 
-// Sends the recorded points to 지능형 과학실.
-//
-// The platform's data model is a value against a time, so the point number
-// stands in for the time: the points go up in the order they were taken, and
-// the volume that produced each one travels as its own sensor type alongside
-// the pressure. Whether the platform will take a volume at all is the open
-// question - the 2026-07-21 appendix has no code for one - so the candidates
-// are tried in turn the way the distance sensor's already are, and the
-// pressure goes up regardless.
-static const char *kBoyleVolumeTypes[] = { "VOLM", "VLM", "VOL", "VOLU" };
-static char boyleVolumeSensorType[8] = "";
-
-static bool boyleRegisterSensorTypes()
+// What goes up for one variable: the platform's code for it, the name it is
+// shown under, and the channel. A sensor variable maps by its unit through the
+// same table the measurement screen uses; a hand-set volume has its own
+// probed code; anything else stays on the board.
+typedef struct
 {
-  const int candidateCount = (int)(sizeof(kBoyleVolumeTypes) / sizeof(kBoyleVolumeTypes[0]));
+  const char *sensorType;
+  const char *nickname;
+  const char *channel;
+  const char *collectUnit;
+  bool isVolume;
+  const float *values;
+} CondIslItem;
 
-  for (int i = 0; i <= candidateCount; i++)
+static int condIslItems(const CondPreset *P, int pi, CondIslItem *items, char *skipped, size_t skippedSize)
+{
+  const CondVariable *vars[2] = { &P->x, &P->y };
+  const float *values[2] = { condX[pi], condY[pi] };
+  int count = 0;
+  bool channelOneTaken = false;
+
+  skipped[0] = 0;
+
+  for (int i = 0; i < 2; i++)
   {
-    // The last pass registers pressure alone, for a platform that will not
-    // take a volume under any name.
-    const bool withVolume = i < candidateCount;
-    const char *volumeType = withVolume ? kBoyleVolumeTypes[i] : NULL;
+    const CondVariable *v = vars[i];
+
+    if (v->source == COND_SRC_MANUAL)
+    {
+      if (v->islType == NULL)
+      {
+        strncat(skipped, skipped[0] ? ", " : "", skippedSize - strlen(skipped) - 1);
+        strncat(skipped, v->name, skippedSize - strlen(skipped) - 1);
+        continue;
+      }
+
+      items[count].sensorType = v->islType;
+      items[count].nickname = v->islNickname;
+      items[count].channel = "01";
+      items[count].collectUnit = v->unit;
+      items[count].isVolume = true;
+      items[count].values = values[i];
+      count++;
+      continue;
+    }
+
+    // Mapped by the unit the number is IN - the preset's own, after any
+    // kPa-to-hPa scaling - so the figure and its label agree on the server.
+    const char *unit = v->source == COND_SRC_SENSOR_ANY ? condAnyUnit : v->unit;
+    const BleIslMapping *m = bleIslMappingForUnit(unit);
+
+    if (m == NULL)
+    {
+      strncat(skipped, skipped[0] ? ", " : "", skippedSize - strlen(skipped) - 1);
+      strncat(skipped, condDisplayName(v), skippedSize - strlen(skipped) - 1);
+      continue;
+    }
+
+    items[count].sensorType = m->sensorType;
+    items[count].nickname = m->nickname;
+    items[count].channel = m->channel;
+    items[count].collectUnit = m->collectUnit;
+    items[count].isVolume = false;
+    items[count].values = values[i];
+    if (strcmp(m->channel, "01") == 0) channelOneTaken = true;
+    count++;
+  }
+
+  // Two items cannot share a channel. Pressure already pairs with temperature
+  // as 02, so the volume takes 02 when the sensor beside it holds 01.
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume && channelOneTaken) items[i].channel = "02";
+  }
+
+  return count;
+}
+
+static String condIslTypeItems(const CondIslItem *items, int count, const char *volumeType)
+{
+  String out = "";
+
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume && volumeType == NULL) continue;
+
+    if (out.length()) out += ",";
+    out += "{\"sensorType\":\"";
+    out += items[i].isVolume ? volumeType : items[i].sensorType;
+    out += "\",\"sensorNicNm\":\"";
+    out += items[i].nickname;
+    out += "\",\"channelCode\":\"";
+    out += items[i].channel;
+    out += "\"}";
+  }
+
+  return out;
+}
+
+// Registers the run's variables. The volume code is unknown to the appendix,
+// so the candidates are tried in turn and, failing all of them, the sensor
+// goes up on its own.
+static bool condRegisterSensorTypes(const CondIslItem *items, int count)
+{
+  bool haveVolume = false;
+  int sensorItems = 0;
+
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume) haveVolume = true;
+    else sensorItems++;
+  }
+
+  const int candidateCount = (int)(sizeof(kCondVolumeTypes) / sizeof(kCondVolumeTypes[0]));
+  const int passes = haveVolume ? candidateCount + 1 : 1;
+
+  for (int pass = 0; pass < passes; pass++)
+  {
+    const bool withVolume = haveVolume && pass < candidateCount;
+    const char *volumeType = withVolume ? kCondVolumeTypes[pass] : NULL;
+    const int registered = sensorItems + (withVolume ? 1 : 0);
+
+    if (registered == 0) break;
 
     String payload = "{";
     payload += "\"serviceKey\":\"";
@@ -9291,22 +9985,13 @@ static bool boyleRegisterSensorTypes()
     payload += "\",\"uniqueCode\":\"";
     payload += jsonEscapeString(directIslUniqueCode);
     payload += "\",\"sensorCount\":";
-    payload += withVolume ? 2 : 1;
+    payload += registered;
     payload += ",\"items\":[";
-    payload += "{\"sensorType\":\"PRS\",\"sensorNicNm\":\"기압센서\",\"channelCode\":\"02\"}";
-
-    if (withVolume)
-    {
-      payload += ",{\"sensorType\":\"";
-      payload += volumeType;
-      payload += "\",\"sensorNicNm\":\"부피센서\",\"channelCode\":\"01\"}";
-    }
-
+    payload += condIslTypeItems(items, count, volumeType);
     payload += "]}";
 
     String response;
-    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response,
-                              "BOYLE_TYPE", 2, 700))
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "COND_TYPE", 2, 700))
     {
       return false;
     }
@@ -9316,44 +10001,57 @@ static bool boyleRegisterSensorTypes()
 
     if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
     {
-      snprintf(boyleVolumeSensorType, sizeof(boyleVolumeSensorType), "%s",
-               withVolume ? volumeType : "");
+      snprintf(condVolumeSensorType, sizeof(condVolumeSensorType), "%s", withVolume ? volumeType : "");
 
-      if (withVolume) Serial.printf("[BOYLE] volume accepted as %s\n", volumeType);
-      else Serial.println("[BOYLE] no volume type accepted; sending pressure only");
+      if (withVolume) Serial.printf("[COND] volume accepted as %s\n", volumeType);
+      else if (haveVolume) Serial.println("[COND] no volume type accepted; sending the sensor only");
 
       return true;
     }
 
-    Serial.print("[BOYLE] sensor type refused: ");
+    Serial.print("[COND] sensor type refused: ");
     Serial.println(response);
   }
 
   return false;
 }
 
-void boyleUploadToIsl()
+// Sends the recorded points to 지능형 과학실. The platform's data model is a
+// value against a time, so the point number stands in for the time: the
+// points go up in the order they were taken, each variable as its own item.
+void conditionUploadToIsl()
 {
-  Serial.printf("[BOYLE] upload requested: %d point(s), wifi=%d, modum=%d\n",
-                boylePointCount, wifiConnected ? 1 : 0, cloudModumConfigured() ? 1 : 0);
+  const int pi = condUploadPreset;
+  const CondPreset *P = &kCondPresets[pi];
+  const int n = condPointCount[pi];
 
-  if (labelBoyleHint == NULL) return;
-
-  if (boylePointCount == 0)
+  if (n == 0)
   {
-    lv_label_set_text(labelBoyleHint, "전송할 점이 없습니다.");
+    condSetNote("전송할 점이 없습니다.");
+    return;
+  }
+
+  CondIslItem items[2];
+  char skipped[80];
+  const int count = condIslItems(P, pi, items, skipped, sizeof(skipped));
+
+  if (count == 0)
+  {
+    char note[140];
+    snprintf(note, sizeof(note), "전송할 수 있는 단위가 없습니다 (%s)", skipped);
+    condSetNote(note);
     return;
   }
 
   if (!cloudModumConfigured())
   {
-    lv_label_set_text(labelBoyleHint, "모둠코드를 먼저 입력하세요.");
+    condSetNote("모둠코드를 먼저 입력하세요.");
     return;
   }
 
-  if (!ensureWifiReadyForHttp("보일전송", 20000))
+  if (!ensureWifiReadyForHttp("조건전송", 20000))
   {
-    lv_label_set_text(labelBoyleHint, "WiFi가 연결되어 있지 않습니다.");
+    condSetNote("WiFi가 연결되어 있지 않습니다.");
     return;
   }
 
@@ -9362,17 +10060,17 @@ void boyleUploadToIsl()
 
   // A fresh session: these points are one experiment, not a continuation of
   // whatever the measurement screen was last doing.
-  resetDirectIslSessionCache("boyle upload");
+  resetDirectIslSessionCache("condition upload");
 
   if (!directIslStartProcess(modumId))
   {
-    lv_label_set_text(labelBoyleHint, "탐구 시작 요청 실패");
+    condSetNote("탐구 시작 요청 실패");
     return;
   }
 
-  if (!boyleRegisterSensorTypes())
+  if (!condRegisterSensorTypes(items, count))
   {
-    lv_label_set_text(labelBoyleHint, "센서등록 실패");
+    condSetNote("센서등록 실패");
     return;
   }
 
@@ -9380,63 +10078,65 @@ void boyleUploadToIsl()
 
   if (!directIslSetStatusOnIfNeeded())
   {
-    lv_label_set_text(labelBoyleHint, "상태 전환 실패");
+    condSetNote("상태 전환 실패");
     return;
   }
 
   int sent = 0;
 
-  for (int i = 0; i < boylePointCount; i++)
+  for (int i = 0; i < n; i++)
   {
-    // 숫자를 보내기 전에 씁니다. 보낸 뒤에 쓰면 첫 왕복이 끝날 때까지 화면이
-    // 조용하고, 그 사이가 사용자에게는 아무 일도 안 일어나는 시간입니다.
-    // 두 번 돌리는 것은 LVGL이 한 번은 그리고 한 번은 내보내기 때문입니다.
+    // Written before each round trip: written after, the screen stayed blank
+    // until the first upload returned, which is exactly the stretch where a
+    // person wonders whether the button did anything. Pumped twice because
+    // LVGL draws on one pass and flushes on the next.
     char progress[80];
-    snprintf(progress, sizeof(progress), "전송 중 %d/%d", i + 1, boylePointCount);
-    lv_label_set_text(labelBoyleHint, progress);
+    snprintf(progress, sizeof(progress), "전송 중 %d/%d", i + 1, n);
+    condSetNote(progress);
     uiTimerHandler();
     uiTimerHandler();
 
     char axisTick[24];
     formatDirectAxisTick((uint32_t)(i + 1), axisTick, sizeof(axisTick));
 
-    char pressure[24];
-    char volume[24];
-    snprintf(pressure, sizeof(pressure), "%.4f", boylePressureHpa[i]);
-    snprintf(volume, sizeof(volume), "%.4f", boyleVolumeMl[i]);
-
     String payload = "{";
     payload += "\"serviceKey\":\"";
     payload += jsonEscapeString(islServiceKey);
     payload += "\",\"uniqueCode\":\"";
     payload += jsonEscapeString(directIslUniqueCode);
-
-    // The server rejects a data post without this - "Field required",
-    // transMethod. 01 is a live reading as it is taken; these points were
-    // taken earlier and are being sent together, which is 02.
     payload += "\",\"transMethod\":\"02\",\"items\":[";
-    payload += "{\"sensorType\":\"PRS\",\"sensorNicNm\":\"기압센서\",\"channelCode\":\"02\",\"sensorData\":\"";
-    payload += pressure;
-    payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
-    payload += axisTick;
-    payload += "\",\"collectUnit\":\"hPa\"}";
 
-    if (boyleVolumeSensorType[0])
+    bool first = true;
+
+    for (int k = 0; k < count; k++)
     {
-      payload += ",{\"sensorType\":\"";
-      payload += boyleVolumeSensorType;
-      payload += "\",\"sensorNicNm\":\"부피센서\",\"channelCode\":\"01\",\"sensorData\":\"";
-      payload += volume;
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) continue;
+
+      char value[24];
+      snprintf(value, sizeof(value), "%.4f", items[k].values[i]);
+
+      if (!first) payload += ",";
+      first = false;
+
+      payload += "{\"sensorType\":\"";
+      payload += items[k].isVolume ? condVolumeSensorType : items[k].sensorType;
+      payload += "\",\"sensorNicNm\":\"";
+      payload += items[k].nickname;
+      payload += "\",\"channelCode\":\"";
+      payload += items[k].channel;
+      payload += "\",\"sensorData\":\"";
+      payload += value;
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
-      payload += "\",\"collectUnit\":\"mL\"}";
+      payload += "\",\"collectUnit\":\"";
+      payload += items[k].collectUnit;
+      payload += "\"}";
     }
 
     payload += "]}";
 
     String response;
-    if (!httpPostJsonReliableCode(DIRECT_ISL_DATA_URL, payload, &response, "BOYLE_DATA",
-                                  "001", NULL, NULL))
+    if (!httpPostJsonReliableCode(DIRECT_ISL_DATA_URL, payload, &response, "COND_DATA", "001", NULL, NULL))
     {
       break;
     }
@@ -9444,200 +10144,347 @@ void boyleUploadToIsl()
     sent++;
   }
 
-  char note[140];
+  char note[160];
 
-  if (sent == boylePointCount)
+  if (sent == n)
   {
-    if (boyleVolumeSensorType[0])
+    char types[60] = "";
+
+    for (int k = 0; k < count; k++)
     {
-      snprintf(note, sizeof(note), "전송 완료: %d개 점 (압력 PRS · 부피 %s)",
-               sent, boyleVolumeSensorType);
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) continue;
+      if (types[0]) strncat(types, " · ", sizeof(types) - strlen(types) - 1);
+      strncat(types, items[k].isVolume ? condVolumeSensorType : items[k].sensorType,
+              sizeof(types) - strlen(types) - 1);
+    }
+
+    bool volumeDropped = false;
+    for (int k = 0; k < count; k++)
+    {
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) volumeDropped = true;
+    }
+
+    if (volumeDropped)
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s) · 부피 제외: 서버가 부피 코드를 받지 않음", sent, types);
+    }
+    else if (skipped[0])
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s) · 제외: %s", sent, types, skipped);
     }
     else
     {
-      snprintf(note, sizeof(note),
-               "전송 완료: %d개 점 · 압력만 (부피 코드를 서버가 받지 않음)", sent);
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s)", sent, types);
     }
   }
   else
   {
-    snprintf(note, sizeof(note), "전송 중단: %d/%d개만 전송됨", sent, boylePointCount);
+    snprintf(note, sizeof(note), "전송 중단: %d/%d개만 전송됨", sent, n);
   }
 
-  lv_label_set_text(labelBoyleHint, note);
-  Serial.printf("[BOYLE] %s\n", note);
+  condSetNote(note);
+  Serial.printf("[COND] %s\n", note);
 }
 
-static void boyle_send_event_cb(lv_event_t *e)
+static void condition_send_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (labelBoyleHint == NULL) return;
 
   // The network work is long and blocking, so the button only asks.
-  lv_label_set_text(labelBoyleHint, "지능형 과학실로 전송 중...");
-  pendingBoyleUpload = true;
+  condSetNote("지능형 과학실로 전송 중...");
+  condUploadPreset = condPresetIndex;
+  pendingConditionUpload = true;
 }
 
-static void go_boyle_event_cb(lv_event_t *e)
+static void go_condition_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  requestScreenSwitch(boyleScreen);
+  condDirty = true;
+  requestScreenSwitch(conditionScreen);
 }
 
-void refreshBoyleScreen()
-{
-  if (boyleChart == NULL) return;
+// ---- the screen ----------------------------------------------------------------
 
-  if (labelBoyleVolume)
+// Formats a number with a variable's unit: "20.0 mL", "23.4 ℃", "12" when the
+// variable carries no unit.
+static void condFormatValue(const CondVariable *v, float value, char *out, size_t outSize)
+{
+  const char *unit = condDisplayUnit(v);
+
+  if (unit[0]) snprintf(out, outSize, "%.*f %s", condDecimals(v), value, unit);
+  else snprintf(out, outSize, "%.*f", condDecimals(v), value);
+}
+
+static void condRestyleButtonLabel(lv_obj_t *btn, const char *text)
+{
+  lv_obj_t *label = lv_obj_get_child(btn, 0);
+  if (label) lv_label_set_text(label, text);
+}
+
+// A tick value with as many decimals as the axis needs: five ticks across a
+// span of one unit printed as whole numbers read "1003 1003 1004 1004 1004".
+static void condFormatTick(float value, float span, char *out, size_t outSize)
+{
+  const int decimals = span >= 20.0f ? 0 : (span >= 2.0f ? 1 : 2);
+  const float unit = decimals == 0 ? 1.0f : (decimals == 1 ? 0.1f : 0.01f);
+
+  // "-0" is what %.0f makes of -0.4.
+  if (fabsf(value) < 0.5f * unit) value = 0.0f;
+
+  snprintf(out, outSize, "%.*f", decimals, value);
+}
+
+// Everything on the screen that depends on which preset is chosen, which
+// points exist, and what the sensor says right now. The table and the graph
+// are rebuilt only when a point changes; the live number every second.
+void refreshConditionScreen()
+{
+  if (conditionChart == NULL) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+  const CondVariable *manualVar = condManualVariable(P);
+  const CondVariable *sensorVar = condSensorVariable(P);
+
+  // ---- which experiment -----------------------------------------------------
+  for (int i = 0; i < COND_PRESET_COUNT; i++)
   {
-    char text[32];
-    snprintf(text, sizeof(text), "%.1f mL", boyleVolumeSetting);
-    lv_label_set_text(labelBoyleVolume, text);
+    if (conditionPresetBtn[i] == NULL) continue;
+
+    const bool selected = i == pi;
+    lv_obj_set_style_bg_color(conditionPresetBtn[i],
+                              lv_color_hex(selected ? UI_ACCENT : UI_ACCENT_TINT), 0);
+
+    lv_obj_t *label = lv_obj_get_child(conditionPresetBtn[i], 0);
+    if (label) lv_obj_set_style_text_color(label, lv_color_hex(selected ? UI_SURFACE : UI_ACCENT), 0);
   }
 
-  if (labelBoyleNow)
+  if (labelConditionHint) lv_label_set_text(labelConditionHint, P->hint);
+
+  // ---- the hand-set variable ------------------------------------------------
+  if (manualVar)
   {
-    float pressure = NAN;
     char text[64];
 
-    if (currentPressureHpa(&pressure)) snprintf(text, sizeof(text), "%.1f hPa", pressure);
-    else snprintf(text, sizeof(text), "---- hPa");
+    if (labelConditionManualCaption)
+    {
+      snprintf(text, sizeof(text), "%s (직접 설정)", manualVar->name);
+      lv_label_set_text(labelConditionManualCaption, text);
+    }
 
-    lv_label_set_text(labelBoyleNow, text);
+    if (labelConditionManual)
+    {
+      condFormatValue(manualVar, condManual[pi], text, sizeof(text));
+      lv_label_set_text(labelConditionManual, text);
+    }
+
+    const float steps[4] = { -manualVar->stepLarge, -manualVar->stepSmall,
+                             manualVar->stepSmall, manualVar->stepLarge };
+
+    for (int i = 0; i < 4; i++)
+    {
+      if (conditionStepBtn[i] == NULL) continue;
+      snprintf(text, sizeof(text), "%+g", steps[i]);
+      condRestyleButtonLabel(conditionStepBtn[i], text);
+    }
+  }
+
+  // ---- the live reading -----------------------------------------------------
+  if (sensorVar)
+  {
+    char text[96];
+    float value = NAN;
+    char node[32] = "";
+    char name[24] = "";
+    char unit[24] = "";
+    const bool have = condReadVariable(sensorVar, &value, node, sizeof(node), name, unit, sizeof(name));
+
+    if (labelConditionSensorCaption)
+    {
+      // The node's own quantity name goes on the line below with the node;
+      // this caption is 86 px and "현재 이산화탄소" is not.
+      snprintf(text, sizeof(text), "현재 %s",
+               sensorVar->source == COND_SRC_SENSOR_ANY ? "값" : sensorVar->name);
+      lv_label_set_text(labelConditionSensorCaption, text);
+    }
+
+    if (labelConditionSensorNow)
+    {
+      if (have)
+      {
+        const char *shownUnit = sensorVar->source == COND_SRC_SENSOR_ANY
+                                  ? bleDisplayUnit(condAnyUnit[0] ? condAnyUnit : unit)
+                                  : sensorVar->unit;
+        if (shownUnit[0]) snprintf(text, sizeof(text), "%.*f %s", condDecimals(sensorVar), value, shownUnit);
+        else snprintf(text, sizeof(text), "%.*f", condDecimals(sensorVar), value);
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "---- %s", sensorVar->unit);
+      }
+
+      lv_label_set_text(labelConditionSensorNow, text);
+    }
+
+    if (labelConditionSensorNode)
+    {
+      if (have) snprintf(condSourceNode, sizeof(condSourceNode), "%s", node);
+
+      if (have && sensorVar->source == COND_SRC_SENSOR_ANY)
+      {
+        snprintf(text, sizeof(text), "← %s · %s", node, condAnyName[0] ? condAnyName : name);
+      }
+      else if (have) snprintf(text, sizeof(text), "← %s", node);
+      else snprintf(text, sizeof(text), "센서 없음 · 블루투스 탭에서 연결하세요");
+      lv_label_set_text(labelConditionSensorNode, text);
+    }
+  }
+
+  if (conditionRecordBtn) condRestyleButtonLabel(conditionRecordBtn, P->recordText);
+
+  if (!condDirty) return;
+  condDirty = false;
+
+  // ---- titles that name the two variables -----------------------------------
+  {
+    char text[96];
+    const char *xu = condDisplayUnit(&P->x);
+    const char *yu = condDisplayUnit(&P->y);
+
+    if (labelConditionChartTitle)
+    {
+      snprintf(text, sizeof(text), "%s%s%s%s - %s%s%s%s",
+               condDisplayName(&P->x), xu[0] ? "(" : "", xu, xu[0] ? ")" : "",
+               condDisplayName(&P->y), yu[0] ? "(" : "", yu, yu[0] ? ")" : "");
+      lv_label_set_text(labelConditionChartTitle, text);
+    }
   }
 
   // ---- the table ------------------------------------------------------------
-  if (tableBoyle)
+  if (tableCondition)
   {
-    // Every point, in the order it was taken, and the table scrolls to reach
-    // them. It used to show the eight most recent with scrolling turned off,
-    // which put the earlier half of an experiment out of reach.
-    lv_table_set_row_cnt(tableBoyle, (uint16_t)(boylePointCount + 1));
+    char cell[32];
 
-    lv_table_set_cell_value(tableBoyle, 0, 0, "No");
-    lv_table_set_cell_value(tableBoyle, 0, 1, "부피(mL)");
-    lv_table_set_cell_value(tableBoyle, 0, 2, "압력(hPa)");
-    lv_table_set_cell_value(tableBoyle, 0, 3, "P×V");
+    lv_table_set_row_cnt(tableCondition, (uint16_t)(n + 1));
+    lv_table_set_cell_value(tableCondition, 0, 0, "No");
 
-    for (int i = 0; i < boylePointCount; i++)
+    const char *xu = condDisplayUnit(&P->x);
+    const char *yu = condDisplayUnit(&P->y);
+
+    if (xu[0]) snprintf(cell, sizeof(cell), "%s(%s)", condDisplayName(&P->x), xu);
+    else snprintf(cell, sizeof(cell), "%s", condDisplayName(&P->x));
+    lv_table_set_cell_value(tableCondition, 0, 1, cell);
+
+    if (yu[0]) snprintf(cell, sizeof(cell), "%s(%s)", condDisplayName(&P->y), yu);
+    else snprintf(cell, sizeof(cell), "%s", condDisplayName(&P->y));
+    lv_table_set_cell_value(tableCondition, 0, 2, cell);
+
+    lv_table_set_cell_value(tableCondition, 0, 3, P->derivedName ? P->derivedName : "-");
+
+    for (int i = 0; i < n; i++)
     {
-      char cell[24];
       const int r = i + 1;
 
       snprintf(cell, sizeof(cell), "%d", r);
-      lv_table_set_cell_value(tableBoyle, r, 0, cell);
-      snprintf(cell, sizeof(cell), "%.1f", boyleVolumeMl[i]);
-      lv_table_set_cell_value(tableBoyle, r, 1, cell);
-      snprintf(cell, sizeof(cell), "%.1f", boylePressureHpa[i]);
-      lv_table_set_cell_value(tableBoyle, r, 2, cell);
-      snprintf(cell, sizeof(cell), "%.0f", boyleVolumeMl[i] * boylePressureHpa[i]);
-      lv_table_set_cell_value(tableBoyle, r, 3, cell);
+      lv_table_set_cell_value(tableCondition, r, 0, cell);
+      snprintf(cell, sizeof(cell), "%.*f", condDecimals(&P->x), condX[pi][i]);
+      lv_table_set_cell_value(tableCondition, r, 1, cell);
+      snprintf(cell, sizeof(cell), "%.*f", condDecimals(&P->y), condY[pi][i]);
+      lv_table_set_cell_value(tableCondition, r, 2, cell);
+
+      const float d = condDerivedValue(P, condX[pi][i], condY[pi][i]);
+      if (isnan(d)) snprintf(cell, sizeof(cell), "-");
+      else if (P->derived == COND_DERIVED_PRODUCT) snprintf(cell, sizeof(cell), "%.0f", d);
+      else snprintf(cell, sizeof(cell), "%.3f", d);
+      lv_table_set_cell_value(tableCondition, r, 3, cell);
     }
   }
 
   // ---- the graph ------------------------------------------------------------
-  lv_chart_set_all_value(boyleChart, boyleSeries, LV_CHART_POINT_NONE);
-  lv_chart_set_all_value(boyleChart, boyleCurve, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(conditionChart, conditionSeries, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(conditionChart, conditionCurve, LV_CHART_POINT_NONE);
 
-  for (int i = 0; i < BOYLE_MAX_POINTS; i++)
+  for (int i = 0; i < COND_MAX_POINTS; i++)
   {
-    if (labelBoylePointText[i]) lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
+    if (labelConditionPointText[i]) lv_obj_add_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
   }
 
-  if (boylePointCount == 0)
+  if (n == 0)
   {
-    for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+    for (int i = 0; i < COND_AXIS_TICKS; i++)
     {
-      if (labelBoyleXTicks[i]) lv_label_set_text(labelBoyleXTicks[i], "");
-      if (labelBoyleYTicks[i]) lv_label_set_text(labelBoyleYTicks[i], "");
+      if (labelConditionXTicks[i]) lv_label_set_text(labelConditionXTicks[i], "");
+      if (labelConditionYTicks[i]) lv_label_set_text(labelConditionYTicks[i], "");
     }
 
-    if (labelBoyleConstant) lv_label_set_text(labelBoyleConstant, "");
-    lv_chart_refresh(boyleChart);
+    if (labelConditionSummary) lv_label_set_text(labelConditionSummary, "");
+    lv_chart_refresh(conditionChart);
     return;
   }
 
-  float vMax = boyleVolumeMl[0];
-  float pMax = boylePressureHpa[0];
-  float sumPV = 0.0f;
+  // Neither axis has to start at zero. A hyperbola reads as one against its
+  // asymptotes, but nothing here is measured below 20 mL or much below
+  // atmospheric pressure, and a panel spent on ground the experiment never
+  // visits costs more resolution than the shape is worth.
+  const CondAxis xa = condAxisRange(P->xAxisMin, P->xAxisMax, P->xAxisStep, condX[pi], n, false);
+  const CondAxis ya = condAxisRange(P->yAxisMin, P->yAxisMax, P->yAxisStep, condY[pi], n, true);
 
-  for (int i = 0; i < boylePointCount; i++)
+  lv_chart_set_range(conditionChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
+  lv_chart_set_range(conditionChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
+
+  CondFit fit;
+  condComputeFit(P, pi, &fit);
+
+  // The fitted curve, sampled densely enough to read as one; samples that
+  // leave the panel carry no information and are skipped.
+  if (fit.valid)
   {
-    if (boyleVolumeMl[i] > vMax) vMax = boyleVolumeMl[i];
-    if (boylePressureHpa[i] > pMax) pMax = boylePressureHpa[i];
-    sumPV += boyleVolumeMl[i] * boylePressureHpa[i];
-  }
+    for (int i = 0; i < COND_CURVE_POINTS; i++)
+    {
+      const float x = xa.lo + xa.span * ((float)i / (float)(COND_CURVE_POINTS - 1));
+      float y = NAN;
 
-  // Both axes start at zero. Fitting them to the data instead would fill the
-  // panel, but a hyperbola only looks like one against its asymptotes: cropped
-  // to the measured range it flattens into a slightly sloped line, which is
-  // exactly what made the shape hard to see.
-  float vBottom = BOYLE_VOLUME_MIN;
-  float vTop = BOYLE_VOLUME_MAX;
+      if (P->fit == COND_FIT_INVERSE)
+      {
+        if (fabsf(x) < 1e-6f) continue;
+        y = fit.k / x;
+      }
+      else if (P->fit == COND_FIT_LINEAR)
+      {
+        y = fit.a + fit.b * x;
+      }
 
-  // A point taken outside the usual range widens the axis rather than falling
-  // off the edge of it.
-  for (int i = 0; i < boylePointCount; i++)
-  {
-    if (boyleVolumeMl[i] < vBottom) vBottom = floorf(boyleVolumeMl[i] / 5.0f) * 5.0f;
-    if (boyleVolumeMl[i] > vTop) vTop = ceilf(boyleVolumeMl[i] / 5.0f) * 5.0f;
-  }
+      if (isnan(y) || y > ya.hi || y < ya.lo) continue;
 
-  const float vSpan = vTop - vBottom;
-
-  float pBottom = BOYLE_PRESSURE_MIN;
-  const float pTop = pMax * 1.10f;
-
-  // A reading below the usual floor drops the axis rather than falling off it.
-  for (int i = 0; i < boylePointCount; i++)
-  {
-    if (boylePressureHpa[i] < pBottom) pBottom = floorf(boylePressureHpa[i] / 50.0f) * 50.0f;
-  }
-
-  const float pSpan = (pTop - pBottom) > 1.0f ? (pTop - pBottom) : 1.0f;
-
-  lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
-  lv_chart_set_range(boyleChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
-
-  const float k = sumPV / (float)boylePointCount;
-
-  // P = k/V through the points, sampled densely enough to read as a curve.
-  // Below vTop/40 the curve runs off the top of the panel and carries no
-  // information anyway.
-  for (int i = 0; i < BOYLE_CURVE_POINTS; i++)
-  {
-    const float v = vBottom + vSpan * ((float)i / (float)(BOYLE_CURVE_POINTS - 1));
-    const float pressure = k / v;
-
-    if (pressure > pTop || pressure < pBottom) continue;
-
-    lv_chart_set_value_by_id2(
-      boyleChart, boyleCurve, i,
-      (int)lroundf((v - vBottom) / vSpan * 1000.0f),
-      (int)lroundf((pressure - pBottom) / pSpan * 1000.0f)
-    );
+      lv_chart_set_value_by_id2(
+        conditionChart, conditionCurve, i,
+        (int)lroundf((x - xa.lo) / xa.span * 1000.0f),
+        (int)lroundf((y - ya.lo) / ya.span * 1000.0f)
+      );
+    }
   }
 
   // ---- the measured points, each carrying its own numbers -------------------
-  const lv_coord_t chartW = lv_obj_get_width(boyleChart);
-  const lv_coord_t chartH = lv_obj_get_height(boyleChart);
-  const lv_coord_t chartX = lv_obj_get_x(boyleChart);
-  const lv_coord_t chartY = lv_obj_get_y(boyleChart);
+  const lv_coord_t chartW = lv_obj_get_width(conditionChart);
+  const lv_coord_t chartH = lv_obj_get_height(conditionChart);
+  const lv_coord_t chartX = lv_obj_get_x(conditionChart);
+  const lv_coord_t chartY = lv_obj_get_y(conditionChart);
 
-  lv_coord_t placedX[BOYLE_MAX_POINTS];
-  lv_coord_t placedY[BOYLE_MAX_POINTS];
+  lv_coord_t placedX[COND_MAX_POINTS];
+  lv_coord_t placedY[COND_MAX_POINTS];
   int placed = 0;
 
-  for (int i = 0; i < boylePointCount; i++)
+  for (int i = 0; i < n; i++)
   {
-    const float fx = (boyleVolumeMl[i] - vBottom) / vSpan;
-    const float fy = (boylePressureHpa[i] - pBottom) / pSpan;
+    const float fx = (condX[pi][i] - xa.lo) / xa.span;
+    const float fy = (condY[pi][i] - ya.lo) / ya.span;
 
-    lv_chart_set_value_by_id2(boyleChart, boyleSeries, i,
+    lv_chart_set_value_by_id2(conditionChart, conditionSeries, i,
                               (int)lroundf(fx * 1000.0f),
                               (int)lroundf(fy * 1000.0f));
 
-    if (labelBoylePointText[i] == NULL) continue;
+    if (labelConditionPointText[i] == NULL) continue;
 
     // Sat just above and left of the point, nudged back inside near an edge.
     lv_coord_t lx = chartX + (lv_coord_t)(fx * chartW) - 26;
@@ -9649,7 +10496,6 @@ void refreshBoyleScreen()
 
     // Points bunch up where the curve is flat, and labels printed on top of
     // each other are worse than no labels: the table has every number anyway.
-    // So a label is only drawn where there is room for it.
     bool room = true;
 
     for (int j = 0; j < placed; j++)
@@ -9663,169 +10509,242 @@ void refreshBoyleScreen()
 
     if (!room) continue;
 
-    char text[24];
-    snprintf(text, sizeof(text), "%.0f / %.0f", boyleVolumeMl[i], boylePressureHpa[i]);
-    lv_label_set_text(labelBoylePointText[i], text);
-    lv_obj_clear_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_pos(labelBoylePointText[i], lx, ly);
+    char text[32];
+    snprintf(text, sizeof(text), "%.*f / %.*f",
+             condDecimals(&P->x) > 1 ? 1 : condDecimals(&P->x), condX[pi][i],
+             condDecimals(&P->y) > 1 ? 1 : condDecimals(&P->y), condY[pi][i]);
+    lv_label_set_text(labelConditionPointText[i], text);
+    lv_obj_clear_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(labelConditionPointText[i], lx, ly);
 
     placedX[placed] = lx;
     placedY[placed] = ly;
     placed++;
   }
 
-  lv_chart_refresh(boyleChart);
+  // LVGL's scatter renderer draws a point's marker as the end of a pair of
+  // real points, or as the series' very last id. With the ids after the
+  // newest point empty, that point - every run's first point among them -
+  // had no marker. Repeating it at the last id gives it one, and the line
+  // between the two is zero length.
+  if (n > 0)
+  {
+    lv_chart_set_value_by_id2(conditionChart, conditionSeries, COND_CURVE_POINTS - 1,
+                              (int)lroundf((condX[pi][n - 1] - xa.lo) / xa.span * 1000.0f),
+                              (int)lroundf((condY[pi][n - 1] - ya.lo) / ya.span * 1000.0f));
+  }
+
+  lv_chart_refresh(conditionChart);
 
   // ---- what the axes mean ---------------------------------------------------
-  for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+  for (int i = 0; i < COND_AXIS_TICKS; i++)
   {
     char text[16];
 
-    if (labelBoyleXTicks[i])
+    if (labelConditionXTicks[i])
     {
-      snprintf(text, sizeof(text), "%.0f",
-               vBottom + vSpan * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
-      lv_label_set_text(labelBoyleXTicks[i], text);
+      condFormatTick(xa.lo + xa.span * (float)(i + 1) / (float)COND_AXIS_TICKS, xa.span, text, sizeof(text));
+      lv_label_set_text(labelConditionXTicks[i], text);
     }
 
-    if (labelBoyleYTicks[i])
+    if (labelConditionYTicks[i])
     {
-      snprintf(text, sizeof(text), "%.0f",
-               pBottom + pSpan * (float)(i + 1) / (float)BOYLE_AXIS_TICKS);
-      lv_label_set_text(labelBoyleYTicks[i], text);
+      condFormatTick(ya.lo + ya.span * (float)(i + 1) / (float)COND_AXIS_TICKS, ya.span, text, sizeof(text));
+      lv_label_set_text(labelConditionYTicks[i], text);
     }
   }
 
-  // The summary lives on its own line. It used to be written to the hint,
-  // once a second, over the top of whatever 전송 or 저장 had just reported -
-  // so a message about WiFi or a 모둠코드 was gone before it could be read,
-  // and the button looked like it had done nothing at all.
-  if (labelBoyleConstant)
+  // ---- the result, in the lesson's own letters ------------------------------
+  if (labelConditionSummary)
   {
-    char text[110];
-    snprintf(text, sizeof(text), "점 %d개 · 부피 %.0f~%.0f mL · P×V 평균 %.0f · 곡선 P = %.0f / V",
-             boylePointCount, vBottom, vTop, k, k);
-    lv_label_set_text(labelBoyleConstant, text);
+    char text[200];
+    const char *xn = condDisplayName(&P->x);
+    const char *yn = condDisplayName(&P->y);
+
+    if (P->fit == COND_FIT_INVERSE && fit.valid)
+    {
+      snprintf(text, sizeof(text), "점 %d개 · %s 평균 %.0f · 곡선: %s = %.0f / %s",
+               n, P->derivedName ? P->derivedName : "x·y", fit.derivedMean, yn, fit.k, xn);
+    }
+    else if (P->fit == COND_FIT_LINEAR && fit.valid)
+    {
+      // The intercept on the x axis is the payoff of a 샤를 lesson: where the
+      // volume would reach zero is an estimate of absolute zero.
+      if (P->derivedOffsetX > 0.0f && fabsf(fit.b) > 1e-9f)
+      {
+        // The per-row ratio is in the table; the line keeps to the fit and
+        // its intercept so it fits the card. ("약" because no face here has ≈.)
+        snprintf(text, sizeof(text), "점 %d개 · %s = %.2f + %.3f×%s · %s=0 일 때 %s 약 %.0f %s",
+                 n, yn, fit.a, fit.b, xn, yn, xn, -fit.a / fit.b, condDisplayUnit(&P->x));
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "점 %d개 · %s = %.2f + %.3f×%s", n, yn, fit.a, fit.b, xn);
+      }
+    }
+    else if (P->fit != COND_FIT_NONE)
+    {
+      snprintf(text, sizeof(text), "점 %d개 · 곡선을 그리려면 서로 다른 조건의 점이 2개 이상 필요합니다", n);
+    }
+    else
+    {
+      snprintf(text, sizeof(text), "점 %d개 · %s %.1f~%.1f", n, xn, xa.lo, xa.hi);
+    }
+
+    lv_label_set_text(labelConditionSummary, text);
   }
 }
 
-void createBoyleUi()
+void createConditionUi()
 {
-  boyleScreen = lv_obj_create(NULL);
-  lv_obj_set_size(boyleScreen, LCD_H_RES, LCD_V_RES);
-  lv_obj_set_style_text_font(boyleScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(boyleScreen, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(boyleScreen, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(boyleScreen, LV_OBJ_FLAG_SCROLLABLE);
+  conditionScreen = lv_obj_create(NULL);
+  lv_obj_set_size(conditionScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(conditionScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(conditionScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(conditionScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(conditionScreen, LV_OBJ_FLAG_SCROLLABLE);
 
-  createStatusBar(boyleScreen, "", &labelBarBoyleTime, &labelBarBoyleWifi, &labelBarBoyleSd);
+  createStatusBar(conditionScreen, "", &labelBarConditionTime, &labelBarConditionWifi, &labelBarConditionSd);
 
-  makeHeading(boyleScreen, "보일의 법칙", 28, 58, UI_TEXT);
-  makeQuietButton(boyleScreen, "측정 화면", 496, 60, 164, 44, go_measure_event_cb);
+  for (int i = 0; i < COND_PRESET_COUNT; i++)
+  {
+    condPointCount[i] = 0;
+    const CondVariable *manualVar = condManualVariable(&kCondPresets[i]);
+    condManual[i] = manualVar ? manualVar->defaultValue : 0.0f;
+  }
 
-  // ---- setting the volume ---------------------------------------------------
-  lv_obj_t *setup = makePanel(boyleScreen, 28, 104, 300, 190);
+  makeHeading(conditionScreen, "조건 측정", 28, 58, UI_TEXT);
 
-  makeSmallLabel(setup, "부피를 맞추고, 값이 안정되면 기록하세요", 20, 14, UI_TEXT_3);
+  // ---- which experiment -----------------------------------------------------
+  const int presetX[3] = { 152, 304, 456 };
+  const int presetW[3] = { 140, 140, 120 };
 
-  labelBoyleVolume = makeHeading(setup, "20.0 mL", 20, 40, UI_TEXT);
+  for (int i = 0; i < COND_PRESET_COUNT && i < 3; i++)
+  {
+    conditionPresetBtn[i] = makeQuietButton(conditionScreen, kCondPresets[i].title,
+                                            presetX[i], 60, presetW[i], 44, condition_preset_event_cb);
+    lv_obj_set_user_data(conditionPresetBtn[i], (void *)(intptr_t)i);
+  }
 
-  struct VolumeStep { const char *text; int step; int x; };
-  const VolumeStep steps[4] = {
-    { "-5", -50, 18 }, { "-1", -10, 84 }, { "+1", 10, 150 }, { "+5", 50, 216 }
-  };
+  makeQuietButton(conditionScreen, "CSV 저장", 692, 60, 136, 44, condition_save_event_cb);
+  makePrimaryButton(conditionScreen, "전송", 844, 60, 152, 44, UI_ACCENT, condition_send_event_cb);
+
+  // ---- setting the condition ------------------------------------------------
+  lv_obj_t *setup = makePanel(conditionScreen, 28, 104, 300, 190);
+
+  labelConditionHint = makeSmallLabel(setup, "", 20, 12, UI_TEXT_3);
+  lv_obj_set_width(labelConditionHint, 262);
+  lv_label_set_long_mode(labelConditionHint, LV_LABEL_LONG_DOT);
+
+  labelConditionManualCaption = makeSmallLabel(setup, "", 20, 36, UI_TEXT_3);
+  lv_obj_set_width(labelConditionManualCaption, 262);
+  lv_label_set_long_mode(labelConditionManualCaption, LV_LABEL_LONG_DOT);
+
+  // Only ever digits and an ASCII unit, so the heading face is safe.
+  labelConditionManual = makeHeading(setup, "", 20, 54, UI_TEXT);
+
+  const int stepX[4] = { 18, 84, 150, 216 };
 
   for (int i = 0; i < 4; i++)
   {
-    lv_obj_t *b = makeQuietButton(setup, steps[i].text, steps[i].x, 84, 62, 46,
-                                  boyle_volume_event_cb);
-    lv_obj_set_user_data(b, (void *)(intptr_t)steps[i].step);
+    conditionStepBtn[i] = makeQuietButton(setup, "", stepX[i], 94, 62, 44, condition_step_event_cb);
+    lv_obj_set_user_data(conditionStepBtn[i], (void *)(intptr_t)i);
   }
 
-  makeSmallLabel(setup, "현재 압력", 20, 146, UI_TEXT_3);
-  labelBoyleNow = makeLabel(setup, "---- hPa", 110, 142, UI_ACCENT);
+  labelConditionSensorCaption = makeSmallLabel(setup, "", 20, 150, UI_TEXT_3);
+  lv_obj_set_width(labelConditionSensorCaption, 86);
+  lv_label_set_long_mode(labelConditionSensorCaption, LV_LABEL_LONG_DOT);
+
+  labelConditionSensorNow = makeLabel(setup, "", 110, 146, UI_ACCENT);
+  lv_obj_set_width(labelConditionSensorNow, 170);
+  lv_label_set_long_mode(labelConditionSensorNow, LV_LABEL_LONG_CLIP);
+
+  // Which node the number comes from: with two temperature sensors in the
+  // room, this is how a student knows which one the graph is listening to.
+  labelConditionSensorNode = makeSmallLabel(setup, "", 20, 168, UI_TEXT_4);
+  lv_obj_set_width(labelConditionSensorNode, 262);
+  lv_label_set_long_mode(labelConditionSensorNode, LV_LABEL_LONG_DOT);
 
   // ---- the points -----------------------------------------------------------
-  makePrimaryButton(boyleScreen, "이 부피로 기록", 28, 306, 300, 56, UI_ACCENT,
-                    boyle_record_event_cb);
-  makeQuietButton(boyleScreen, "되돌리기", 28, 370, 145, 44, boyle_undo_event_cb);
-  makeQuietButton(boyleScreen, "지우기", 183, 370, 145, 44, boyle_clear_event_cb);
+  conditionRecordBtn = makePrimaryButton(conditionScreen, "이 조건으로 기록", 28, 306, 300, 56, UI_ACCENT,
+                                         condition_record_event_cb);
+  makeQuietButton(conditionScreen, "되돌리기", 28, 370, 145, 44, condition_undo_event_cb);
+  makeQuietButton(conditionScreen, "지우기", 183, 370, 145, 44, condition_clear_event_cb);
 
-  tableBoyle = lv_table_create(boyleScreen);
-  lv_obj_set_size(tableBoyle, 300, 118);
-  lv_obj_align(tableBoyle, LV_ALIGN_TOP_LEFT, 28, 424);
-  lv_obj_set_style_text_font(tableBoyle, FONT_KR_SMALL, 0);
-  lv_obj_set_style_border_width(tableBoyle, 0, 0);
-  lv_obj_set_style_bg_color(tableBoyle, lv_color_hex(UI_SURFACE), 0);
-  lv_table_set_col_cnt(tableBoyle, 4);
-  lv_table_set_row_cnt(tableBoyle, 1);
-  lv_table_set_col_width(tableBoyle, 0, 42);
-  lv_table_set_col_width(tableBoyle, 1, 78);
-  lv_table_set_col_width(tableBoyle, 2, 90);
-  lv_table_set_col_width(tableBoyle, 3, 88);
-  lv_obj_set_scrollbar_mode(tableBoyle, LV_SCROLLBAR_MODE_AUTO);
+  tableCondition = lv_table_create(conditionScreen);
+  lv_obj_set_size(tableCondition, 300, 90);
+  lv_obj_align(tableCondition, LV_ALIGN_TOP_LEFT, 28, 422);
+  lv_obj_set_style_text_font(tableCondition, FONT_KR_SMALL, 0);
+  lv_obj_set_style_border_width(tableCondition, 0, 0);
+  lv_obj_set_style_bg_color(tableCondition, lv_color_hex(UI_SURFACE), 0);
+  lv_table_set_col_cnt(tableCondition, 4);
+  lv_table_set_row_cnt(tableCondition, 1);
+  lv_table_set_col_width(tableCondition, 0, 42);
+  lv_table_set_col_width(tableCondition, 1, 78);
+  lv_table_set_col_width(tableCondition, 2, 90);
+  lv_table_set_col_width(tableCondition, 3, 88);
+  lv_obj_set_scrollbar_mode(tableCondition, LV_SCROLLBAR_MODE_AUTO);
 
-  // ---- pressure against volume ----------------------------------------------
-  lv_obj_t *chartCard = makePanel(boyleScreen, BOYLE_CARD_X, BOYLE_CARD_Y,
-                                  BOYLE_CARD_W, BOYLE_CARD_H);
+  // ---- one quantity against the other ----------------------------------------
+  lv_obj_t *chartCard = makePanel(conditionScreen, COND_CARD_X, COND_CARD_Y, COND_CARD_W, COND_CARD_H);
 
-  // Both units live in the heading. As separate axis captions the volume one
-  // sat on top of the last tick value - "부피 (mL)" and "60" in the same place.
-  makeSmallLabel(chartCard, "부피(mL) - 압력(hPa)", 18, 12, UI_TEXT_3);
+  // Both units live in the heading. As separate axis captions the x one sat
+  // on top of the last tick value.
+  labelConditionChartTitle = makeSmallLabel(chartCard, "", 18, 12, UI_TEXT_3);
+  lv_obj_set_width(labelConditionChartTitle, 400);
+  lv_label_set_long_mode(labelConditionChartTitle, LV_LABEL_LONG_DOT);
 
-  boyleChart = lv_chart_create(chartCard);
-  lv_obj_set_size(boyleChart, BOYLE_CHART_W, BOYLE_CHART_H);
-  lv_obj_align(boyleChart, LV_ALIGN_TOP_LEFT, BOYLE_CHART_X, BOYLE_CHART_Y);
-  lv_obj_set_style_bg_color(boyleChart, lv_color_hex(UI_SURFACE), 0);
-  lv_obj_set_style_border_width(boyleChart, 0, 0);
-  lv_obj_set_style_line_color(boyleChart, lv_color_hex(UI_LINE), LV_PART_MAIN);
-  lv_obj_set_style_size(boyleChart, 6, LV_PART_INDICATOR);
+  conditionChart = lv_chart_create(chartCard);
+  lv_obj_set_size(conditionChart, COND_CHART_W, COND_CHART_H);
+  lv_obj_align(conditionChart, LV_ALIGN_TOP_LEFT, COND_CHART_X, COND_CHART_Y);
+  lv_obj_set_style_bg_color(conditionChart, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_border_width(conditionChart, 0, 0);
+  lv_obj_set_style_line_color(conditionChart, lv_color_hex(UI_LINE), LV_PART_MAIN);
+  lv_obj_set_style_size(conditionChart, 6, LV_PART_INDICATOR);
 
-  // Scatter, because the volume is chosen rather than swept: the points do not
-  // arrive evenly spaced and must not be drawn as though they did.
-  lv_chart_set_type(boyleChart, LV_CHART_TYPE_SCATTER);
-  lv_chart_set_point_count(boyleChart, BOYLE_CURVE_POINTS);
-  lv_chart_set_div_line_count(boyleChart, 6, 6);
+  // Scatter, because the condition is chosen rather than swept: the points do
+  // not arrive evenly spaced and must not be drawn as though they did.
+  lv_chart_set_type(conditionChart, LV_CHART_TYPE_SCATTER);
+  lv_chart_set_point_count(conditionChart, COND_CURVE_POINTS);
+  lv_chart_set_div_line_count(conditionChart, 6, 6);
 
   // The fitted curve goes on first so the measured points sit over it.
-  boyleCurve = lv_chart_add_series(boyleChart, lv_color_hex(UI_TEXT_4), LV_CHART_AXIS_PRIMARY_Y);
-  boyleSeries = lv_chart_add_series(boyleChart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+  conditionCurve = lv_chart_add_series(conditionChart, lv_color_hex(UI_TEXT_4), LV_CHART_AXIS_PRIMARY_Y);
+  conditionSeries = lv_chart_add_series(conditionChart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
 
-  // Axis values, drawn as plain labels the way the measurement screen does.
-  for (int i = 0; i < BOYLE_AXIS_TICKS; i++)
+  for (int i = 0; i < COND_AXIS_TICKS; i++)
   {
-    const int x = BOYLE_CHART_X + (i + 1) * BOYLE_CHART_W / BOYLE_AXIS_TICKS;
-    labelBoyleXTicks[i] = makeSmallLabel(chartCard, "", x - 14, BOYLE_CHART_Y + BOYLE_CHART_H + 8,
-                                         UI_TEXT_3);
+    const int x = COND_CHART_X + (i + 1) * COND_CHART_W / COND_AXIS_TICKS;
+    labelConditionXTicks[i] = makeSmallLabel(chartCard, "", x - 14, COND_CHART_Y + COND_CHART_H + 8, UI_TEXT_3);
 
-    const int y = BOYLE_CHART_Y + BOYLE_CHART_H - (i + 1) * BOYLE_CHART_H / BOYLE_AXIS_TICKS;
-    labelBoyleYTicks[i] = makeSmallLabel(chartCard, "", 0, y - 8, UI_TEXT_3);
-    lv_obj_set_width(labelBoyleYTicks[i], BOYLE_CHART_X - 8);
-    lv_obj_set_style_text_align(labelBoyleYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
+    const int y = COND_CHART_Y + COND_CHART_H - (i + 1) * COND_CHART_H / COND_AXIS_TICKS;
+    labelConditionYTicks[i] = makeSmallLabel(chartCard, "", 0, y - 8, UI_TEXT_3);
+    lv_obj_set_width(labelConditionYTicks[i], COND_CHART_X - 8);
+    lv_obj_set_style_text_align(labelConditionYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
   }
 
-
-
-  for (int i = 0; i < BOYLE_MAX_POINTS; i++)
+  for (int i = 0; i < COND_MAX_POINTS; i++)
   {
-    labelBoylePointText[i] = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_2);
-    lv_obj_add_flag(labelBoylePointText[i], LV_OBJ_FLAG_HIDDEN);
+    labelConditionPointText[i] = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_2);
+    lv_obj_add_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
   }
 
-  labelBoyleConstant = makeSmallLabel(boyleScreen, "", BOYLE_CARD_X, 540, UI_TEXT_2);
-  lv_obj_set_width(labelBoyleConstant, BOYLE_CARD_W);
-  lv_label_set_long_mode(labelBoyleConstant, LV_LABEL_LONG_CLIP);
+  // The result lives inside the card, on its own line, so a message from
+  // 전송 or 저장 below is never written over.
+  labelConditionSummary = makeSmallLabel(chartCard, "", 18, COND_CHART_Y + COND_CHART_H + 32, UI_TEXT_2);
+  lv_obj_set_width(labelConditionSummary, COND_CARD_W - 36);
+  lv_label_set_long_mode(labelConditionSummary, LV_LABEL_LONG_DOT);
 
-  labelBoyleHint = makeSmallLabel(boyleScreen, "부피를 정하고 [이 부피로 기록]을 누르세요.",
-                                  28, 540, UI_TEXT_3);
-  lv_obj_set_width(labelBoyleHint, 300);
-  lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_DOT);
-  lv_label_set_long_mode(labelBoyleHint, LV_LABEL_LONG_WRAP);
+  labelConditionNote = makeSmallLabel(conditionScreen, "조건을 정하고 기록 버튼을 누르세요.", 28, 518, UI_TEXT_3);
+  lv_obj_set_width(labelConditionNote, 968);
+  lv_label_set_long_mode(labelConditionNote, LV_LABEL_LONG_DOT);
 
-  makeQuietButton(boyleScreen, "CSV 저장", 672, 60, 148, 44, boyle_save_event_cb);
-  makePrimaryButton(boyleScreen, "전송", 838, 60, 158, 44, UI_ACCENT, boyle_send_event_cb);
+  // No tab is "this screen", so every tab stays tappable - the old Boyle
+  // screen lit 측정 and thereby made that tab dead.
+  createTabBar(conditionScreen, -1);
 
-  createTabBar(boyleScreen, TAB_MEASURE);
+  condDirty = true;
+  refreshConditionScreen();
 }
 
 void createSettingsUi()
@@ -13839,7 +14758,7 @@ void setup()
   createSettingsUi();
   createBleUi();
   createDeviceUi();
-  createBoyleUi();
+  createConditionUi();
   createCsvUi();
   createFileViewerUi();
   createIslUi();
@@ -13895,7 +14814,10 @@ void setup()
   }
   else
   {
-    lv_label_set_text(labelStatus, "센서 초기화 실패");
+    // With a node as the default sensor this is every cold boot until one
+    // links, and "실패" is not what that is.
+    lv_label_set_text(labelStatus, activeSensorMode == SENSOR_MODE_BLE ? "노드 연결 대기"
+                                                                        : "센서 초기화 실패");
   }
 
   applyRestoredMeasurementToUi();
@@ -14034,24 +14956,32 @@ void loop()
     // sensor gets changed.
     bleLinkServiceExploration();
 
-    if (currentLoadedScreen == boyleScreen) refreshBoyleScreen();
+    if (currentLoadedScreen == conditionScreen) refreshConditionScreen();
 
-    if (pendingBoyleUpload)
+    if (pendingConditionUpload)
     {
-      pendingBoyleUpload = false;
+      pendingConditionUpload = false;
 
       // Let the "전송 중" line reach the glass before the network work starts.
       uiTimerHandler();
-      boyleUploadToIsl();
+      conditionUploadToIsl();
     }
-    refreshHomeBleTiles();
-    refreshHomeSensorTilesFor(activeSensorMode);
+    refreshHomeNodeCards();
 
     // dpsReady is settled once when a sensor is chosen, which is wrong for a
     // link that comes and goes; for a node it is simply whether it is linked.
+    // The measurement screen's status line follows it too, or a board that
+    // booted with nothing linked would say 연결 대기 forever.
     if (activeSensorMode == SENSOR_MODE_BLE)
     {
-      dpsReady = bleLinkSlotIsSubscribed(activeBleSlot);
+      const bool linkedNow = bleLinkSlotIsSubscribed(activeBleSlot);
+
+      if (linkedNow != dpsReady && labelStatus && !measuring)
+      {
+        lv_label_set_text(labelStatus, linkedNow ? "준비" : "노드 연결 대기");
+      }
+
+      dpsReady = linkedNow;
     }
 
     if (pendingBleDisconnect)

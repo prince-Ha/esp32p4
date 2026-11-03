@@ -3,17 +3,41 @@
 PlatformIO/Arduino firmware for an ESP32-P4 board driving a 1024x600 LCD touch
 dashboard for school science probes, used by students and teachers together.
 
-Sensors reach it three ways - wired to the board, over BLE from an ESP32 node,
-or over BLE from a commercial PASCO sensor - and from the measurement screen's
-point of view there is no difference between them. Readings go to the screen,
-to CSV on an SD card, and to 지능형 과학실.
+Sensors reach it over BLE - from an ESP32 node running [`sensor_node/`](sensor_node/)
+or from a commercial PASCO sensor - and the home screen is built around that:
+one card per linked node with its live readings, and two ways to measure.
+The sensors wired to the board's own connector still work, chosen from the
+설정 tab as a fallback. Readings go to the screen, to CSV on an SD card, and
+to 지능형 과학실.
 
 ## Features
 
 - **Display & touch**: 1024x600 LCD UI built with [LVGL](https://lvgl.io/),
   driven through a GT911 capacitive touch panel.
-- **Sensors**: pick one on the home screen. Most sit on the soft-I2C bus
-  (GPIO2 SDA / GPIO3 SCL); the encoder and the DS18B20 are digital.
+- **Two ways to measure**, chosen on the home screen:
+
+  | | 시간 측정 | 조건 측정 |
+  |---|---|---|
+  | records | once a second, automatically | once per tap, when the student says so |
+  | graph | value against time | one quantity against another |
+  | for | cooling water, a CO2 room, anything that changes on its own | 보일의 법칙, 샤를의 법칙, any "set a condition, read the sensor" experiment |
+
+  조건 측정 is a table of presets ([`kCondPresets`](src/main.cpp)): each row
+  names the two variables, which one is set by hand with the stepper and which
+  is read from a sensor (by unit, across every linked node), the fit to draw
+  through the points (P = k/V, or a straight line), the derived column
+  (P×V, V/T in kelvin) and the axis defaults. 보일 sets a volume and reads
+  pressure in hPa; 샤를 reads a temperature and sets the volume, and the
+  summary line gives where V would reach zero - the lesson's estimate of
+  absolute zero; 일반 조건 records any number against whatever the lead node
+  reports first. Points are kept per preset, so switching presets loses
+  nothing. Every preset saves to its own CSV and uploads to 지능형 과학실,
+  the hand-set volume going up under a probed volume code beside the sensor's
+  own.
+
+- **Wired sensors** (설정 → 유선 센서): the board's own connector still takes
+  these; most sit on the soft-I2C bus (GPIO2 SDA / GPIO3 SCL), the encoder
+  and the DS18B20 are digital.
 
   | Tile | Part | Reports | Bus |
   |---|---|---|---|
@@ -31,8 +55,9 @@ to CSV on an SD card, and to 지능형 과학실.
 - **Tabs**: 홈 · 측정 · 기록 · 블루투스 · WiFi · 설정. 블루투스 and WiFi are
   where a lesson actually goes wrong - a node that dropped, a network that did
   not join - so they are one tap from anywhere rather than buried in 설정.
-- **Wireless sensors**: up to three at once over BLE, each appearing on the
-  home grid like a sensor wired to the board. Two kinds are supported:
+- **Wireless sensors**: up to three at once over BLE, each a card on the
+  home screen with its name, whether data is arriving, and its live readings.
+  Two kinds are supported:
 
   | Kind | What it is | Reports |
   |---|---|---|
@@ -42,12 +67,6 @@ to CSV on an SD card, and to 지능형 과학실.
 
   All connected nodes are recorded together, so pressure from one sensor and
   temperature from another fill two columns of one experiment.
-
-- **보일의 법칙**: a second view for the pressure sensor, reached from the
-  measurement screen. The volume is set by hand and each point is held
-  deliberately - set the syringe, let the reading settle, record it - so the
-  graph is pressure against volume rather than against time, with the fitted
-  P = k/V drawn through the points and P x V beside every row.
 
 - **Data logging**: measurement sessions can be recorded to CSV on an
   SD/SDMMC card, previewed on-device, and uploaded to 지능형 과학실 in
@@ -70,9 +89,10 @@ cd sensor_node && pio run -t upload
 ```
 
 Then on the P4: the **블루투스** tab -> 다시 검색, tap the `SciNode-XXXX` row to
-connect, and press **이 센서로 측정**. After a scan the board also links itself
-to every node advertising this project's service, so a hub power-cycled
-mid-lesson comes back talking to the room on its own.
+connect. The node appears as a card on the home screen, and either measuring
+mode will read it. After a scan the board also links itself to every node
+advertising this project's service, so a hub power-cycled mid-lesson comes
+back talking to the room on its own.
 
 **Up to three nodes at once** - that is what the controller holds
 (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3`), and the P4 keeps advertising as a
