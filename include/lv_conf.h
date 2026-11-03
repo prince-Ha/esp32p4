@@ -60,10 +60,22 @@
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
-    #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>   /*Header for the dynamic memory function*/
-    #define LV_MEM_CUSTOM_ALLOC   malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC realloc
+    /* Widgets live in PSRAM, not in internal RAM.
+     *
+     * malloc() here hands out internal RAM, and internal RAM is the one thing
+     * on this board that runs out: WiFi and Bluetooth both reach the ESP32-C6
+     * over the same SDIO link, and that driver needs DMA-capable internal
+     * buffers. With a node linked and an upload starting, the board was down
+     * to 32 kB contiguous and ESP-Hosted asserted in sdio_rx_get_buffer(),
+     * rebooting mid-lesson.
+     *
+     * Object metadata does not need to be internal or DMA-capable - only the
+     * display draw buffer does, and that is allocated separately in main.cpp.
+     */
+    #define LV_MEM_CUSTOM_INCLUDE "esp_heap_caps.h"
+    #define LV_MEM_CUSTOM_ALLOC(size)        heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    #define LV_MEM_CUSTOM_FREE               heap_caps_free
+    #define LV_MEM_CUSTOM_REALLOC(ptr, size) heap_caps_realloc((ptr), (size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.

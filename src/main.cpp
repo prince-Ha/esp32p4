@@ -109,6 +109,7 @@ LV_FONT_DECLARE(korean_14);
 // Digits only, for the measurement readout. A full Hangul face at this size
 // would cost megabytes; the value itself never needs one.
 LV_FONT_DECLARE(digits_64);
+LV_FONT_DECLARE(digits_48);
 
 #define FONT_KR &korean_16
 #define FONT_TABLE &korean_16
@@ -119,6 +120,8 @@ LV_FONT_DECLARE(digits_64);
 #define FONT_KR_HEAD &korean_24_bold
 #define FONT_KR_SMALL &korean_14
 #define FONT_VALUE &digits_64
+// Used when a sensor reports two or three quantities that share the row.
+#define FONT_VALUE_SMALL &digits_48
 
 #define FONT_KR_NORMAL FONT_KR
 // =====================================================
@@ -156,7 +159,67 @@ static WifiNetworkInfo wifiScanResults[WIFI_SCAN_MAX];
 #define SENSOR_MODE_TSL2591   4
 #define SENSOR_MODE_TMP117    5
 #define SENSOR_MODE_VL53L1X   6
-#define ACTIVE_SENSOR_DEFAULT SENSOR_MODE_DPS310
+#define SENSOR_MODE_INA228    7
+#define SENSOR_MODE_ENCODER   8
+
+// A sensor on another board, reached over BLE. This is how every sensor
+// reaches the board now: the home screen shows the linked nodes, and the
+// wired modes above remain as a fallback chosen on the 설정 screen.
+#define SENSOR_MODE_BLE       9
+
+// A node publishes once a second. Past this the link is up but the node has
+// gone quiet, and showing its last number as if it were current would be a
+// lie, so the reading is refused instead.
+#define BLE_READING_MAX_AGE_MS 5000
+
+// =====================================================
+// Grove 광학 로터리 엔코더 (TCUT1600X01)
+//
+// Not an I2C part: the module's two phototransistors drive a quadrature A/B
+// pair, so it will never appear in the I2C scan. Both edges of both channels
+// are counted, giving four counts per slot.
+//
+// The board has one fixed sensor connector, so A and B land on the same two
+// signal lines every other sensor uses - SOFT_SDA and SOFT_SCL - the way the
+// DS18B20 already shares SOFT_SDA. Only one sensor mode runs at a time, but
+// the interrupts must come off those pins before anything bit-bangs I2C on
+// them again, or every clock edge of every transaction fires the ISR.
+//
+// Power it from 3.3 V. The module accepts 3.3 V or 5 V, but at 5 V its outputs
+// are 5 V and the P4's pins are not 5 V tolerant.
+// =====================================================
+#define ENCODER_PIN_A SOFT_SDA
+#define ENCODER_PIN_B SOFT_SCL
+
+// Counts for one full turn of the disk. A photo-interrupter counts slots in
+// whatever disk is fitted, so this depends on the wheel, not the module: a
+// 20-slot disk at four counts per slot is 80. Turn the wheel exactly once and
+// read the angle — 360° means this is right, half that means it is doubled.
+#define ENCODER_COUNTS_PER_REV 80
+
+// =====================================================
+// INA228 전압·전류·전력 (raw Soft-I2C)
+// =====================================================
+#define INA228_ADDR                0x40
+#define INA228_REG_CONFIG          0x00
+#define INA228_REG_ADC_CONFIG      0x01
+#define INA228_REG_SHUNT_CAL       0x02
+#define INA228_REG_VBUS            0x05
+#define INA228_REG_CURRENT         0x07
+#define INA228_REG_POWER           0x08
+#define INA228_REG_MANUFACTURER_ID 0x3E
+#define INA228_MANUFACTURER_TI     0x5449
+
+// The shunt on the breakout board. Adafruit's INA228 carries 0.015 Ω rated to
+// 10 A, which is the common case; a board with a different resistor needs this
+// changed or every current and power reading is scaled wrong.
+#define INA228_SHUNT_OHMS   0.015f
+#define INA228_MAX_CURRENT  10.0f
+
+// Datasheet fixed scalings.
+#define INA228_VBUS_LSB_V   0.0001953125f
+#define INA228_POWER_LSB_K  3.2f
+#define ACTIVE_SENSOR_DEFAULT SENSOR_MODE_BLE
 
 #define DS18B20_DQ_GPIO GPIO_NUM_2
 #define DS18B20_CONVERT_MS 1000
@@ -221,6 +284,261 @@ static const uint8_t VL53L1X_DEFAULT_CONFIGURATION[] = {
 #define TMP117_LSB_C                0.0078125f
 
 static bool tmp117LastReadWasWaiting = false;
+
+// INA228 measures three things at once; current is the headline and the other
+// two ride along, the way SCD41's temperature and humidity do.
+// Quadrature state. Written from an interrupt, so volatile.
+static volatile int32_t encoderCount = 0;
+static volatile uint8_t encoderLastState = 0;
+// Counts every edge the ISR sees, including the invalid ones the
+// quadrature table scores as zero, so a bouncing input still shows up.
+static volatile uint32_t encoderEdgeCount = 0;
+static bool encoderReady = false;
+static int32_t encoderPrevCount = 0;
+static unsigned long encoderPrevMs = 0;
+static float encoderLastRateDegPerS = NAN;
+
+// Filled in from each notification: a node names its own quantities and units,
+// so unlike every other sensor here these are not compile-time constants. A
+// DPS310 on a node reports two, the same as one wired to this board.
+// Which connected node the measurement screen is on. Several can be linked at
+// once, but only one is being recorded, because the sample buffers, the CSV
+// and the 지능형 과학실 session all describe a single experiment.
+static int activeBleSlot = 0;
+
+static char bleNodeQuantity[BLE_LINK_MAX_VALUES][24] = { "블루투스", "", "" };
+static char bleNodeUnit[BLE_LINK_MAX_VALUES][24] = { "-", "", "" };
+static int bleNodeValueCount = 1;
+static float bleNodeThirdValue = NAN;
+// Where each displayed value comes from: which link, and which of that link's
+// quantities. A PASCO pressure sensor and a PASCO temperature sensor are two
+// connections and one experiment, which is the whole point of a gas-law
+// measurement, so the readout is filled across links rather than from one.
+static int bleValueSlot[BLE_LINK_MAX_VALUES];
+static int bleValueIndex[BLE_LINK_MAX_VALUES];
+
+// What the node was last reporting, so a change of sensor is noticed.
+void onBleNodeSensorChanged(const char *from, const char *to);
+static char bleNodeSignature[56] = "";
+
+// Defined with the measurement labels; cleared from here when a node goes.
+extern bool previewValid;
+
+// Every other sensor's 지능형 과학실 code is chosen at compile time, because
+// the firmware knows what the part measures. A node does not offer that: it
+// says "hPa" and the code has to be looked up.
+//
+// Only codes this firmware has watched the server accept are listed. An
+// unknown unit is not transmitted at all - a guessed sensorType would put a
+// reading under the wrong quantity in a student's report, which is worse than
+// sending nothing and saying so.
+//
+// The channel codes mirror the DPS310 pairing that already works: TPR on 01,
+// PRS on 02.
+typedef struct
+{
+  const char *nodeUnit;    // what the node writes in its payload
+  const char *sensorType;  // 별첨2 code
+  const char *nickname;
+  const char *channel;
+  const char *collectUnit; // what the platform expects to be told
+} BleIslMapping;
+
+static const BleIslMapping kBleIslMappings[] = {
+  { "C",    "TPR",  "온도센서",       "01", "C" },
+  { "℃",   "TPR",  "온도센서",       "01", "C" },
+  { "degC", "TPR",  "온도센서",       "01", "C" },
+  { "hPa",  "PRS",  "기압센서",       "02", "hPa" },
+
+  // A PASCO pressure sensor reports kPa. Same quantity, same 별첨2 code; only
+  // the unit label the platform is told differs.
+  { "kPa",  "PRS",  "기압센서",       "02", "kPa" },
+
+  // ISL_SENSOR_TYPE_CO2 and ISL_SENSOR_TYPE_HUMIDITY, written out because this
+  // table is above where they are defined. A SCD41 wired to this board already
+  // registers with exactly these, so a node carrying one looks the same to the
+  // platform as the local part.
+  { "ppm",  "CTRT", "이산화탄소센서", "01", "ppm" },
+  { "%",    "HMDT", "습도센서",       "01", "%" },
+
+  // 노드가 낼 수 있는 나머지 단위 전부. 이 표에 없는 단위는 "전송 미지원"이
+  // 되어, 센서를 갈아 끼운 사람에게는 보드가 고장난 것처럼 보입니다 -
+  // 조도로 바꾸자마자 전송이 멈춘 것이 정확히 그것이었습니다. 노드가 sensors.cpp
+  // 에서 쓰는 단위 문자열과 한 줄씩 맞춰 둡니다.
+  //
+  // 조도와 거리 코드는 보드에 직접 꽂았을 때 쓰는 것과 같은 것을 씁니다.
+  { "lx",   "ILM",  "조도센서",       "01", "lx" },
+  { "mm",   "DITC", "거리센서",       "01", "mm" },
+  { "A",    "ECRT", "전류센서",       "01", "A" },
+  { "V",    "VOLT", "전압센서",       "01", "V" },
+  { "W",    "EPOW", "전력센서",       "01", "W" }
+};
+
+// Pulls the active node's quantity names, units and count out of its last
+// packet.
+//
+// This has to run whether or not a measurement is going, and that is the whole
+// reason realtime upload did nothing: readActiveSensor() only runs while
+// measuring, so at the instant 측정 시작 was pressed the units were still the
+// startup placeholders, nothing mapped to a 지능형 과학실 code, and the
+// session was never opened. By the time readings arrived the decision had
+// already been made.
+// Collects the quantities every connected node is reporting, in slot order,
+// up to the three the measurement screen can hold.
+static int bleCollectValues()
+{
+  int found = 0;
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES && found < BLE_LINK_MAX_VALUES; slot++)
+  {
+    if (!bleLinkSlotIsSubscribed(slot)) continue;
+
+    const int count = bleLinkValueCount(slot);
+
+    for (int i = 0; i < count && found < BLE_LINK_MAX_VALUES; i++)
+    {
+      char quantity[24] = "";
+      char unit[24] = "";
+
+      if (!bleLinkValueAt(slot, i, NULL, quantity, unit, NULL)) break;
+
+      bleValueSlot[found] = slot;
+      bleValueIndex[found] = i;
+
+      if (quantity[0]) snprintf(bleNodeQuantity[found], sizeof(bleNodeQuantity[found]), "%s", quantity);
+      if (unit[0]) snprintf(bleNodeUnit[found], sizeof(bleNodeUnit[found]), "%s", unit);
+
+      found++;
+    }
+  }
+
+  return found;
+}
+
+static void bleNodeRefreshMetadata()
+{
+  const int count = bleCollectValues();
+
+  if (count <= 0)
+  {
+    // A node that has gone must stop looking live. Keeping its last quantity
+    // on screen is how the board came to say 온도 while the node had been
+    // swapped for a light sensor.
+    if (bleLinkNodeCount() == 0)
+    {
+      snprintf(bleNodeQuantity[0], sizeof(bleNodeQuantity[0]), "%s", "블루투스");
+      snprintf(bleNodeUnit[0], sizeof(bleNodeUnit[0]), "%s", "-");
+      bleNodeQuantity[1][0] = 0;
+      bleNodeQuantity[2][0] = 0;
+      bleNodeUnit[1][0] = 0;
+      bleNodeUnit[2][0] = 0;
+      bleNodeValueCount = 1;
+      bleNodeThirdValue = NAN;
+      previewValid = false;
+      bleNodeSignature[0] = 0;
+    }
+
+    return;
+  }
+
+  // A node that changes what it measures reports fewer values than before;
+  // the leftovers would otherwise keep describing the old sensor.
+  for (int i = count; i < BLE_LINK_MAX_VALUES; i++)
+  {
+    bleNodeQuantity[i][0] = 0;
+    bleNodeUnit[i][0] = 0;
+  }
+
+  // Swapping the sensor on a node is a different experiment, not a
+  // continuation of this one. Samples taken in hPa do not belong on an axis
+  // labelled lx, and the CSV would carry two quantities under one heading.
+  char signature[56];
+  int sigUsed = snprintf(signature, sizeof(signature), "%d", count);
+
+  for (int i = 0; i < count && sigUsed < (int)sizeof(signature) - 1; i++)
+  {
+    sigUsed += snprintf(signature + sigUsed, sizeof(signature) - sigUsed, "|%s|%s",
+                        bleNodeQuantity[i], bleNodeUnit[i]);
+  }
+
+  if (bleNodeSignature[0] && strcmp(bleNodeSignature, signature) != 0)
+  {
+    onBleNodeSensorChanged(bleNodeSignature, signature);
+  }
+
+  snprintf(bleNodeSignature, sizeof(bleNodeSignature), "%s", signature);
+
+  bleNodeValueCount = count;
+}
+
+// A node writes its unit in ASCII, because the payload has to survive a font
+// subset cut at build time and a comma-separated line. On screen it should
+// still read the way a student writes it. The 지능형 과학실 mapping keeps
+// using the raw unit, so this is display only.
+const char *bleDisplayUnit(const char *unit)
+{
+  if (unit == NULL) return "";
+  if (strcmp(unit, "C") == 0 || strcmp(unit, "degC") == 0) return "℃";
+  if (strcmp(unit, "deg") == 0) return "°";
+  if (strcmp(unit, "deg/s") == 0) return "°/s";
+  return unit;
+}
+
+static const BleIslMapping *bleIslMappingForUnit(const char *unit)
+{
+  if (unit == NULL || unit[0] == 0) return NULL;
+
+  const int count = (int)(sizeof(kBleIslMappings) / sizeof(kBleIslMappings[0]));
+
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(kBleIslMappings[i].nodeUnit, unit) == 0) return &kBleIslMappings[i];
+  }
+
+  return NULL;
+}
+
+// The mapping for value `index` of the node's last packet, or NULL when that
+// unit is not one the server is known to accept.
+static const BleIslMapping *bleIslMappingForValue(int index)
+{
+  if (index < 0 || index >= BLE_LINK_MAX_VALUES) return NULL;
+  if (index >= bleNodeValueCount) return NULL;
+  return bleIslMappingForUnit(bleNodeUnit[index]);
+}
+
+static int bleIslMappedCount()
+{
+  int mapped = 0;
+
+  for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    if (bleIslMappingForValue(i) != NULL) mapped++;
+  }
+
+  return mapped;
+}
+
+// Names the units that will not be sent, so the reason is on the glass rather
+// than only in a log nobody reads during a lesson.
+static void bleIslUnmappedSummary(char *out, size_t outSize)
+{
+  out[0] = 0;
+
+  for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    if (bleIslMappingForValue(i) != NULL) continue;
+
+    char entry[40];
+    snprintf(entry, sizeof(entry), "%s%s(%s)", out[0] ? ", " : "",
+             bleNodeQuantity[i], bleNodeUnit[i][0] ? bleNodeUnit[i] : "단위 없음");
+    strncat(out, entry, outSize - strlen(out) - 1);
+  }
+}
+
+static bool ina228Ready = false;
+static float ina228LastPowerW = NAN;
+static float ina228CurrentLsb = 0.0f;
 
 // =====================================================
 // Adafruit / Sensirion SCD41 CO2 sensor (Soft-I2C)
@@ -329,6 +647,9 @@ static bool tmp117LastReadWasWaiting = false;
 #define UI_TEXT        0x14181F
 #define UI_TEXT_2      0x4A5566
 #define UI_TEXT_3      0x79849A
+// A step lighter again, for the part number and resolution under a tile
+// name: present when looked for, silent otherwise.
+#define UI_TEXT_4      0xA6AEBB
 #define UI_ACCENT      0x0B6BCB
 #define UI_ACCENT_SOFT 0xF2F7FE
 #define UI_ACCENT_TINT 0xE9F1FC
@@ -372,6 +693,10 @@ const int I2C_DELAY_US = 5;
 
 static char csvFileName[64] = CSV_DEFAULT_FILE;
 static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
+
+// primary, secondary, third - the most any one sensor reports.
+#define CSV_VALUE_COLUMNS 3
+#define CSV_HEADER_LINE "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,third_value,third_unit"
 
 // Rows buffered before the CSV handle is flushed to the card. At the 1 Hz
 // sample rate this caps data loss on a power cut at CSV_FLUSH_EVERY_ROWS
@@ -424,6 +749,21 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 // SCD41 reports temperature and humidity alongside CO2. 습도 is HMDT in the
 // appendix; temperature reuses the TPR code the server already accepts. They
 // are separate sensor types, so each takes channel 01 (별첨3).
+// 별첨2: 전압 Voltage VOLT, 전류 Electric current ECRT, 전력 Electric power
+// EPOW. Distinct sensor types, so each takes channel 01 (별첨3).
+// 별첨2: 각도 Angle ANGL, 각속도 Angular velocity ANGV.
+#define ISL_SENSOR_TYPE_ANGLE    "ANGL"
+#define ISL_SENSOR_TYPE_ANGVEL   "ANGV"
+#define ISL_UNIT_ANGLE  "deg"
+#define ISL_UNIT_ANGVEL "deg/s"
+
+#define ISL_SENSOR_TYPE_VOLTAGE "VOLT"
+#define ISL_SENSOR_TYPE_CURRENT "ECRT"
+#define ISL_SENSOR_TYPE_POWER   "EPOW"
+#define ISL_UNIT_VOLTAGE "V"
+#define ISL_UNIT_CURRENT "A"
+#define ISL_UNIT_POWER   "W"
+
 #define ISL_SENSOR_TYPE_HUMIDITY "HMDT"
 #define ISL_CHANNEL_HUMIDITY "01"
 #define ISL_UNIT_HUMIDITY "%"
@@ -442,11 +782,59 @@ static char csvPath[128] = MOUNT_POINT "/" CSV_DEFAULT_FILE;
 #define REALTIME_DIRECT_ISL_ENABLED 1
 #define DIRECT_ISL_AXIS_PADDED 1
 
-#define DIRECT_ISL_START_URL "https://api-scion.kosac.re.kr/sensorapi/startExplortProcess"
-#define DIRECT_ISL_SENSOR_TYPE_URL "https://api-scion.kosac.re.kr/sensorapi/sendSensorType"
-#define DIRECT_ISL_STATUS_URL "https://api-scion.kosac.re.kr/sensorapi/setExplortProcessStatus"
-#define DIRECT_ISL_DATA_URL "https://api-scion.kosac.re.kr/sensorapi/sendExplortData"
-#define DIRECT_ISL_STOP_URL "https://api-scion.kosac.re.kr/sensorapi/stopExplortProcess"
+// 지능형 과학실은 같은 API를 두 곳에 두고 있습니다. 시연과 점검은 테스트 서버에서
+// 하고 실제 수업은 운영 서버로 보내는데, 경로는 같고 호스트만 다릅니다. 그래서
+// 주소를 붙박이 문자열로 두지 않고 고른 호스트로 다시 조립합니다. 시연 때문에
+// 펌웨어를 다시 굽는 일이 없어야 합니다.
+#define ISL_HOST_PROD "api-scion.kosac.re.kr"
+#define ISL_HOST_TEST "testapi-scion.kofac.re.kr"
+
+static bool islUseTestServer = false;
+static char islApiHost[64] = ISL_HOST_PROD;
+
+// 지능형 과학실의 테스트 환경은 문서와 실제 사이트가 서로 다른 도메인을 가리키고
+// 있습니다 - 문서는 kofac, 로그인한 탐구는 kosac. 어느 쪽이 이 탐구의 API인지는
+// 물어봐야 알 수 있는데, 그때마다 펌웨어를 다시 구울 수는 없습니다.
+static char islTestHost[64] = ISL_HOST_TEST;
+
+static char islUrlStart[144];
+static char islUrlSensorType[144];
+static char islUrlStatus[144];
+static char islUrlData[144];
+static char islUrlStop[144];
+
+// 주소를 쓰는 스무 곳은 매크로 이름 그대로 남습니다. 서버를 바꾸는 일은 여기
+// 한 곳에서 끝나야 하고, 호출하는 쪽은 어느 서버인지 몰라도 됩니다.
+#define DIRECT_ISL_START_URL islUrlStart
+#define DIRECT_ISL_SENSOR_TYPE_URL islUrlSensorType
+#define DIRECT_ISL_STATUS_URL islUrlStatus
+#define DIRECT_ISL_DATA_URL islUrlData
+#define DIRECT_ISL_STOP_URL islUrlStop
+
+static void islBuildApiUrls()
+{
+  snprintf(islApiHost, sizeof(islApiHost), "%s",
+           islUseTestServer ? islTestHost : ISL_HOST_PROD);
+
+  struct IslEndpoint { char *slot; size_t size; const char *path; };
+
+  const IslEndpoint endpoints[] = {
+    { islUrlStart,      sizeof(islUrlStart),      "startExplortProcess" },
+    { islUrlSensorType, sizeof(islUrlSensorType), "sendSensorType" },
+    { islUrlStatus,     sizeof(islUrlStatus),     "setExplortProcessStatus" },
+    { islUrlData,       sizeof(islUrlData),       "sendExplortData" },
+    { islUrlStop,       sizeof(islUrlStop),       "stopExplortProcess" }
+  };
+
+  for (size_t i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++)
+  {
+    snprintf(endpoints[i].slot, endpoints[i].size, "https://%s/sensorapi/%s",
+             islApiHost, endpoints[i].path);
+  }
+
+  Serial.printf("[ISL] server = %s (%s)\n", islApiHost,
+                islUseTestServer ? "테스트" : "운영");
+}
 
 // HTTPS 전송 안정화 설정
 // 1초마다 HTTPS를 새로 연결하면 TLS handshake 때문에 실패할 수 있습니다.
@@ -567,6 +955,9 @@ void servicePendingScreenSwitch();
 void servicePendingWifiCommand();
 void servicePendingSensorMode();
 void activateScreenNow(lv_obj_t *screen);
+void refreshHomeNodeCards();
+void syncWiredSensorDropdown();
+void refreshConditionScreen();
 
 // =====================================================
 // 화면 객체
@@ -595,7 +986,13 @@ static lv_obj_t *labelHumidityBig;
 // Measure screen: the value is split across three labels so the digits can use
 // a digits-only face while the name and unit stay in the Hangul face.
 static lv_obj_t *labelMeasureSensorName;
-static lv_obj_t *labelMeasurePrimaryUnit;
+
+// Up to three readings share the row: DPS310 gives 온도 and 기압, SCD41 gives
+// CO2, 온도 and 습도. Each column is a caption, a number and a unit.
+#define MEASURE_VALUE_MAX 3
+static lv_obj_t *labelValueCaption[MEASURE_VALUE_MAX];
+static lv_obj_t *labelValueNumber[MEASURE_VALUE_MAX];
+static lv_obj_t *labelValueUnit[MEASURE_VALUE_MAX];
 static lv_obj_t *labelMeasureIslState;
 static lv_obj_t *labelMeasureModum;
 static lv_obj_t *labelMeasureBle;
@@ -632,6 +1029,23 @@ static lv_obj_t *labelBarBleTime;
 static lv_obj_t *labelBarBleWifi;
 static lv_obj_t *labelBarBleSd;
 static volatile bool pendingBleScan = false;
+// A tapped row asks for a connection; the radio work happens in the loop.
+static volatile int pendingBleConnectIndex = -1;
+static volatile bool pendingBleDisconnect = false;
+static volatile int pendingBleDropSlot = -1;
+// Uploading blocks for as long as there are points, so the button only asks.
+static volatile bool pendingConditionUpload = false;
+
+
+// Rows are rebuilt on every refresh, so the addresses they connect to live
+// here and the row only carries an index.
+static char bleRowAddress[BLE_SCAN_MAX_RESULTS][18];
+// Whether that row advertises this project's service, which decides whether a
+// tap means "connect and read" or "tell me what you are".
+static bool bleRowIsSensorNode[BLE_SCAN_MAX_RESULTS];
+static lv_obj_t *labelBleLink = NULL;
+// Scanning bit-bangs the bus, so it runs from the loop, not a callback.
+static volatile bool pendingI2cScan = false;
 
 // Bluetooth is off unless asked for. NimBLE holds DMA-capable internal RAM,
 // and that is the same pool the AES accelerator draws from for a TLS
@@ -654,17 +1068,41 @@ static lv_obj_t *labelFileViewerPageInfo;
 
 
 
-// Home sensor grid, kept so the selected tile can follow the active sensor.
-#define HOME_SENSOR_TILE_COUNT 6
+// Home screen. Every sensor arrives over BLE now, so the grid of wired-sensor
+// tiles is gone: one card per linked node, laid out by position so the single
+// "센서 연결" card always follows the linked ones, and two cards for the two
+// ways of measuring.
+#define HOME_NODE_CARD_COUNT BLE_LINK_MAX_NODES
+#define HOME_NODE_CARD_ROWS BLE_LINK_MAX_VALUES
 // The group code is edited in a modal sheet rather than in place: the keyboard
 // covers the lower third of the screen, so an inline field would either sit
-// under the keyboard or have to displace the sensor grid.
+// under the keyboard or have to displace the cards.
 static lv_obj_t *homeCodeEditor;
 static lv_obj_t *labelHomeModumCode;
 
-static lv_obj_t *homeSensorTiles[HOME_SENSOR_TILE_COUNT];
-static lv_obj_t *homeSensorTileMarks[HOME_SENSOR_TILE_COUNT];
-static int homeSensorTileModes[HOME_SENSOR_TILE_COUNT];
+static lv_obj_t *homeNodeCards[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardName[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardState[HOME_NODE_CARD_COUNT];
+static lv_obj_t *homeNodeCardQty[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+static lv_obj_t *homeNodeCardNum[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+static lv_obj_t *homeNodeCardUnit[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
+// The slot shown at each position, or -1 for the "센서 연결" card.
+static int homeNodeCardSlot[HOME_NODE_CARD_COUNT];
+static lv_obj_t *labelHomeReady;
+
+// 설정: the sensors wired to this board, kept reachable as a fallback. The
+// dropdown's rows map to modes through this table, so adding a part is one
+// line in each.
+static lv_obj_t *wiredSensorDropdown;
+static const int kWiredSensorModes[] = {
+  SENSOR_MODE_BLE, SENSOR_MODE_DPS310, SENSOR_MODE_DS18B20, SENSOR_MODE_SCD41,
+  SENSOR_MODE_TSL2591, SENSOR_MODE_TMP117, SENSOR_MODE_VL53L1X, SENSOR_MODE_INA228,
+  SENSOR_MODE_ENCODER
+};
+#define WIRED_SENSOR_OPTION_COUNT ((int)(sizeof(kWiredSensorModes) / sizeof(kWiredSensorModes[0])))
+static const char *kWiredSensorOptions =
+  "블루투스 노드 (기본)\n온도 · 기압 (DPS310)\n수온 (DS18B20)\n이산화탄소 (SCD41)\n"
+  "조도 (TSL2591)\n정밀 온도 (TMP117)\n거리 (VL53L1X)\n전압 · 전류 (INA228)\n회전 (엔코더)";
 
 static lv_obj_t *wifiSsidTa;
 static lv_obj_t *wifiPassTa;
@@ -680,6 +1118,7 @@ static lv_obj_t *homeIslModuleTa;
 static lv_obj_t *islServiceKeyTa;
 static lv_obj_t *labelHomeIsl;
 static lv_obj_t *labelCloudMode;
+static lv_obj_t *labelIslServer;
 static lv_obj_t *homeCsvFileTa;
 static lv_obj_t *labelHomeCsv;
 static lv_obj_t *labelHomeCsvPath;
@@ -697,14 +1136,206 @@ static lv_obj_t *labelSettingsWifi;
 static lv_obj_t *labelSettingsSd;
 static lv_obj_t *labelSettingsCsv;
 static lv_obj_t *labelSettingsNote;
+// 조건 측정
+//
+// A time series is the wrong shape for a gas-law experiment: the quantity
+// being varied is set by hand, one position at a time, and a point is taken
+// when the student decides the reading has settled. So this screen records on
+// a tap rather than on a clock, and plots one quantity against another rather
+// than against time. Which two, and how they are expected to relate, is a row
+// in kCondPresets - 보일 (V by hand, P read, P = k/V), 샤를 (T read, V by
+// hand, V = a + bT) and a general row for any condition against whatever the
+// lead node reports. A new experiment is one more row.
+#define COND_MAX_POINTS   20
+#define COND_CURVE_POINTS 60
+#define COND_AXIS_TICKS   5
+#define COND_MAX_ALIASES  4
+
+// Where a variable's number comes from.
+#define COND_SRC_MANUAL      0   // set by hand with the stepper
+#define COND_SRC_SENSOR      1   // looked up by unit across every linked node
+#define COND_SRC_SENSOR_ANY  2   // the lead node's first quantity, whatever it is
+
+#define COND_FIT_NONE     0
+#define COND_FIT_INVERSE  1   // y = k / x,   k = mean(x*y)
+#define COND_FIT_LINEAR   2   // y = a + b x, least squares
+
+#define COND_DERIVED_NONE     0
+#define COND_DERIVED_PRODUCT  1   // x * y             (P×V)
+#define COND_DERIVED_RATIO    2   // y / (x + offset)  (V/T with T in kelvin)
+
+// A unit as a node writes it, and how to bring it to the variable's own unit:
+// value = raw * scale + offset. A PASCO sensor says kPa where the axis is hPa.
+typedef struct
+{
+  const char *unit;
+  float scale;
+  float offset;
+} CondUnitAlias;
+
+typedef struct
+{
+  const char *name;        // 부피 - drawn in the full-range face
+  const char *unit;        // the variable's own unit: mL, hPa, ℃; "" when none
+  const char *csvName;     // ASCII column heading
+  uint8_t source;          // COND_SRC_*
+  CondUnitAlias aliases[COND_MAX_ALIASES];   // sensor only; NULL-terminated
+  // Manual variables only.
+  float minValue, maxValue, stepSmall, stepLarge, defaultValue;
+  uint8_t decimals;        // for the readout, the table and the CSV
+  // Upload. A sensor variable maps through kBleIslMappings by its unit; a
+  // manual one needs a code of its own or is not sent.
+  const char *islType;
+  const char *islNickname;
+} CondVariable;
+
+typedef struct
+{
+  const char *title;          // literal, so it may use the heading face
+  const char *hint;
+  const char *recordText;     // 이 부피로 기록
+  const char *csvFile;        // boyle -> /sdcard/boyle.csv
+  CondVariable x;
+  CondVariable y;
+  uint8_t fit;                // COND_FIT_*
+  uint8_t derived;            // COND_DERIVED_*
+  const char *derivedName;    // P×V - table column and summary
+  const char *derivedCsvName;
+  float derivedOffsetX;       // 273.15 for a ratio against kelvin
+  // Axis defaults. NAN = take it from the data. The step is the grid a point
+  // outside the default range widens the axis to.
+  float xAxisMin, xAxisMax, xAxisStep;
+  float yAxisMin, yAxisMax, yAxisStep;
+} CondPreset;
+
+#define COND_ALIAS_END { NULL, 0.0f, 0.0f }
+
+static const CondPreset kCondPresets[] = {
+  // 보일: V set by hand, P read, P = k/V. A syringe experiment runs 20 to
+  // 60 mL, so that is the axis from the first point; the pressure axis starts
+  // at 950 hPa because nothing is measured much below atmospheric, and a
+  // hyperbola still reads as one over that range.
+  { "보일의 법칙", "부피 맞추고 압력 안정되면 기록", "이 부피로 기록", "boyle",
+    { "부피", "mL", "volume_mL", COND_SRC_MANUAL, { COND_ALIAS_END },
+      1.0f, 200.0f, 1.0f, 5.0f, 20.0f, 1, "VOLM", "부피센서" },
+    { "압력", "hPa", "pressure_hPa", COND_SRC_SENSOR,
+      { { "hPa", 1.0f, 0.0f }, { "kPa", 10.0f, 0.0f }, COND_ALIAS_END },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1, NULL, NULL },
+    COND_FIT_INVERSE, COND_DERIVED_PRODUCT, "P×V", "PV", 0.0f,
+    20.0f, 60.0f, 5.0f, 950.0f, NAN, 50.0f },
+
+  // 샤를: T read, V read off the syringe and set by hand, V = a + bT. The
+  // intercept where V would reach zero is the lesson's payoff.
+  { "샤를의 법칙", "온도 안정되면 부피 맞춰 기록", "이 온도로 기록", "charles",
+    { "온도", "℃", "temperature_C", COND_SRC_SENSOR,
+      { { "C", 1.0f, 0.0f }, { "℃", 1.0f, 0.0f }, { "degC", 1.0f, 0.0f }, { "K", 1.0f, -273.15f } },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1, NULL, NULL },
+    { "부피", "mL", "volume_mL", COND_SRC_MANUAL, { COND_ALIAS_END },
+      1.0f, 200.0f, 1.0f, 5.0f, 30.0f, 1, "VOLM", "부피센서" },
+    COND_FIT_LINEAR, COND_DERIVED_RATIO, "V/T(K)", "V_over_TK", 273.15f,
+    NAN, NAN, 10.0f, 0.0f, NAN, 5.0f },
+
+  // 일반: any number the student controls, against whatever the lead node
+  // reports first - distance against mass, light against angle, and so on.
+  { "일반 조건", "조건 정하고 값 안정되면 기록", "이 조건으로 기록", "condition",
+    { "조건", "", "condition", COND_SRC_MANUAL, { COND_ALIAS_END },
+      -1000.0f, 1000.0f, 1.0f, 10.0f, 1.0f, 1, NULL, NULL },
+    { "측정값", "", "value", COND_SRC_SENSOR_ANY, { COND_ALIAS_END },
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2, NULL, NULL },
+    COND_FIT_NONE, COND_DERIVED_NONE, NULL, NULL, 0.0f,
+    NAN, NAN, 1.0f, NAN, NAN, 1.0f }
+};
+#define COND_PRESET_COUNT ((int)(sizeof(kCondPresets) / sizeof(kCondPresets[0])))
+#define COND_PRESET_BOYLE 0
+
+// Points live per preset, so switching presets loses nothing: a class that
+// has taken fifteen Boyle points can look at the 샤를 screen and come back.
+static int condPresetIndex = COND_PRESET_BOYLE;
+static float condX[COND_PRESET_COUNT][COND_MAX_POINTS];
+static float condY[COND_PRESET_COUNT][COND_MAX_POINTS];
+static int condPointCount[COND_PRESET_COUNT];
+static float condManual[COND_PRESET_COUNT];
+// 일반: what the lead node's first quantity was called when the first point
+// was taken, so the rest of the run is refused if the sensor changes.
+static char condAnyName[24] = "";
+static char condAnyUnit[24] = "";
+static char condAnyNode[32] = "";
+// Which node fed the sensor variable last, for the line under the live value.
+static char condSourceNode[32] = "";
+// The table and chart are rebuilt only when a point changes, not every second.
+static bool condDirty = true;
+
+typedef struct
+{
+  bool valid;
+  float k;            // INVERSE: y = k / x
+  float a, b;         // LINEAR: y = a + b x
+  float derivedMean;
+} CondFit;
+
+typedef struct { float lo, hi, span; } CondAxis;
+
+// The volume-code probe that 보일의 법칙 already did: the 2026-07-21 appendix
+// has no code for a volume, so the candidates are tried in turn.
+static const char *kCondVolumeTypes[] = { "VOLM", "VLM", "VOL", "VOLU" };
+static char condVolumeSensorType[8] = "";
+// The preset whose points 전송 asked for; the screen may be on another one by
+// the time the loop gets to it.
+static int condUploadPreset = 0;
+
+static lv_obj_t *conditionScreen;
+static lv_obj_t *conditionChart;
+static lv_chart_series_t *conditionSeries;
+static lv_chart_series_t *conditionCurve;
+static lv_obj_t *conditionPresetBtn[COND_PRESET_COUNT];
+static lv_obj_t *conditionStepBtn[6];
+static lv_obj_t *conditionRecordBtn;
+static lv_obj_t *labelConditionManualCaption;
+static lv_obj_t *labelConditionManual;
+static lv_obj_t *labelConditionSensorCaption;
+static lv_obj_t *labelConditionSensorNow;
+static lv_obj_t *labelConditionSensorNode;
+static lv_obj_t *labelConditionChartTitle;
+static lv_obj_t *labelConditionXTicks[COND_AXIS_TICKS];
+static lv_obj_t *labelConditionYTicks[COND_AXIS_TICKS];
+static lv_obj_t *labelConditionPointText[COND_MAX_POINTS];
+static lv_obj_t *labelConditionSummary;
+static lv_obj_t *labelConditionNote;
+static lv_obj_t *tableCondition;
+static lv_obj_t *labelBarConditionTime;
+static lv_obj_t *labelBarConditionWifi;
+static lv_obj_t *labelBarConditionSd;
+
+// The graph takes most of the screen: the shape of the curve is the result of
+// the experiment.
+#define COND_CARD_X 424
+#define COND_CARD_Y 104
+#define COND_CARD_W 572
+#define COND_CARD_H 408
+#define COND_CHART_X 56
+#define COND_CHART_Y 44
+#define COND_CHART_W 500
+#define COND_CHART_H 310
+
+static lv_obj_t *labelDeviceNote;
+static lv_obj_t *deviceScreen;
+static lv_obj_t *labelBarDeviceTime;
+static lv_obj_t *labelBarDeviceWifi;
+static lv_obj_t *labelBarDeviceSd;
 static lv_obj_t *labelSettingsIsl;
 static lv_obj_t *islModuleTa;
 static lv_obj_t *sdFileList;
 
-#define SD_FILE_LIST_MAX 1
+// Files the list can hold. This was 1, left over from a build that cut every
+// buffer it could: the loop stopped after the first directory entry, and on a
+// card whose first entry is a hidden system folder no CSV ever appeared.
+// 32 x 96 bytes is 3 kB, which the reclaimed internal RAM affords.
+#define SD_FILE_LIST_MAX 32
 static char sdListedFiles[SD_FILE_LIST_MAX][96];
 static int sdListedFileCount = 0;
-#define CSV_FILE_VIEW_PAGE_BYTES 256  // File viewer disabled
+// Bytes shown per page in the file viewer. Also cut to a stub; 256 bytes is
+// about three CSV rows.
+#define CSV_FILE_VIEW_PAGE_BYTES 2048
 static char csvFileViewBuffer[CSV_FILE_VIEW_PAGE_BYTES + 1024];
 static char sdSelectedTextFile[96] = "";
 static long csvFileViewOffset = 0;
@@ -798,6 +1429,9 @@ bool isBatchUploading();
 void requestBatchUiRefresh();
 void serviceLightweightBatchUi();
 void resetDirectIslSessionCache(const char *reason);
+// Switches server, and with it the stored key, because the two servers issue
+// their own. `persist` is false only while restoring the saved choice at boot.
+void islApplyServerChoice(bool useTest, bool persist);
 bool ensureWifiReadyForHttp(const char *context, int waitMs);
 bool wifiReadyForHttp();
 void httpCloseConnection(const char *reason);
@@ -808,10 +1442,10 @@ static bool cloudModumConfigured();
 
 
 void createCsvUi();
-void createFileViewerUi();
 void createIslUi();
 void createBleUi();
 void refreshBleScreen();
+void applyTableValueHeaders();
 void resetTable();
 void updateTable();
 
@@ -819,6 +1453,10 @@ static void go_csv_event_cb(lv_event_t *e);
 static void go_home_event_cb(lv_event_t *e);
 static void go_measure_event_cb(lv_event_t *e);
 static void go_settings_event_cb(lv_event_t *e);
+static void go_ble_event_cb(lv_event_t *e);
+static void go_device_event_cb(lv_event_t *e);
+static void go_condition_event_cb(lv_event_t *e);
+static void screen_tap_dismiss_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -839,42 +1477,144 @@ bool saveMeasurementBackupToNvs(bool force);
 void updateChartAutoScale();
 void clearChart();
 
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
+const char *sensorDetailText(int mode);
 
-// Move the "선택됨" state onto the tile for `mode`.
-void refreshHomeSensorTilesFor(int mode)
+// One card per linked node, by position: the first linked node takes the
+// first card whichever slot it holds, and the one card after the last node
+// offers the connection. Runs on the 1 Hz clock, because a node appearing is
+// exactly the event the home screen exists to show.
+//
+// The state on a card is about the data, not the link. A node can stay
+// connected and go quiet, and that is the case a teacher needs to see from
+// the back of the room.
+void refreshHomeNodeCards()
 {
-  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
+  if (homeNodeCards[0] == NULL) return;
+
+  int position = 0;
+  int linked = 0;
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES && position < HOME_NODE_CARD_COUNT; slot++)
   {
-    styleSensorTile(
-      homeSensorTiles[i],
-      homeSensorTileMarks[i],
-      homeSensorTileModes[i] == mode
-    );
-  }
-}
+    const bool live = bleLinkSlotIsSubscribed(slot);
+    const bool busy = bleLinkSlotIsBusy(slot);
+    if (!live && !busy) continue;
 
-void refreshHomeSensorTiles()
-{
-  refreshHomeSensorTilesFor(activeSensorMode);
+    const int p = position++;
+    if (live) linked++;
+    homeNodeCardSlot[p] = slot;
+
+    lv_obj_t *card = homeNodeCards[p];
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_SURFACE), 0);
+
+    // The node's own name, in the full-range face: the heading subset is cut
+    // from this file's literals and cannot know it.
+    const char *name = bleLinkSlotName(slot);
+    lv_obj_set_style_text_font(homeNodeCardName[p], FONT_KR, 0);
+    lv_label_set_text(homeNodeCardName[p], (name && name[0]) ? name : "연결 중...");
+    lv_obj_set_style_text_color(homeNodeCardName[p], lv_color_hex(UI_TEXT), 0);
+
+    bool anyFresh = false;
+    const int count = live ? bleLinkValueCount(slot) : 0;
+
+    for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
+    {
+      float value = NAN;
+      char quantity[24] = "";
+      char unit[24] = "";
+      uint32_t ageMs = 0;
+      const bool have = i < count && bleLinkValueAt(slot, i, &value, quantity, unit, &ageMs);
+
+      if (!have)
+      {
+        lv_obj_add_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
+        continue;
+      }
+
+      const bool fresh = ageMs <= BLE_READING_MAX_AGE_MS && !isnan(value);
+      if (fresh) anyFresh = true;
+
+      // Digits only in the 24 px face; the quantity and unit are the node's
+      // words and go in the full-range faces beside it.
+      char number[24];
+      if (fresh) snprintf(number, sizeof(number), "%.1f", value);
+      else snprintf(number, sizeof(number), "----");
+
+      lv_label_set_text(homeNodeCardQty[p][i], quantity[0] ? quantity : "값");
+      lv_label_set_text(homeNodeCardNum[p][i], number);
+      lv_label_set_text(homeNodeCardUnit[p][i], bleDisplayUnit(unit));
+      lv_obj_clear_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    const char *state = "연결 중";
+    uint32_t stateColor = UI_TEXT_3;
+
+    if (live && anyFresh) { state = "수신 중"; stateColor = UI_OK; }
+    else if (live) { state = "응답 없음"; stateColor = UI_DANGER; }
+
+    lv_label_set_text(homeNodeCardState[p], state);
+    lv_obj_set_style_text_color(homeNodeCardState[p], lv_color_hex(stateColor), 0);
+  }
+
+  // The one card after the nodes: how to get another one.
+  if (position < HOME_NODE_CARD_COUNT)
+  {
+    const int p = position++;
+    homeNodeCardSlot[p] = -1;
+
+    lv_obj_t *card = homeNodeCards[p];
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(card, lv_color_hex(UI_ACCENT_TINT), 0);
+
+    lv_obj_set_style_text_font(homeNodeCardName[p], FONT_KR_HEAD, 0);
+    lv_label_set_text(homeNodeCardName[p], bleEnabled ? "+ 센서 연결" : "블루투스 켜기");
+    lv_obj_set_style_text_color(homeNodeCardName[p], lv_color_hex(UI_ACCENT), 0);
+    lv_label_set_text(homeNodeCardState[p], "");
+
+    for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
+    {
+      lv_obj_add_flag(homeNodeCardQty[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(homeNodeCardNum[p][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+  }
+
+  for (; position < HOME_NODE_CARD_COUNT; position++)
+  {
+    homeNodeCardSlot[position] = -1;
+    lv_obj_add_flag(homeNodeCards[position], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // WiFi is the one thing on this screen a student cannot see for themselves.
+  if (labelHomeReady)
+  {
+    char text[96];
+
+    if (wifiConnected && strlen(wifiSavedSsid) > 0) snprintf(text, sizeof(text), "연결됨 · %s", wifiSavedSsid);
+    else if (wifiConnected) snprintf(text, sizeof(text), "연결됨");
+    else snprintf(text, sizeof(text), "연결 안 됨");
+
+    lv_label_set_text(labelHomeReady, text);
+    lv_obj_set_style_text_color(labelHomeReady, lv_color_hex(wifiConnected ? UI_OK : UI_TEXT_3), 0);
+  }
 }
 
 void refreshHomeSensorLabels()
 {
   char buf[96];
 
-  refreshHomeSensorTiles();
+  refreshHomeNodeCards();
 
   if (labelHomeSensorMode)
   {
     snprintf(buf, sizeof(buf), "선택: %s", activeMeasurementTitle());
     lv_label_set_text(labelHomeSensorMode, buf);
-  }
-
-  if (labelHomeSensorStatus)
-  {
-    snprintf(buf, sizeof(buf), "상태: %s", dpsReady ? "준비" : "인식 실패");
-    lv_label_set_text(labelHomeSensorStatus, buf);
   }
 
   if (labelHomeRecovery)
@@ -898,46 +1638,34 @@ void refreshHomeSensorLabels()
   }
 }
 
-static void home_sensor_dps_event_cb(lv_event_t *e)
+static void home_node_card_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_DPS310;
+
+  // Both kinds of card lead to the 블루투스 screen: that is where a node is
+  // connected, dropped, or made the lead one. The home screen only shows.
+  requestScreenSwitch(bleScreen);
 }
 
-static void home_sensor_water_event_cb(lv_event_t *e)
+static void wired_sensor_dropdown_event_cb(lv_event_t *e)
 {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_DS18B20;
-}
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
 
-static void home_sensor_co2_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_SCD41;
-}
+  const int index = (int)lv_dropdown_get_selected(lv_event_get_target(e));
+  if (index < 0 || index >= WIRED_SENSOR_OPTION_COUNT) return;
 
-static void home_sensor_light_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_TSL2591;
-}
+  const int mode = kWiredSensorModes[index];
+  if (mode == activeSensorMode) return;
 
-static void home_sensor_tmp117_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_TMP117;
-}
+  if (measuring)
+  {
+    setIslStatusText("측정 정지 후 센서 변경");
+    // The control must not claim a change that was refused.
+    syncWiredSensorDropdown();
+    return;
+  }
 
-static void home_sensor_vl53_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (measuring) { setIslStatusText("측정 정지 후 센서 변경"); return; }
-  pendingSensorMode = SENSOR_MODE_VL53L1X;
+  pendingSensorMode = mode;
 }
 
 void servicePendingSensorMode()
@@ -955,13 +1683,14 @@ void servicePendingSensorMode()
   uiInputLocked = true;
   ignoreTouchUntilMs = millis() + 200;
 
-  // Move the selection and paint it before switching sensors. Bringing a
-  // sensor up probes I2C and can block for a second or more, and doing that
-  // first made the tap feel unacknowledged.
-  refreshHomeSensorTilesFor(mode);
+  // Paint before switching sensors. Bringing a sensor up probes I2C and can
+  // block for a second or more, and doing that first made the tap feel
+  // unacknowledged.
   lv_refr_now(NULL);
 
   setActiveSensorMode(mode);
+  // Whether or not the switch was accepted - a batch upload refuses it.
+  syncWiredSensorDropdown();
   uiInputLocked = false;
   ignoreTouchUntilMs = millis() + 200;
 }
@@ -977,22 +1706,9 @@ static void board_restart_event_cb(lv_event_t *e)
 static void dashboard_isl_save_event_cb(lv_event_t *e);
 static void dashboard_isl_start_event_cb(lv_event_t *e);
 static void dashboard_isl_stop_event_cb(lv_event_t *e);
-static void dashboard_cloud_realtime_event_cb(lv_event_t *e);
-static void dashboard_cloud_batch_event_cb(lv_event_t *e);
 static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e);
-static void dashboard_csv_mount_event_cb(lv_event_t *e);
-static void dashboard_csv_toggle_event_cb(lv_event_t *e);
-static void dashboard_csv_preview_event_cb(lv_event_t *e);
 static void csv_save_measurement_data_event_cb(lv_event_t *e);
-static void csv_viewer_prev_event_cb(lv_event_t *e);
-static void csv_viewer_next_event_cb(lv_event_t *e);
 static void sd_file_item_event_cb(lv_event_t *e);
-static void home_sensor_dps_event_cb(lv_event_t *e);
-static void home_sensor_water_event_cb(lv_event_t *e);
-static void home_sensor_co2_event_cb(lv_event_t *e);
-static void home_sensor_light_event_cb(lv_event_t *e);
-static void home_sensor_tmp117_event_cb(lv_event_t *e);
-static void home_sensor_vl53_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
 void sanitizeBasicFileName(const char *input, char *out, size_t outSize);
@@ -1002,8 +1718,6 @@ void loadSdTextFilePage(const char *fileName, long offset);
 static void dashboard_textarea_event_cb(lv_event_t *e);
 static void dashboard_keyboard_event_cb(lv_event_t *e);
 static void copy_label_event_cb(lv_event_t *e);
-static void csv_textarea_event_cb(lv_event_t *e);
-static void csv_keyboard_event_cb(lv_event_t *e);
 void updateDashboardCsvPreview();
 void updateDashboardCsvLabels();
 void updateDashboardIslLabels();
@@ -1027,7 +1741,6 @@ void applyRestoredMeasurementToUi();
 
 lv_obj_t *makeButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
 lv_obj_t *makeTableNavButton(lv_obj_t *parent, const char *text, int x, int y, int w, int h, lv_event_cb_t cb);
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected);
 
 #if HAS_IDF_WIFI
 static bool idfWifiStarted = false;
@@ -1057,6 +1770,7 @@ bool measuring = false;
 bool sdReady = false;
 
 unsigned long lastReadMs = 0;
+unsigned long lastPreviewMs = 0;
 unsigned long lastUiClockMs = 0;
 unsigned long startMs = 0;
 const unsigned long readIntervalMs = 1000;
@@ -2548,6 +3262,9 @@ const char *activeSensorName()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "SCD41 CO2";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "TSL2591 조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "TMP117 정밀온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "INA228 전압·전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전 엔코더";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "VL53L1X 거리";
   return "DPS310";
 }
@@ -2558,6 +3275,9 @@ const char *activeMeasurementTitle()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "이산화탄소";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀 온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전압 · 전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도 · 기압";
 }
@@ -2568,6 +3288,9 @@ const char *activePrimaryName()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "CO2";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "조도";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전류";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "각도";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "거리";
   return "온도";
 }
@@ -2577,6 +3300,9 @@ const char *activePrimaryUnit()
   if (activeSensorMode == SENSOR_MODE_SCD41) return "ppm";
   if (activeSensorMode == SENSOR_MODE_TSL2591) return "lux";
   if (activeSensorMode == SENSOR_MODE_VL53L1X) return "mm";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "A";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "°";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleDisplayUnit(bleNodeUnit[0]);
   return "℃";
 }
 
@@ -2603,7 +3329,46 @@ const char *islTemperatureNickname()
 {
   if (activeSensorMode == SENSOR_MODE_DS18B20) return "수온센서";
   if (activeSensorMode == SENSOR_MODE_TMP117) return "정밀온도센서";
+  if (activeSensorMode == SENSOR_MODE_INA228) return "전류센서";
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return "회전센서";
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeQuantity[0];
   return "온도센서";
+}
+
+// The part behind each tile and the resolution it is displayed at. The
+// figures are what the firmware actually prints, taken from
+// formatPrimaryValueText(), not datasheet accuracy — a student comparing two
+// readings cares which digits are real on screen.
+const char *sensorDetailText(int mode)
+{
+  switch (mode)
+  {
+    case SENSOR_MODE_DPS310:  return "DPS310 · 0.01℃ · 0.1hPa";
+    case SENSOR_MODE_DS18B20: return "DS18B20 · 0.01℃";
+    case SENSOR_MODE_SCD41:   return "SCD41 · 1ppm · 0.1℃ · 0.1%";
+    case SENSOR_MODE_TSL2591: return "TSL2591 · 0.1lx";
+    case SENSOR_MODE_TMP117:  return "TMP117 · 0.001℃";
+    case SENSOR_MODE_INA228:  return "INA228 · 0.001A · 0.001V · 0.001W";
+    case SENSOR_MODE_ENCODER: return "TCUT1600X01 · 4.5°";
+    case SENSOR_MODE_VL53L1X: return "VL53L1X · 1mm";
+    default:                  return "";
+  }
+}
+
+// How many quantities the active sensor reports at once.
+int activeSensorValueCount()
+{
+  // However many the node last sent, which is its business, not ours.
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    return bleNodeValueCount > 0 ? bleNodeValueCount : 1;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_SCD41) return 3;   // CO2, 온도, 습도
+  if (activeSensorMode == SENSOR_MODE_INA228) return 3;  // 전류, 전압, 전력
+  if (activeSensorMode == SENSOR_MODE_ENCODER) return 2;  // 각도, 각속도
+  if (activeSensorMode == SENSOR_MODE_DPS310) return 2;  // 온도, 기압
+  return 1;
 }
 
 bool activeSensorSupportsDirectIsl()
@@ -2623,6 +3388,9 @@ bool activeSensorSupportsDirectIsl()
          activeSensorMode == SENSOR_MODE_TMP117 ||
          activeSensorMode == SENSOR_MODE_TSL2591 ||
          activeSensorMode == SENSOR_MODE_VL53L1X ||
+         activeSensorMode == SENSOR_MODE_INA228 ||
+         activeSensorMode == SENSOR_MODE_ENCODER ||
+         (activeSensorMode == SENSOR_MODE_BLE && bleIslMappedCount() > 0) ||
          (SCD41_DIRECT_ISL_ENABLED && activeSensorMode == SENSOR_MODE_SCD41);
 }
 
@@ -2668,6 +3436,22 @@ static void formatPrimaryValueText(char *out, size_t outSize, float value, bool 
     if (includeName) snprintf(out, outSize, "거리: %.0fmm", value);
     else snprintf(out, outSize, "%.0f", value);
   }
+  else if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    if (includeName) snprintf(out, outSize, "전류: %.3fA", value);
+    else snprintf(out, outSize, "%.3f", value);
+  }
+  else if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    if (includeName) snprintf(out, outSize, "각도: %.1f°", value);
+    else snprintf(out, outSize, "%.1f", value);
+  }
+  else if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    // A node can be sending anything, so no assumption about decimals.
+    if (includeName) snprintf(out, outSize, "%s: %.4g%s", bleNodeQuantity[0], value, bleDisplayUnit(bleNodeUnit[0]));
+    else snprintf(out, outSize, "%.4g", value);
+  }
   else if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     if (includeName) snprintf(out, outSize, "수온: %.2f℃", value);
@@ -2689,16 +3473,178 @@ static void formatPrimaryPlaceholderNumber(char *out, size_t outSize)
   if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "----");
   else if (activeSensorMode == SENSOR_MODE_TSL2591) snprintf(out, outSize, "----.-");
   else if (activeSensorMode == SENSOR_MODE_TMP117) snprintf(out, outSize, "--.---");
+  else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
+  else if (activeSensorMode == SENSOR_MODE_ENCODER) snprintf(out, outSize, "---.-");
   else if (activeSensorMode == SENSOR_MODE_VL53L1X) snprintf(out, outSize, "----");
   else snprintf(out, outSize, "--.--");
 }
 
-// The value label is width-to-content, so the unit has to be re-pinned every
-// time the number changes width.
-static void realignPrimaryUnit()
+// Arrange the readings for however many the active sensor reports: one gets
+// the full width at 64 px, two or three share the row at 48 px. Called when
+// the sensor changes, and again after each update because the labels are
+// width-to-content and the units sit against their right edge.
+static void refreshMeasureValueLayout()
 {
-  if (labelTempBig == NULL || labelMeasurePrimaryUnit == NULL) return;
-  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+  if (labelValueNumber[0] == NULL) return;
+
+  const int count = activeSensorValueCount();
+  const int colLeftX = 24;
+  const int colLeftW = 700;
+  const int contentTop = 58;
+  const int columnW = colLeftW / (count > 0 ? count : 1);
+
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    const bool used = (i < count);
+
+    if (!used)
+    {
+      lv_obj_add_flag(labelValueCaption[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(labelValueNumber[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(labelValueUnit[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    lv_obj_clear_flag(labelValueCaption[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(labelValueNumber[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(labelValueUnit[i], LV_OBJ_FLAG_HIDDEN);
+
+    const int x = colLeftX + i * columnW;
+
+    lv_obj_set_style_text_font(labelValueNumber[i], count == 1 ? FONT_VALUE : FONT_VALUE_SMALL, 0);
+
+    lv_obj_set_width(labelValueCaption[i], columnW - 12);
+    lv_obj_align(labelValueCaption[i], LV_ALIGN_TOP_LEFT, x, contentTop + 34);
+    lv_obj_align(labelValueNumber[i], LV_ALIGN_TOP_LEFT, x, contentTop + 56);
+    lv_obj_align_to(labelValueUnit[i], labelValueNumber[i], LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -8);
+  }
+}
+
+// What each column is showing, for the active sensor.
+static void measureValueMeta(int index, const char **caption, const char **unit)
+{
+  *caption = "";
+  *unit = "";
+
+  if (activeSensorMode == SENSOR_MODE_SCD41)
+  {
+    if (index == 0) { *caption = "이산화탄소"; *unit = "ppm"; }
+    else if (index == 1) { *caption = "온도"; *unit = "℃"; }
+    else if (index == 2) { *caption = "습도"; *unit = "%"; }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    if (index >= 0 && index < BLE_LINK_MAX_VALUES)
+    {
+      *caption = bleNodeQuantity[index];
+      *unit = bleDisplayUnit(bleNodeUnit[index]);
+    }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    if (index == 0) { *caption = "각도"; *unit = "°"; }
+    else if (index == 1) { *caption = "각속도"; *unit = "°/s"; }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    if (index == 0) { *caption = "전류"; *unit = "A"; }
+    else if (index == 1) { *caption = "전압"; *unit = "V"; }
+    else if (index == 2) { *caption = "전력"; *unit = "W"; }
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_DPS310)
+  {
+    if (index == 0) { *caption = "온도"; *unit = "℃"; }
+    else if (index == 1) { *caption = "기압"; *unit = "hPa"; }
+    return;
+  }
+
+  if (index == 0)
+  {
+    *caption = activePrimaryName();
+    *unit = activePrimaryUnit();
+  }
+}
+
+// Whether the graph draws a second line, and whether a given sample belongs on
+// it. Both used to ask activeSensorHasPressure(), which is true for the DPS310
+// alone, so a node reporting 온도 and 기압 - or the encoder, or the INA228 -
+// plotted only its first quantity while the readout showed both.
+static bool secondaryPlotAxisOn()
+{
+  return activeSensorValueCount() >= 2;
+}
+
+static bool secondaryPlotValueValid(float value)
+{
+  if (isnan(value)) return false;
+
+  // NO_PRESSURE_VALUE is the DPS310's own "no reading" sentinel and is not NaN.
+  return !activeSensorHasPressure() || pressureValueValid(value);
+}
+
+// The last reading taken while not recording. Recording is what 측정 시작
+// starts; seeing is not, and a sensor that shows nothing until then looks
+// broken.
+static float previewValues[MEASURE_VALUE_MAX] = { NAN, NAN, NAN };
+bool previewValid = false;
+
+// How many decimals a sensor's second and third readings deserve. The first
+// column has formatPrimaryValueText() for this; these needed the same.
+static void formatMeasureExtraValue(float value, char *out, size_t outSize)
+{
+  if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "%.3f", value);
+  else if (activeSensorMode == SENSOR_MODE_BLE) snprintf(out, outSize, "%.4g", value);
+  else snprintf(out, outSize, "%.1f", value);
+}
+
+// Placeholder digits at the width each value will occupy, so the layout does
+// not jump when the first reading lands.
+static void measureValuePlaceholder(int index, char *out, size_t outSize)
+{
+  if (index == 0)
+  {
+    formatPrimaryPlaceholderNumber(out, outSize);
+    return;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_SCD41) snprintf(out, outSize, "--.-");
+  else if (activeSensorMode == SENSOR_MODE_INA228) snprintf(out, outSize, "-.---");
+  else if (activeSensorMode == SENSOR_MODE_ENCODER) snprintf(out, outSize, "---.-");
+  else if (activeSensorMode == SENSOR_MODE_BLE) snprintf(out, outSize, "----");
+  else snprintf(out, outSize, "----.-");
+}
+
+void refreshMeasureValueCaptions()
+{
+  if (labelValueCaption[0] == NULL) return;
+
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    const char *caption = "";
+    const char *unit = "";
+    measureValueMeta(i, &caption, &unit);
+
+    lv_label_set_text(labelValueCaption[i], caption);
+    lv_label_set_text(labelValueUnit[i], unit);
+
+    // Every other sensor's unit is a string literal in this file, so the
+    // build-time subset font is guaranteed to cover it. A BLE node names its
+    // own unit at runtime and nothing here can have subset a glyph for it, so
+    // that one case falls back to the full-range face.
+    lv_obj_set_style_text_font(
+      labelValueUnit[i],
+      activeSensorMode == SENSOR_MODE_BLE ? FONT_KR : FONT_KR_HEAD,
+      0
+    );
+  }
 }
 
 void updateActiveSensorUiLabels()
@@ -2708,51 +3654,26 @@ void updateActiveSensorUiLabels()
   if (labelMeasureSensorName)
   {
     lv_label_set_text(labelMeasureSensorName, activeMeasurementTitle());
+
+    // Same reason as the unit above: this title is the node's own wording.
+    lv_obj_set_style_text_font(
+      labelMeasureSensorName,
+      activeSensorMode == SENSOR_MODE_BLE ? FONT_KR : FONT_KR_HEAD,
+      0
+    );
   }
 
-  if (labelMeasurePrimaryUnit)
-  {
-    lv_label_set_text(labelMeasurePrimaryUnit, activePrimaryUnit());
-  }
+  refreshMeasureValueCaptions();
 
-  if (labelTempBig)
+  if (labelValueNumber[0])
   {
-    formatPrimaryPlaceholderNumber(text, sizeof(text));
-    lv_label_set_text(labelTempBig, text);
-    realignPrimaryUnit();
-  }
+    for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+    {
+      measureValuePlaceholder(i, text, sizeof(text));
+      lv_label_set_text(labelValueNumber[i], text);
+    }
 
-  if (labelPressureBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-    {
-      lv_label_set_text(labelPressureBig, "온도: --.-℃");
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else if (activeSensorHasPressure())
-    {
-      lv_label_set_text(labelPressureBig, "압력: ----.-hPa");
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelPressureBig, "");
-      lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
-
-  if (labelHumidityBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-    {
-      lv_label_set_text(labelHumidityBig, "습도: --.-%");
-      lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelHumidityBig, "");
-      lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
+    refreshMeasureValueLayout();
   }
 
   if (labelMeasureTempAxisTitle)
@@ -2776,21 +3697,7 @@ void updateActiveSensorUiLabels()
     }
   }
 
-  if (tableData)
-  {
-    snprintf(text, sizeof(text), "%s(%s)", activePrimaryName(), activePrimaryUnit());
-    lv_table_set_cell_value(tableData, 0, 2, text);
-
-    if (activeSensorMode == SENSOR_MODE_SCD41)
-      lv_table_set_cell_value(tableData, 0, 3, "T/RH");
-    else if (activeSensorHasPressure())
-    {
-      snprintf(text, sizeof(text), "%s(%s)", activeSecondaryName(), activeSecondaryUnit());
-      lv_table_set_cell_value(tableData, 0, 3, text);
-    }
-    else
-      lv_table_set_cell_value(tableData, 0, 3, "-");
-  }
+  applyTableValueHeaders();
 }
 
 // Show exactly one of 시작 / 정지, and keep the send-status rail truthful about
@@ -2870,89 +3777,67 @@ void refreshMeasureControls()
 
 static void refreshLatestMeasurementLabels()
 {
-  if (labelTempBig == NULL) return;
+  if (labelValueNumber[0] == NULL) return;
+
   char text[96];
 
   if (sampleCount <= 0)
   {
-    formatPrimaryPlaceholderNumber(text, sizeof(text));
-    lv_label_set_text(labelTempBig, text);
-
-    if (labelPressureBig)
+    // Nothing recorded yet, but the sensor is still reading. Showing the live
+    // value here is what makes choosing a sensor feel like it did something:
+    // before this the screen sat on a row of dashes until 측정 시작 was
+    // pressed, which read as "the sensor did not open".
+    for (int i = 0; i < MEASURE_VALUE_MAX; i++)
     {
-      if (activeSensorMode == SENSOR_MODE_SCD41)
+      if (previewValid && !isnan(previewValues[i]))
       {
-        lv_label_set_text(labelPressureBig, "온도: --.-℃");
-        lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-      }
-      else if (activeSensorHasPressure())
-      {
-        lv_label_set_text(labelPressureBig, "압력: ----.-hPa");
-        lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
+        if (i == 0) formatPrimaryValueText(text, sizeof(text), previewValues[0], false);
+        else formatMeasureExtraValue(previewValues[i], text, sizeof(text));
       }
       else
       {
-        lv_label_set_text(labelPressureBig, "");
-        lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
+        measureValuePlaceholder(i, text, sizeof(text));
       }
+
+      lv_label_set_text(labelValueNumber[i], text);
     }
 
-    if (labelHumidityBig)
-    {
-      if (activeSensorMode == SENSOR_MODE_SCD41)
-      {
-        lv_label_set_text(labelHumidityBig, "습도: --.-%");
-        lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-      }
-      else
-      {
-        lv_label_set_text(labelHumidityBig, "");
-        lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-      }
-    }
+    refreshMeasureValueLayout();
     return;
   }
 
   const int idx = sampleCount - 1;
+
+  // Column 0 is always the sensor's headline quantity.
   formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
-  lv_label_set_text(labelTempBig, text);
-  realignPrimaryUnit();
+  lv_label_set_text(labelValueNumber[0], text);
 
-  if (labelPressureBig)
+  // Columns 1 and 2 carry whatever else the part measured in the same reading:
+  // 기압 for DPS310, 온도 and 습도 for SCD41, both of a node's quantities over
+  // BLE. Each is a bare number under its own caption, at the same size as the
+  // first - a sensor that measures two things has two readings, not one
+  // reading and a footnote.
+  //
+  // This is driven by activeSensorValueCount(), not by a branch per sensor.
+  // It was a chain of branches and had grown one arm per part, and the newest
+  // one - a BLE node - was simply missing from it, so its 기압 column stayed
+  // blank while the value was arriving, being logged and being uploaded.
+  const float extraValues[2] = { pressureHistory[idx], humidityHistory[idx] };
+  const int shownValues = activeSensorValueCount();
+
+  for (int i = 1; i < shownValues && i < MEASURE_VALUE_MAX; i++)
   {
-    if (activeSensorMode == SENSOR_MODE_SCD41 && !isnan(pressureHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "온도: %.1f℃", pressureHistory[idx]);
-      lv_label_set_text(labelPressureBig, text);
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else if (activeSensorHasPressure() && pressureValueValid(pressureHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "압력: %.1fhPa", pressureHistory[idx]);
-      lv_label_set_text(labelPressureBig, text);
-      lv_obj_clear_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelPressureBig, "");
-      lv_obj_add_flag(labelPressureBig, LV_OBJ_FLAG_HIDDEN);
-    }
+    const float value = extraValues[i - 1];
+    const bool usable =
+      !isnan(value) && (i != 1 || !activeSensorHasPressure() || pressureValueValid(value));
+
+    if (usable) formatMeasureExtraValue(value, text, sizeof(text));
+    else measureValuePlaceholder(i, text, sizeof(text));
+
+    lv_label_set_text(labelValueNumber[i], text);
   }
 
-  if (labelHumidityBig)
-  {
-    if (activeSensorMode == SENSOR_MODE_SCD41 && !isnan(humidityHistory[idx]))
-    {
-      snprintf(text, sizeof(text), "습도: %.1f%%", humidityHistory[idx]);
-      lv_label_set_text(labelHumidityBig, text);
-      lv_obj_clear_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-    else
-    {
-      lv_label_set_text(labelHumidityBig, "");
-      lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
+  refreshMeasureValueLayout();
 }
 
 
@@ -3131,8 +4016,376 @@ bool readDs18b20(float *temperatureC)
   return true;
 }
 
+// The INA228 has 16-bit configuration registers; the byte-wide helper cannot
+// reach them.
+static bool ina228WriteRegister16(uint8_t reg, uint16_t value)
+{
+  softI2cStart();
+
+  bool ok = softI2cWriteByte(INA228_ADDR << 1);
+  ok = ok && softI2cWriteByte(reg);
+  ok = ok && softI2cWriteByte((uint8_t)(value >> 8));
+  ok = ok && softI2cWriteByte((uint8_t)(value & 0xFF));
+
+  softI2cStop();
+  return ok;
+}
+
+// VBUS, CURRENT and POWER are 24-bit. Returns the raw register contents.
+static bool ina228ReadRegister24(uint8_t reg, uint32_t *out)
+{
+  uint8_t buf[3] = {0, 0, 0};
+  if (!softI2cReadRegisters(INA228_ADDR, reg, buf, 3)) return false;
+
+  *out = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+  return true;
+}
+
+bool ina228Begin()
+{
+  sdaHigh();
+  sclHigh();
+  delay(10);
+  softI2cRecoverBus();
+
+  ina228Ready = false;
+  ina228LastPowerW = NAN;
+
+  uint8_t idBuf[2] = {0, 0};
+  if (!softI2cReadRegisters(INA228_ADDR, INA228_REG_MANUFACTURER_ID, idBuf, 2))
+  {
+    Serial.println("[INA228] no response at 0x40");
+    return false;
+  }
+
+  const uint16_t manufacturer = ((uint16_t)idBuf[0] << 8) | idBuf[1];
+  if (manufacturer != INA228_MANUFACTURER_TI)
+  {
+    Serial.printf("[INA228] unexpected manufacturer id 0x%04X\n", manufacturer);
+    return false;
+  }
+
+  // Reset, then let the part come back up.
+  ina228WriteRegister16(INA228_REG_CONFIG, 0x8000);
+  delay(5);
+
+  // Continuous conversion of bus, shunt and temperature, 1052 µs each,
+  // averaged over 16 samples — steady enough to read once a second.
+  if (!ina228WriteRegister16(INA228_REG_ADC_CONFIG, 0xFB6A))
+  {
+    Serial.println("[INA228] ADC config write failed");
+    return false;
+  }
+
+  // CURRENT_LSB = max current / 2^19, and the calibration register scales the
+  // shunt voltage into that unit.
+  ina228CurrentLsb = INA228_MAX_CURRENT / 524288.0f;
+  const float shuntCal = 13107.2e6f * ina228CurrentLsb * INA228_SHUNT_OHMS;
+  const uint16_t shuntCalReg = (uint16_t)(shuntCal + 0.5f);
+
+  if (!ina228WriteRegister16(INA228_REG_SHUNT_CAL, shuntCalReg))
+  {
+    Serial.println("[INA228] shunt calibration write failed");
+    return false;
+  }
+
+  Serial.printf(
+    "[INA228] ready: shunt %.3f ohm, max %.1f A, cal %u\n",
+    INA228_SHUNT_OHMS, INA228_MAX_CURRENT, (unsigned)shuntCalReg
+  );
+
+  ina228Ready = true;
+  return true;
+}
+
+// Bus voltage in V, current in A, power in W.
+bool readIna228(float *voltageV, float *currentA, float *powerW)
+{
+  if (!ina228Ready || voltageV == NULL || currentA == NULL || powerW == NULL) return false;
+
+  uint32_t rawVbus = 0;
+  uint32_t rawCurrent = 0;
+  uint32_t rawPower = 0;
+
+  if (!ina228ReadRegister24(INA228_REG_VBUS, &rawVbus)) return false;
+  if (!ina228ReadRegister24(INA228_REG_CURRENT, &rawCurrent)) return false;
+  if (!ina228ReadRegister24(INA228_REG_POWER, &rawPower)) return false;
+
+  // VBUS and CURRENT carry their value in the upper 20 bits.
+  *voltageV = (float)(rawVbus >> 4) * INA228_VBUS_LSB_V;
+
+  int32_t current20 = (int32_t)(rawCurrent >> 4);
+  if (current20 & 0x00080000) current20 -= 0x00100000;   // sign-extend from 20 bits
+  *currentA = (float)current20 * ina228CurrentLsb;
+
+  *powerW = (float)rawPower * INA228_POWER_LSB_K * ina228CurrentLsb;
+
+  ina228LastPowerW = *powerW;
+  return true;
+}
+
+void encoderEnd();
+void encoderZero();
+
+// Addresses the firmware already knows how to talk to, so a scan can say
+// which of what it found is a sensor the board supports.
+static const char *knownI2cDeviceName(uint8_t addr)
+{
+  switch (addr)
+  {
+    case 0x29: return "VL53L1X 거리";
+    case 0x40: return "INA228 전압·전류";
+    case 0x48: return "TMP117 정밀온도";
+    case 0x62: return "SCD41 이산화탄소";
+    case 0x76: case 0x77: return "DPS310 온도·기압";
+    default: return NULL;
+  }
+}
+
+// Walks the 7-bit address space and reports every device that acknowledges.
+// Adding a sensor starts here: a part whose address does not appear is a
+// wiring or power problem, and no amount of driver work will help.
+int scanSensorI2cBus(char *summary, size_t summaryLen)
+{
+  // Driving the bus with the encoder's interrupts still attached would fire
+  // the ISR on every clock edge of every address probe.
+  encoderEnd();
+
+  sdaHigh();
+  sclHigh();
+  delay(5);
+  softI2cRecoverBus();
+
+  int found = 0;
+  if (summary && summaryLen) summary[0] = '\0';
+
+  Serial.println("[I2C] scanning sensor bus (GPIO2/3)");
+
+  for (uint8_t addr = 0x08; addr <= 0x77; addr++)
+  {
+    softI2cStart();
+    const bool ack = softI2cWriteByte((uint8_t)(addr << 1));
+    softI2cStop();
+
+    if (!ack) continue;
+
+    found++;
+    const char *known = knownI2cDeviceName(addr);
+
+    Serial.printf("[I2C] 0x%02X  %s\n", addr, known ? known : "(모르는 장치)");
+
+    if (summary && summaryLen)
+    {
+      char entry[64];
+      snprintf(entry, sizeof(entry), "%s0x%02X %s",
+               summary[0] ? " · " : "", addr, known ? known : "?");
+      strncat(summary, entry, summaryLen - strlen(summary) - 1);
+    }
+  }
+
+  Serial.printf("[I2C] %d device(s)\n", found);
+
+  if (found == 0 && summary && summaryLen)
+  {
+    snprintf(summary, summaryLen, "응답한 장치 없음 - 전원과 SDA/SCL 배선 확인");
+  }
+
+  return found;
+}
+
+// Standard quadrature table: index by the previous two-bit state followed by
+// the current one, and the value is the direction. 0 covers both the invalid
+// double transitions and no movement.
+static const int8_t kQuadratureStep[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+static void IRAM_ATTR encoderIsr()
+{
+  const uint8_t state = (uint8_t)((digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B));
+  encoderCount += kQuadratureStep[(encoderLastState << 2) | state];
+  encoderLastState = state;
+  encoderEdgeCount = encoderEdgeCount + 1;
+}
+
+bool encoderBegin()
+{
+  pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+  pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+
+  encoderCount = 0;
+  encoderPrevCount = 0;
+  encoderPrevMs = millis();
+  encoderLastRateDegPerS = NAN;
+  encoderLastState = (uint8_t)((digitalRead(ENCODER_PIN_A) << 1) | digitalRead(ENCODER_PIN_B));
+
+  if (!encoderReady)
+  {
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), encoderIsr, CHANGE);
+    encoderReady = true;
+  }
+
+  Serial.printf(
+    "[ENCODER] ready on GPIO%d/%d, %d counts per turn\n",
+    ENCODER_PIN_A, ENCODER_PIN_B, ENCODER_COUNTS_PER_REV
+  );
+
+  // Nothing to probe: an idle encoder is indistinguishable from an absent one
+  // until it is turned, so report ready and let the reading show the truth.
+  return true;
+}
+
+// Back to zero degrees without disturbing the interrupts.
+void encoderZero()
+{
+  noInterrupts();
+  encoderCount = 0;
+  interrupts();
+
+  encoderPrevCount = 0;
+  encoderPrevMs = millis();
+  encoderLastRateDegPerS = NAN;
+}
+
+// Hands the two pins back so the soft-I2C driver can drive them again.
+void encoderEnd()
+{
+  if (!encoderReady) return;
+
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A));
+  detachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B));
+  encoderReady = false;
+
+  Serial.println("[ENCODER] detached");
+}
+
+// Angle in degrees since the run started, and how fast it is turning.
+bool readEncoder(float *angleDeg, float *rateDegPerS)
+{
+  if (!encoderReady || angleDeg == NULL || rateDegPerS == NULL) return false;
+
+  noInterrupts();
+  const int32_t count = encoderCount;
+  interrupts();
+
+  const unsigned long now = millis();
+  const float degPerCount = 360.0f / (float)ENCODER_COUNTS_PER_REV;
+
+  *angleDeg = (float)count * degPerCount;
+
+  const unsigned long elapsed = now - encoderPrevMs;
+  if (elapsed >= 200)
+  {
+    const float deltaDeg = (float)(count - encoderPrevCount) * degPerCount;
+    encoderLastRateDegPerS = deltaDeg * 1000.0f / (float)elapsed;
+    encoderPrevCount = count;
+    encoderPrevMs = now;
+  }
+
+  *rateDegPerS = encoderLastRateDegPerS;
+
+  Serial.printf(
+    "[ENCODER] A=%d B=%d edges=%lu count=%ld angle=%.1f\n",
+    digitalRead(ENCODER_PIN_A), digitalRead(ENCODER_PIN_B),
+    (unsigned long)encoderEdgeCount, (long)count, *angleDeg
+  );
+
+  return true;
+}
+
+// Pins this board leaves free and that are safe to switch to an input with a
+// pull-up. Deliberately no pin above 20: the ESP32-P4 runs its flash and PSRAM
+// on the high pads, and reconfiguring one of those would take the board down.
+// 2, 3, 7, 8, 14-19, 21-23 and 27 are left out because they are already
+// driving the sensor bus, the touch panel, the radio link or the backlight.
+static const uint8_t kEncoderCandidatePins[] = { SOFT_SDA, SOFT_SCL, 4, 5, 6, 9, 10, 11, 12, 13, 20 };
+
+// Which of the free pins move while the wheel turns. If the encoder is wired
+// somewhere other than GPIO4/5 this finds it, and if nothing moves anywhere
+// then the signal is not reaching the board at all.
+void encoderFindActivePins(char *out, size_t outSize)
+{
+  if (out == NULL || outSize == 0) return;
+
+  const int pinCount = (int)(sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0]));
+  int changes[sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0])] = { 0 };
+  int last[sizeof(kEncoderCandidatePins) / sizeof(kEncoderCandidatePins[0])];
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    pinMode(kEncoderCandidatePins[i], INPUT_PULLUP);
+  }
+
+  delay(2);
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    last[i] = digitalRead(kEncoderCandidatePins[i]);
+  }
+
+  const unsigned long until = millis() + 3000;
+
+  while ((long)(millis() - until) < 0)
+  {
+    for (int i = 0; i < pinCount; i++)
+    {
+      const int now = digitalRead(kEncoderCandidatePins[i]);
+      if (now != last[i]) { changes[i]++; last[i] = now; }
+    }
+
+    delayMicroseconds(100);
+  }
+
+  out[0] = '\0';
+  int moved = 0;
+
+  for (int i = 0; i < pinCount; i++)
+  {
+    Serial.printf("[ENCODER] GPIO%-2d level=%d changes=%d\n",
+                  kEncoderCandidatePins[i], last[i], changes[i]);
+
+    if (changes[i] < 2) continue;
+
+    char entry[32];
+    snprintf(entry, sizeof(entry), "%sGPIO%d(%d회)",
+             moved ? ", " : "", kEncoderCandidatePins[i], changes[i]);
+    strncat(out, entry, outSize - strlen(out) - 1);
+    moved++;
+  }
+
+  if (moved == 0)
+  {
+    snprintf(out, outSize,
+             "움직인 핀 없음 - 배선/3.3V 전원, 그리고 슬릿 원판이 센서 홈을 지나는지 확인");
+  }
+}
+
 bool activeSensorBegin()
 {
+  // The encoder holds SOFT_SDA/SOFT_SCL as interrupt inputs, so every other
+  // mode has to take them back before it touches the bus.
+  if (activeSensorMode != SENSOR_MODE_ENCODER)
+  {
+    encoderEnd();
+  }
+
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    return encoderBegin();
+  }
+
+  // Nothing to initialise: the node is already connected, or it is not, and
+  // that was settled on the 블루투스 screen.
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    bleNodeRefreshMetadata();
+    return bleLinkSlotIsSubscribed(activeBleSlot);
+  }
+
   if (activeSensorMode == SENSOR_MODE_DS18B20)
   {
     return ds18b20Begin();
@@ -3159,6 +4412,11 @@ bool activeSensorBegin()
   if (activeSensorMode == SENSOR_MODE_VL53L1X)
   {
     return vl53l1xBegin();
+  }
+
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    return ina228Begin();
   }
 
   return dps310Begin();
@@ -3205,6 +4463,63 @@ bool readActiveSensor(float *primaryValue, float *secondaryValue)
     return true;
   }
 
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    float busVoltage = NAN;
+    float powerW = NAN;
+    if (!readIna228(&busVoltage, primaryValue, &powerW)) return false;
+    *secondaryValue = busVoltage;   // power rides along in ina228LastPowerW
+    return true;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    float rateDegPerS = NAN;
+    if (!readEncoder(primaryValue, &rateDegPerS)) return false;
+    *secondaryValue = rateDegPerS;
+    return true;
+  }
+
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    const int count = bleNodeValueCount;
+    if (count <= 0) return false;
+
+    float values[BLE_LINK_MAX_VALUES] = { NAN, NAN, NAN };
+    int read = 0;
+
+    // Each value is taken from whichever link reported it. Two sensors sample
+    // on their own clocks, so a row can mix readings up to a second apart -
+    // which is the same skew a single sensor already has between its own
+    // quantities, and well inside what a school experiment resolves.
+    for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
+    {
+      uint32_t ageMs = 0;
+
+      if (!bleLinkValueAt(bleValueSlot[i], bleValueIndex[i], &values[i], NULL, NULL, &ageMs))
+      {
+        continue;
+      }
+
+      // A node that has gone quiet leaves its column empty rather than
+      // repeating its last reading as though it were current.
+      if (ageMs > BLE_READING_MAX_AGE_MS)
+      {
+        values[i] = NAN;
+        continue;
+      }
+
+      read++;
+    }
+
+    if (read == 0) return false;
+
+    *primaryValue = values[0];
+    *secondaryValue = values[1];
+    bleNodeThirdValue = values[2];
+    return true;
+  }
+
   return readDps310(primaryValue, secondaryValue);
 }
 
@@ -3215,6 +4530,9 @@ void setActiveSensorMode(int mode)
       mode != SENSOR_MODE_SCD41 &&
       mode != SENSOR_MODE_TSL2591 &&
       mode != SENSOR_MODE_TMP117 &&
+      mode != SENSOR_MODE_INA228 &&
+      mode != SENSOR_MODE_ENCODER &&
+      mode != SENSOR_MODE_BLE &&
       mode != SENSOR_MODE_VL53L1X)
   {
     return;
@@ -3271,7 +4589,10 @@ void setActiveSensorMode(int mode)
 
   if (labelStatus)
   {
-    lv_label_set_text(labelStatus, dpsReady ? "준비" : "센서 초기화 실패");
+    // A node is not initialised, it is linked or not; "초기화 실패" was the
+    // wrong word for a board that had simply not been given a node yet.
+    lv_label_set_text(labelStatus, dpsReady ? "준비"
+                                   : (mode == SENSOR_MODE_BLE ? "노드 연결 대기" : "센서 초기화 실패"));
   }
 
   updateActiveSensorUiLabels();
@@ -3287,6 +4608,7 @@ void setActiveSensorMode(int mode)
   clearChart();
   chartUiDirty = true;
   refreshHomeSensorLabels();
+  syncWiredSensorDropdown();
 
   if (activeSensorMode == SENSOR_MODE_SCD41)
   {
@@ -3303,6 +4625,26 @@ void setActiveSensorMode(int mode)
   else if (activeSensorMode == SENSOR_MODE_VL53L1X)
   {
     setIslStatusText(dpsReady ? "거리: VL53L1X 준비" : "VL53L1X 인식 실패: 0x29 / 배선 확인");
+  }
+  else if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    setIslStatusText(dpsReady ? "전압·전류·전력: INA228 준비" : "INA228 인식 실패: 0x40 / 배선 확인");
+  }
+  else if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    setIslStatusText("회전: 엔코더 준비 / 센서포트, 3.3V 연결");
+  }
+  else if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    char text[96];
+    char skipped[120] = "";
+    bleIslUnmappedSummary(skipped, sizeof(skipped));
+
+    snprintf(text, sizeof(text), "블루투스: %s / %s%s%s",
+             bleLinkSlotName(activeBleSlot)[0] ? bleLinkSlotName(activeBleSlot) : "-",
+             bleLinkSlotState(activeBleSlot),
+             skipped[0] ? " / 전송 제외: " : "", skipped);
+    setIslStatusText(text);
   }
 }
 
@@ -3416,7 +4758,7 @@ bool initSdCard()
       return false;
     }
 
-    fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit,raw1,raw2\n");
+    fprintf(file, CSV_HEADER_LINE ",raw1,raw2\n");
     fclose(file);
 
     Serial.println("CSV file created");
@@ -3473,6 +4815,46 @@ static void reportCsvWriteFailure()
   updateSdStatusLabels();
 }
 
+// Every reading a sensor produces, laid out as value,unit pairs for one row.
+// Only the DPS310 used to reach the second column, so the SCD41's humidity and
+// the INA228's voltage and power were measured, shown on screen and uploaded
+// to the platform, but never landed on the card. Columns a sensor does not
+// produce stay empty so a file that mixes sensors still lines up.
+static void formatCsvValueColumns(
+  float primaryValue, float secondaryValue, float thirdValue,
+  char *out, size_t outSize
+)
+{
+  const float values[CSV_VALUE_COLUMNS] = { primaryValue, secondaryValue, thirdValue };
+  const int count = activeSensorValueCount();
+
+  out[0] = '\0';
+
+  for (int i = 0; i < CSV_VALUE_COLUMNS; i++)
+  {
+    char cell[64];
+    const bool usable =
+      i < count && !isnan(values[i]) &&
+      (i != 1 || !activeSensorHasPressure() || pressureValueValid(values[i]));
+
+    if (usable)
+    {
+      const char *caption = "";
+      const char *unit = "";
+      measureValueMeta(i, &caption, &unit);
+      snprintf(cell, sizeof(cell), "%s%.4f,%s", i ? "," : "", values[i], unit);
+    }
+    else
+    {
+      snprintf(cell, sizeof(cell), "%s,", i ? "," : "");
+    }
+
+    strncat(out, cell, outSize - strlen(out) - 1);
+  }
+}
+
+static float thirdValueForActiveSensor();
+
 void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
 {
   if (!csvLoggingEnabled) return;
@@ -3491,38 +4873,20 @@ void appendCsv(uint32_t timeS, float primaryValue, float secondaryValue)
     csvRowsSinceFlush = 0;
   }
 
-  int written;
+  char columns[160];
+  formatCsvValueColumns(primaryValue, secondaryValue, thirdValueForActiveSensor(),
+                        columns, sizeof(columns));
 
-  if (activeSensorHasPressure() && pressureValueValid(secondaryValue))
-  {
-    written = fprintf(
-      csvFile,
-      "%d,%lu,%s,%.4f,%s,%.4f,%s,%ld,%ld\n",
-      measurementCount,
-      (unsigned long)timeS,
-      activeSensorName(),
-      primaryValue,
-      activePrimaryUnit(),
-      secondaryValue,
-      activeSecondaryUnit(),
-      (long)lastRawTemp,
-      (long)lastRawPressure
-    );
-  }
-  else
-  {
-    written = fprintf(
-      csvFile,
-      "%d,%lu,%s,%.4f,%s,,,%ld,%ld\n",
-      measurementCount,
-      (unsigned long)timeS,
-      activeSensorName(),
-      primaryValue,
-      activePrimaryUnit(),
-      (long)lastRawTemp,
-      (long)lastRawPressure
-    );
-  }
+  const int written = fprintf(
+    csvFile,
+    "%d,%lu,%s,%s,%ld,%ld\n",
+    measurementCount,
+    (unsigned long)timeS,
+    activeSensorName(),
+    columns,
+    (long)lastRawTemp,
+    (long)lastRawPressure
+  );
 
   if (written < 0)
   {
@@ -3763,6 +5127,9 @@ lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
   lv_obj_set_style_pad_all(panel, 0, 0);
   lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_OFF);
+  // A tap on a panel is a tap on the screen behind it: that is what dismisses
+  // a keyboard.
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
   return panel;
 }
 
@@ -3850,76 +5217,114 @@ lv_obj_t *makeQuietButton(lv_obj_t *parent, const char *text, int x, int y,
   return btn;
 }
 
-// Selection styling lives here so it can be re-applied when the active sensor
-// changes, rather than being baked in when the tile is built.
-void styleSensorTile(lv_obj_t *tile, lv_obj_t *mark, bool selected)
+// A card the size of a fingertip's comfortable target, pressed-tint feedback,
+// no border: the same surface the panels use, but tappable.
+static lv_obj_t *makeCardButton(lv_obj_t *parent, int x, int y, int w, int h, lv_event_cb_t cb)
 {
-  if (tile == NULL) return;
-
-  lv_obj_set_style_bg_color(tile, lv_color_hex(selected ? UI_ACCENT_SOFT : UI_SURFACE), 0);
-  lv_obj_set_style_border_width(tile, selected ? 2 : 0, 0);
-  lv_obj_set_style_border_color(tile, lv_color_hex(UI_ACCENT), 0);
-
-  if (mark == NULL) return;
-
-  if (selected) lv_obj_clear_flag(mark, LV_OBJ_FLAG_HIDDEN);
-  else lv_obj_add_flag(mark, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_t *card = lv_btn_create(parent);
+  lv_obj_set_size(card, w, h);
+  lv_obj_align(card, LV_ALIGN_TOP_LEFT, x, y);
+  lv_obj_set_style_bg_color(card, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(UI_ACCENT_SOFT), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(card, 16, 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_set_style_outline_width(card, 0, 0);
+  lv_obj_set_style_shadow_width(card, 0, 0);
+  lv_obj_set_style_pad_all(card, 0, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(card, cb, LV_EVENT_CLICKED, NULL);
+  return card;
 }
 
-// Sensor tile. Named by the quantity it measures, not the part number, and
-// large enough that a fingertip cannot reach two of them at once. The caller
-// keeps `markOut` so the selected state can be moved later.
-lv_obj_t *makeSensorTile(lv_obj_t *parent, const char *name, const char *unit,
-                         int x, int y, int w, int h, bool selected,
-                         lv_event_cb_t cb, lv_obj_t **markOut)
+// A home card for one BLE node: its name, whether data is arriving, and up to
+// three live readings. Everything on it is written at runtime by
+// refreshHomeNodeCards(); the card itself is built empty and hidden.
+lv_obj_t *makeHomeNodeCard(lv_obj_t *parent, int position, int x, int y, int w, int h)
 {
-  lv_obj_t *tile = lv_btn_create(parent);
-  lv_obj_set_size(tile, w, h);
-  lv_obj_align(tile, LV_ALIGN_TOP_LEFT, x, y);
-  lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(tile, 16, 0);
-  lv_obj_set_style_outline_width(tile, 0, 0);
-  lv_obj_set_style_shadow_width(tile, 0, 0);
-  lv_obj_set_style_pad_all(tile, 0, 0);
-  lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_event_cb(tile, cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *card = makeCardButton(parent, x, y, w, h, home_node_card_event_cb);
 
-  lv_obj_t *nameLabel = lv_label_create(tile);
-  lv_label_set_text(nameLabel, name);
-  lv_obj_set_style_text_color(nameLabel, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_text_font(nameLabel, FONT_KR_HEAD, 0);
-  lv_obj_align(nameLabel, LV_ALIGN_TOP_LEFT, 18, 16);
+  homeNodeCardName[position] = makeLabel(card, "", 16, 12, UI_TEXT);
+  lv_obj_set_width(homeNodeCardName[position], 196);
+  lv_label_set_long_mode(homeNodeCardName[position], LV_LABEL_LONG_DOT);
 
-  lv_obj_t *unitLabel = lv_label_create(tile);
-  lv_label_set_text(unitLabel, unit);
-  lv_obj_set_style_text_color(unitLabel, lv_color_hex(UI_TEXT_3), 0);
-  lv_obj_set_style_text_font(unitLabel, FONT_KR_SMALL, 0);
-  lv_obj_align(unitLabel, LV_ALIGN_BOTTOM_LEFT, 18, -14);
+  homeNodeCardState[position] = makeSmallLabel(card, "", 0, 0, UI_TEXT_3);
+  lv_obj_set_width(homeNodeCardState[position], 84);
+  lv_obj_set_style_text_align(homeNodeCardState[position], LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_align(homeNodeCardState[position], LV_ALIGN_TOP_RIGHT, -16, 15);
 
-  lv_obj_t *mark = lv_label_create(tile);
-  lv_label_set_text(mark, "선택됨");
-  lv_obj_set_style_text_color(mark, lv_color_hex(UI_ACCENT), 0);
-  lv_obj_set_style_text_font(mark, FONT_KR_SMALL, 0);
-  lv_obj_align(mark, LV_ALIGN_BOTTOM_RIGHT, -18, -14);
+  for (int i = 0; i < HOME_NODE_CARD_ROWS; i++)
+  {
+    const int rowY = 44 + i * 30;
 
-  styleSensorTile(tile, mark, selected);
+    homeNodeCardQty[position][i] = makeSmallLabel(card, "", 16, rowY + 7, UI_TEXT_3);
+    lv_obj_set_width(homeNodeCardQty[position][i], 280);
+    lv_label_set_long_mode(homeNodeCardQty[position][i], LV_LABEL_LONG_CLIP);
 
-  if (markOut != NULL) *markOut = mark;
-  return tile;
+    // Digits only, so the 24 px subset face is safe here.
+    homeNodeCardNum[position][i] = lv_label_create(card);
+    lv_label_set_text(homeNodeCardNum[position][i], "");
+    lv_obj_set_style_text_font(homeNodeCardNum[position][i], FONT_KR_HEAD, 0);
+    lv_obj_set_style_text_color(homeNodeCardNum[position][i], lv_color_hex(UI_TEXT), 0);
+    lv_obj_set_width(homeNodeCardNum[position][i], 128);
+    lv_obj_set_style_text_align(homeNodeCardNum[position][i], LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(homeNodeCardNum[position][i], LV_LABEL_LONG_CLIP);
+    lv_obj_align(homeNodeCardNum[position][i], LV_ALIGN_TOP_LEFT, 102, rowY);
+
+    homeNodeCardUnit[position][i] = makeLabel(card, "", 238, rowY + 5, UI_TEXT_2);
+    lv_obj_set_width(homeNodeCardUnit[position][i], 58);
+    lv_label_set_long_mode(homeNodeCardUnit[position][i], LV_LABEL_LONG_CLIP);
+  }
+
+  lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
+  return card;
+}
+
+// One of the two ways to measure: a title and an arrow, nothing to read.
+lv_obj_t *makeModeCard(lv_obj_t *parent, const char *title, int x, int y, int w, int h, lv_event_cb_t cb)
+{
+  lv_obj_t *card = makeCardButton(parent, x, y, w, h, cb);
+
+  lv_obj_t *label = makeHeading(card, title, 24, 0, UI_TEXT);
+  lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
+
+  lv_obj_t *arrow = lv_label_create(card);
+  lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_font(arrow, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_color(arrow, lv_color_hex(UI_ACCENT), 0);
+  lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, -20, 0);
+
+  return card;
 }
 
 // Bottom tab bar, identical on every screen so "back" is always in one place.
 // Icons come from the Montserrat symbol range; the Korean caption sits below
 // them in the Hangul face, so each tab reads without relying on the glyph.
+// 홈 · 측정 · 기록 · 블루투스 · WiFi · 설정
+#define TAB_COUNT 6
+#define TAB_HOME 0
+#define TAB_MEASURE 1
+#define TAB_RECORD 2
+#define TAB_BLE 3
+#define TAB_WIFI 4
+#define TAB_DEVICE 5
+
 void createTabBar(lv_obj_t *parent, int activeIndex)
 {
-  static const char *tabIcons[4] = {
-    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST, LV_SYMBOL_SETTINGS
+  // 블루투스 and WiFi are where a lesson actually goes wrong - a node that
+  // dropped, a network that did not join - so they are one tap from anywhere
+  // rather than buried two levels into 설정.
+  static const char *tabIcons[TAB_COUNT] = {
+    LV_SYMBOL_HOME, LV_SYMBOL_PLAY, LV_SYMBOL_LIST,
+    LV_SYMBOL_BLUETOOTH, LV_SYMBOL_WIFI, LV_SYMBOL_SETTINGS
   };
-  static const char *tabNames[4] = { "홈", "측정", "기록", "설정" };
+  static const char *tabNames[TAB_COUNT] = {
+    "홈", "측정", "기록", "블루투스", "WiFi", "설정"
+  };
 
-  lv_event_cb_t tabCallbacks[4] = {
-    go_home_event_cb, go_measure_event_cb, go_csv_event_cb, go_settings_event_cb
+  lv_event_cb_t tabCallbacks[TAB_COUNT] = {
+    go_home_event_cb, go_measure_event_cb, go_csv_event_cb,
+    go_ble_event_cb, go_settings_event_cb, go_device_event_cb
   };
 
   lv_obj_t *bar = lv_obj_create(parent);
@@ -3943,9 +5348,9 @@ void createTabBar(lv_obj_t *parent, int activeIndex)
   lv_obj_set_style_radius(hairline, 0, 0);
   lv_obj_clear_flag(hairline, LV_OBJ_FLAG_CLICKABLE);
 
-  const int tabWidth = LCD_H_RES / 4;
+  const int tabWidth = LCD_H_RES / TAB_COUNT;
 
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < TAB_COUNT; i++)
   {
     const bool active = (i == activeIndex);
     const uint32_t tint = active ? UI_ACCENT : UI_TEXT_3;
@@ -4036,6 +5441,17 @@ lv_obj_t *makeArrowButton(lv_obj_t *parent, const char *text, int x, int y, int 
   return btn;
 }
 
+// 화면마다 한 줄씩 손으로 적어 두면 나중에 만든 화면이 빠집니다. 보일의 법칙과
+// 설정, 블루투스 화면의 시계와 WiFi 표시가 멈춰 있던 것이 그 때문이었습니다 -
+// 라벨은 만들어졌는데 갱신 목록에 이름이 없었습니다. 상태바가 스스로 등록하면
+// 빠질 수가 없습니다.
+#define STATUS_BAR_MAX 12
+
+static lv_obj_t *statusBarTime[STATUS_BAR_MAX];
+static lv_obj_t *statusBarWifi[STATUS_BAR_MAX];
+static lv_obj_t *statusBarSd[STATUS_BAR_MAX];
+static int statusBarCount = 0;
+
 void createStatusBar(
   lv_obj_t *parent,
   const char *title,
@@ -4091,6 +5507,14 @@ void createStatusBar(
   lv_obj_set_style_text_font(*wifiLabel, &lv_font_montserrat_16, 0);
   lv_obj_set_style_text_color(*wifiLabel, lv_color_hex(UI_TEXT_3), 0);
   lv_obj_align(*wifiLabel, LV_ALIGN_RIGHT_MID, -64, 0);
+
+  if (statusBarCount < STATUS_BAR_MAX)
+  {
+    statusBarTime[statusBarCount] = *timeLabel;
+    statusBarWifi[statusBarCount] = *wifiLabel;
+    statusBarSd[statusBarCount] = *sdLabel;
+    statusBarCount++;
+  }
 }
 
 // Green when the thing is actually working, muted grey otherwise.
@@ -4105,27 +5529,14 @@ void updateStatusBars()
   String nowText = getCurrentDateTimeText();
   String shortTime = nowText.substring(0, 16);
 
-  if (labelBarHomeTime) lv_label_set_text(labelBarHomeTime, shortTime.c_str());
-  if (labelBarMeasureTime) lv_label_set_text(labelBarMeasureTime, shortTime.c_str());
-  if (labelBarSettingsTime) lv_label_set_text(labelBarSettingsTime, shortTime.c_str());
-  if (labelBarIslTime) lv_label_set_text(labelBarIslTime, shortTime.c_str());
-  if (labelBarCsvTime) lv_label_set_text(labelBarCsvTime, shortTime.c_str());
-  if (labelBarFileViewerTime) lv_label_set_text(labelBarFileViewerTime, shortTime.c_str());
-
-  setStatusIconState(labelBarHomeWifi, wifiConnected);
-  setStatusIconState(labelBarMeasureWifi, wifiConnected);
-  setStatusIconState(labelBarSettingsWifi, wifiConnected);
-  setStatusIconState(labelBarIslWifi, wifiConnected);
-  setStatusIconState(labelBarCsvWifi, wifiConnected);
-  setStatusIconState(labelBarFileViewerWifi, wifiConnected);
-
   const bool sdActive = sdReady && csvLoggingEnabled;
-  setStatusIconState(labelBarHomeSd, sdActive);
-  setStatusIconState(labelBarMeasureSd, sdActive);
-  setStatusIconState(labelBarSettingsSd, sdActive);
-  setStatusIconState(labelBarIslSd, sdActive);
-  setStatusIconState(labelBarCsvSd, sdActive);
-  setStatusIconState(labelBarFileViewerSd, sdActive);
+
+  for (int i = 0; i < statusBarCount; i++)
+  {
+    if (statusBarTime[i]) lv_label_set_text(statusBarTime[i], shortTime.c_str());
+    setStatusIconState(statusBarWifi[i], wifiConnected);
+    setStatusIconState(statusBarSd[i], sdActive);
+  }
 }
 
 lv_obj_t *makeInfoLabel(lv_obj_t *parent, const char *text, int w)
@@ -4391,8 +5802,7 @@ void updateCloudModeLabel()
     snprintf(
       text,
       sizeof(text),
-      "방식: %s / 저장 %d개 / 전송중 %d/%d",
-      cloudUploadModeName(),
+      "저장 %d개 / 전송중 %d/%d",
       sampleCount,
       batchUploadProgressSent,
       batchUploadProgressTotal
@@ -4403,8 +5813,7 @@ void updateCloudModeLabel()
     snprintf(
       text,
       sizeof(text),
-      "방식: %s / 저장 %d개 / 일괄전송 %d/%d / 실시간간격 %d초",
-      cloudUploadModeName(),
+      "저장 %d개 / 일괄전송 %d/%d / 실시간간격 %d초",
       sampleCount,
       batchUploadProgressSent,
       batchUploadProgressTotal,
@@ -4524,35 +5933,48 @@ void enableCopyOnDoubleClick(lv_obj_t *label)
   lv_obj_add_event_cb(label, copy_label_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
-static void csv_textarea_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_FOCUSED) return;
-
-  if (csvKeyboard)
-  {
-    lv_keyboard_set_textarea(csvKeyboard, lv_event_get_target(e));
-    lv_obj_clear_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-  }
-}
-
-static void csv_keyboard_event_cb(lv_event_t *e)
-{
-  lv_event_code_t code = lv_event_get_code(e);
-
-  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL)
-  {
-    if (csvKeyboard)
-    {
-      lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-      lv_keyboard_set_textarea(csvKeyboard, NULL);
-    }
-  }
-}
-
 // =====================================================
 // Table
 // =====================================================
 
+
+// Both the table rebuild and the sensor-change refresh used to spell these
+// headings out, and they disagreed: whichever ran last won. One writer.
+void applyTableValueHeaders()
+{
+  if (tableData == NULL) return;
+
+  char header[40];
+
+  snprintf(header, sizeof(header), "%s(%s)", activePrimaryName(), activePrimaryUnit());
+  lv_table_set_cell_value(tableData, 0, 2, header);
+
+  const int valueCount = activeSensorValueCount();
+
+  if (valueCount >= 3)
+  {
+    const char *caption2 = "";
+    const char *caption3 = "";
+    const char *unit2 = "";
+    const char *unit3 = "";
+    measureValueMeta(1, &caption2, &unit2);
+    measureValueMeta(2, &caption3, &unit3);
+    snprintf(header, sizeof(header), "%s/%s", caption2, caption3);
+    lv_table_set_cell_value(tableData, 0, 3, header);
+  }
+  else if (valueCount == 2)
+  {
+    const char *caption2 = "";
+    const char *unit2 = "";
+    measureValueMeta(1, &caption2, &unit2);
+    snprintf(header, sizeof(header), "%s(%s)", caption2, unit2);
+    lv_table_set_cell_value(tableData, 0, 3, header);
+  }
+  else
+  {
+    lv_table_set_cell_value(tableData, 0, 3, "-");
+  }
+}
 
 void resetTable()
 {
@@ -4562,27 +5984,10 @@ void resetTable()
   // screen no longer does.
   if (tableData == NULL) return;
 
-  char header[32];
-
   lv_table_set_cell_value(tableData, 0, 0, "No");
   lv_table_set_cell_value(tableData, 0, 1, "시간(s)");
 
-  snprintf(header, sizeof(header), "%s(%s)", activePrimaryName(), activePrimaryUnit());
-  lv_table_set_cell_value(tableData, 0, 2, header);
-
-  if (activeSensorMode == SENSOR_MODE_SCD41)
-  {
-    lv_table_set_cell_value(tableData, 0, 3, "T/RH");
-  }
-  else if (activeSensorHasPressure())
-  {
-    snprintf(header, sizeof(header), "%s(%s)", activeSecondaryName(), activeSecondaryUnit());
-    lv_table_set_cell_value(tableData, 0, 3, header);
-  }
-  else
-  {
-    lv_table_set_cell_value(tableData, 0, 3, "-");
-  }
+  applyTableValueHeaders();
 
   for (int r = 1; r <= TABLE_VISIBLE_ROWS; r++)
   {
@@ -4653,15 +6058,22 @@ void updateTable()
       formatPrimaryValueText(text, sizeof(text), tempHistory[idx], false);
       lv_table_set_cell_value(tableData, r, 2, text);
 
-      if (activeSensorMode == SENSOR_MODE_SCD41 &&
-          !isnan(pressureHistory[idx]) && !isnan(humidityHistory[idx]))
+      // %g so one column can hold a bus voltage, a pressure and an angle
+      // without either dropping the INA228's milliamps or padding hPa with
+      // decimals it does not have.
+      const int extraValues = activeSensorValueCount();
+      const bool secondUsable =
+        extraValues >= 2 && !isnan(pressureHistory[idx]) &&
+        (!activeSensorHasPressure() || pressureValueValid(pressureHistory[idx]));
+
+      if (extraValues >= 3 && secondUsable && !isnan(humidityHistory[idx]))
       {
-        snprintf(text, sizeof(text), "%.1f/%.0f", pressureHistory[idx], humidityHistory[idx]);
+        snprintf(text, sizeof(text), "%.4g/%.4g", pressureHistory[idx], humidityHistory[idx]);
         lv_table_set_cell_value(tableData, r, 3, text);
       }
-      else if (activeSensorHasPressure() && pressureValueValid(pressureHistory[idx]))
+      else if (secondUsable)
       {
-        snprintf(text, sizeof(text), "%.1f", pressureHistory[idx]);
+        snprintf(text, sizeof(text), "%.4g", pressureHistory[idx]);
         lv_table_set_cell_value(tableData, r, 3, text);
       }
       else
@@ -4729,7 +6141,7 @@ void clearChart()
   if (labelGraphStart) lv_label_set_text(labelGraphStart, "시간(s)");
   if (labelGraphEnd) lv_label_set_text(labelGraphEnd, "");
 
-  bool pressureAxisOn = activeSensorHasPressure();
+  bool pressureAxisOn = secondaryPlotAxisOn();
 
   if (labelMeasurePressureAxisTitle)
   {
@@ -4757,6 +6169,60 @@ void clearChart()
   }
 }
 
+// Sensors that report three quantities keep the third in a global, because
+// readActiveSensor() only returns two.
+static float thirdValueForActiveSensor()
+{
+  if (activeSensorMode == SENSOR_MODE_SCD41) return scd41LastHumidityPct;
+  if (activeSensorMode == SENSOR_MODE_INA228) return ina228LastPowerW;
+  if (activeSensorMode == SENSOR_MODE_BLE) return bleNodeThirdValue;
+  return NAN;
+}
+
+// Swapping the sensor on a node is a different experiment, not a
+// continuation of this one. Samples taken in hPa do not belong on an axis
+// labelled lx, and the CSV would carry two quantities under one heading.
+void onBleNodeSensorChanged(const char *from, const char *to)
+{
+  Serial.printf("[BLE] node changed sensor: %s -> %s\n", from, to);
+
+    if (measuring)
+    {
+      measuring = false;
+      measureClockRunning = false;
+      setIslStatusText("노드 센서가 바뀌어 측정을 멈췄습니다");
+    }
+    else
+    {
+      setIslStatusText("노드 센서가 바뀌었습니다: 기록 초기화");
+    }
+
+    measurementCount = 0;
+    sampleCount = 0;
+    tablePageOffset = 0;
+    batchUploadStartIndex = 0;
+    measureAccumulatedMs = 0;
+    measureResumeMs = 0;
+    dataClockStarted = false;
+    dataFirstSampleMs = 0;
+    previewValid = false;
+
+    for (int i = 0; i < MAX_SAMPLES; i++)
+    {
+      sampleEnabled[i] = true;
+      noHistory[i] = 0;
+      tempHistory[i] = 0.0f;
+      pressureHistory[i] = NO_PRESSURE_VALUE;
+      humidityHistory[i] = NAN;
+      timeHistory[i] = 0;
+    }
+
+    resetDirectIslSessionCache("node sensor changed");
+    clearChart();
+    chartUiDirty = true;
+    refreshLatestMeasurementLabels();
+}
+
 void addSample(uint32_t timeS, float tempC, float pressureHpa)
 {
   String collectText = getCurrentDateTimeText();
@@ -4768,7 +6234,7 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     noHistory[sampleCount] = currentNo;
     tempHistory[sampleCount] = tempC;
     pressureHistory[sampleCount] = pressureHpa;
-    humidityHistory[sampleCount] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
+    humidityHistory[sampleCount] = thirdValueForActiveSensor();
     timeHistory[sampleCount] = timeS;
     sampleEnabled[sampleCount] = true;
     sampleCount++;
@@ -4790,7 +6256,7 @@ void addSample(uint32_t timeS, float tempC, float pressureHpa)
     noHistory[MAX_SAMPLES - 1] = currentNo;
     tempHistory[MAX_SAMPLES - 1] = tempC;
     pressureHistory[MAX_SAMPLES - 1] = pressureHpa;
-    humidityHistory[MAX_SAMPLES - 1] = (activeSensorMode == SENSOR_MODE_SCD41) ? scd41LastHumidityPct : NAN;
+    humidityHistory[MAX_SAMPLES - 1] = thirdValueForActiveSensor();
     timeHistory[MAX_SAMPLES - 1] = timeS;
     sampleEnabled[MAX_SAMPLES - 1] = true;
   }
@@ -4875,7 +6341,10 @@ bool restoreMeasurementBackupFromNvs()
       activeSensorMode != SENSOR_MODE_SCD41 &&
       activeSensorMode != SENSOR_MODE_TSL2591 &&
       activeSensorMode != SENSOR_MODE_TMP117 &&
-      activeSensorMode != SENSOR_MODE_VL53L1X)
+      activeSensorMode != SENSOR_MODE_VL53L1X &&
+      activeSensorMode != SENSOR_MODE_INA228 &&
+      activeSensorMode != SENSOR_MODE_ENCODER &&
+      activeSensorMode != SENSOR_MODE_BLE)
   {
     activeSensorMode = ACTIVE_SENSOR_DEFAULT;
   }
@@ -5064,7 +6533,7 @@ void updateChartAutoScale()
 {
   if (sampleCount <= 0 || chart == NULL || seriesTemp == NULL || seriesPressure == NULL) return;
 
-  const bool pressureAxisOn = activeSensorHasPressure();
+  const bool pressureAxisOn = secondaryPlotAxisOn();
 
   if (labelMeasurePressureAxisTitle)
   {
@@ -5088,7 +6557,7 @@ void updateChartAutoScale()
     if (value < primaryMin) primaryMin = value;
     if (value > primaryMax) primaryMax = value;
 
-    if (pressureAxisOn && pressureValueValid(pressureHistory[i]))
+    if (pressureAxisOn && secondaryPlotValueValid(pressureHistory[i]))
     {
       if (!hasPressure)
       {
@@ -5176,7 +6645,7 @@ void updateChartAutoScale()
     if (hasPressure)
     {
       float pressureValue = graphSecondaryInterpolated(sourcePosition);
-      if (pressureValueValid(pressureValue))
+      if (secondaryPlotValueValid(pressureValue))
       {
         float pressureRatio = (pressureValue - pressureMin) / pressureSpan;
         if (pressureRatio < 0.0f) pressureRatio = 0.0f;
@@ -5329,6 +6798,8 @@ uint32_t screenBgColor(lv_obj_t *screen)
   if (screen == fileViewerScreen) return UI_BG;
   if (screen == islScreen) return UI_BG;
   if (screen == bleScreen) return UI_BG;
+  if (screen == deviceScreen) return UI_BG;
+  if (screen == conditionScreen) return UI_BG;
   return 0x0B1020;
 }
 
@@ -5360,6 +6831,7 @@ void ensureOpaqueScreenBase(lv_obj_t *screen)
     lv_obj_align(*slot, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_clear_flag(*slot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(*slot, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(*slot, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_set_style_radius(*slot, 0, 0);
     lv_obj_set_style_border_width(*slot, 0, 0);
@@ -5390,9 +6862,31 @@ void loadHomeScreenFresh()
   requestScreenSwitch(homeScreen);
 }
 
+// Names a screen for the log. Nothing else needs this, but "which screen did
+// it actually go to" is otherwise invisible from a serial capture.
+static const char *screenName(lv_obj_t *screen)
+{
+  if (screen == homeScreen) return "home";
+  if (screen == measureScreen) return "measure";
+  if (screen == csvScreen) return "record";
+  if (screen == bleScreen) return "ble";
+  if (screen == settingsScreen) return "wifi";
+  if (screen == deviceScreen) return "device";
+  if (screen == islScreen) return "isl";
+  if (screen == conditionScreen) return "condition";
+  if (screen == fileViewerScreen) return "fileviewer";
+  return screen == NULL ? "(null)" : "(unknown)";
+}
+
 void requestScreenSwitch(lv_obj_t *screen)
 {
-  if (screen == NULL) return;
+  if (screen == NULL)
+  {
+    Serial.println("[UI] screen switch requested to a screen that was never built");
+    return;
+  }
+
+  Serial.printf("[UI] switch requested -> %s\n", screenName(screen));
   pendingScreen = screen;
   pendingScreenRequestMs = millis();
 }
@@ -5422,6 +6916,15 @@ void prepareScreenContent(lv_obj_t *screen)
       lv_label_set_text(labelSettingsWifi, wifiConnected ? "WiFi: 연결됨" : "WiFi: 연결 안 됨");
     }
   }
+  else if (screen == deviceScreen)
+  {
+    syncWiredSensorDropdown();
+  }
+  else if (screen == conditionScreen)
+  {
+    condDirty = true;
+    refreshConditionScreen();
+  }
   else if (screen == islScreen)
   {
     if (islModuleTa && strlen(islRuntimeSerialNumber) > 0)
@@ -5443,6 +6946,7 @@ void activateScreenNow(lv_obj_t *screen)
   ensureOpaqueScreenBase(screen);
   prepareScreenContent(screen);
 
+  Serial.printf("[UI] now showing %s\n", screenName(screen));
   lv_scr_load(screen);
   currentLoadedScreen = screen;
   lv_obj_invalidate(screen);
@@ -5516,6 +7020,14 @@ static void start_event_cb(lv_event_t *e)
           setIslStatusText("SCD41 0x62 없음: 안정적 전원·SDA2·SCL3 확인");
         return;
       }
+    }
+
+    // The angle is cumulative, so a fresh run has to start from zero the way
+    // the clock and the sample count do - otherwise the first reading carries
+    // over however far the wheel was turned while setting the experiment up.
+    if (activeSensorMode == SENSOR_MODE_ENCODER && measurementCount == 0 && sampleCount == 0)
+    {
+      encoderZero();
     }
 
     if (measurementCount == 0 && sampleCount == 0)
@@ -5746,93 +7258,43 @@ static void dashboard_isl_stop_event_cb(lv_event_t *e)
   updateIslStatusLabels();
 }
 
-static void dashboard_cloud_realtime_event_cb(lv_event_t *e)
+void updateIslServerLabel()
 {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (isBatchUploading())
-  {
-    setIslStatusText("일괄전송 중: 실시간 전환 무시");
-    return;
-  }
+  if (!labelIslServer) return;
 
-  updateIslModuleCodeFromUi();
-  cloudUploadMode = CLOUD_UPLOAD_REALTIME;
+  const bool haveKey = strlen(islServiceKey) > 0 &&
+                       strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0;
 
-  if (measuring)
+  char text[160];
+
+  // 글자 수를 보여 줍니다. 가려진 칸에 44자를 넣다 보면 한두 자가 빠지는데,
+  // 그러면 서버는 "인증키가 일치하지 않습니다"라고만 하고 어디가 틀렸는지는
+  // 말해 주지 않습니다. 길이는 화면에서 바로 셀 수 있습니다.
+  if (haveKey)
   {
-    // 일괄전송에서 실시간으로 전환하면 이후 새 샘플부터 실시간 전송한다.
-    // 과거에 모아둔 값은 자동으로 섞어 보내지 않는다.
-    clearCloudQueue();
-    if (!activeSensorSupportsDirectIsl())
-    {
-      setIslStatusText("현재 센서: 보드 측정 모드 / ON 전송 미지원");
-    }
-    else if (cloudModumConfigured())
-    {
-      resetDirectIslSessionCache("realtime mode switch");
-      queueCloudAction("start");
-      setIslStatusText("직접전송: 실시간 전환 - 새 세션 시작");
-    }
-    else
-    {
-      setIslStatusText("전송: 실시간 전환 - 모둠코드 필요");
-    }
+    snprintf(text, sizeof(text), "%s / 인증키 %d자", islApiHost, (int)strlen(islServiceKey));
   }
   else
   {
-    setIslStatusText("전송: 실시간 전송 모드");
+    snprintf(text, sizeof(text), "%s / 인증키 없음", islApiHost);
   }
 
-  updateCloudModeLabel();
+  lv_label_set_text(labelIslServer, text);
+}
+
+static void dashboard_isl_server_prod_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  islApplyServerChoice(false, true);
+  setIslStatusText("전송: 운영 서버");
   updateIslStatusLabels();
 }
 
-static void dashboard_cloud_batch_event_cb(lv_event_t *e)
+static void dashboard_isl_server_test_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (isBatchUploading())
-  {
-    setIslStatusText("일괄전송 중: 모드 전환 무시");
-    return;
-  }
-
-  updateIslModuleCodeFromUi();
-
-  bool wasRealtimeMeasuring = measuring && cloudUploadMode == CLOUD_UPLOAD_REALTIME;
-  cloudUploadMode = CLOUD_UPLOAD_BATCH;
-
-  if (wasRealtimeMeasuring)
-  {
-    // 핵심 수정:
-    // 실시간 구간은 이미 지능형과학실/Google Sheets로 전송된 값이 있으므로
-    // 일괄전송 전환 시점 이후의 새 샘플만 일괄전송 대상으로 삼는다.
-    // 여기서 stop을 보내면 지능형과학실 세션이 꼬일 수 있으므로 즉시 stop하지 않는다.
-    // 최종 stop은 [일괄] 전송 완료 후 한 번만 보낸다.
-    batchUploadStartIndex = sampleCount;
-    // 실시간 그래프 세션은 즉시 정리하고, 이후부터 보드 내부에만 저장한다.
-    // batch 전송은 나중에 [일괄전송] 버튼에서 처리한다.
-    if (activeSensorSupportsDirectIsl())
-    {
-      queueCloudAction("stop");
-      setIslStatusText("일괄전송 전환: 실시간 정지 요청");
-    }
-    else
-    {
-      setIslStatusText("현재 센서: 일괄 직접전송 코드 미설정");
-    }
-  }
-  else if (measuring)
-  {
-    setIslStatusText("일괄전송 측정 중");
-  }
-  else
-  {
-    // 정지 상태에서 일괄전송을 선택하면 새 실험 구간 전체를 보낼 수 있게 0부터 시작한다.
-    batchUploadStartIndex = 0;
-    setIslStatusText("일괄전송 모드");
-  }
-
-  updateCloudModeLabel();
+  islApplyServerChoice(true, true);
+  setIslStatusText("전송: 테스트 서버");
   updateIslStatusLabels();
 }
 
@@ -5944,7 +7406,8 @@ static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
     if (labelStatus) lv_label_set_text(labelStatus, "정지");
   }
 
-  cloudUploadMode = CLOUD_UPLOAD_BATCH;
+  // 여기서 모드를 바꾸지 않습니다. 위에서 측정을 이미 멈췄으니 새 샘플은 오지
+  // 않고, 이 업로드가 끝나면 보드는 그대로 실시간 상태로 남아 있어야 합니다.
 
   // 현재까지 누적된 전체 샘플을 보냅니다.
   batchUploadStartIndex = 0;
@@ -5979,154 +7442,96 @@ static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
   updateCloudModeLabel();
   updateIslStatusLabels();
 }
-static void dashboard_csv_mount_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-  sdReady = initSdCard();
-  updateSdStatusLabels();
-  updateDashboardCsvPreview();
-}
-
-static void dashboard_csv_toggle_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-  csvLoggingEnabled = !csvLoggingEnabled;
-  if (!csvLoggingEnabled) closeCsvFile();
-
-  if (csvLoggingEnabled && !sdReady)
-  {
-    sdReady = initSdCard();
-  }
-
-  updateSdStatusLabels();
-  updateDashboardCsvPreview();
-}
-
-static void dashboard_csv_preview_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
-}
-
+// 저장하기: everything measured so far, as one CSV on the card. The card is
+// mounted here if it is not yet, and the file is named by the clock, so there
+// is nothing to set up first and two runs never overwrite each other.
 static void csv_save_measurement_data_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
+  if (labelSelectedSdFile == NULL) return;
 
   if (sampleCount <= 0)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 저장할 데이터 없음");
-    if (labelHomeCsvPreview)
-    {
-      lv_label_set_text(labelHomeCsvPreview, "저장할 측정 데이터가 없습니다.\n먼저 센서 측정을 시작하세요.");
-    }
-    updateDashboardCsvLabels();
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 저장할 데이터 없음");
+    lv_label_set_text(labelSelectedSdFile, "저장할 측정값이 없습니다");
     return;
   }
 
   if (!sdReady)
   {
     sdReady = initSdCard();
+    updateSdStatusLabels();
   }
 
   if (!sdReady)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: SD 카드 오류");
-    if (labelHomeCsvPreview)
-    {
-      lv_label_set_text(labelHomeCsvPreview, "SD 카드를 마운트하지 못했습니다.\nSD 카드 삽입 상태와 핀 설정을 확인하세요.");
-    }
-    updateSdStatusLabels();
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: SD 카드 오류");
+    char note[120];
+    snprintf(note, sizeof(note), "SD 카드를 읽을 수 없습니다%s%s",
+             sdLastError[0] ? ": " : "", sdLastError);
+    lv_label_set_text(labelSelectedSdFile, note);
     return;
   }
+
+  // Named by the clock when it is known, by a counter otherwise.
+  time_t nowTime;
+  struct tm timeInfo;
+  time(&nowTime);
+
+  if (localtime_r(&nowTime, &timeInfo) != NULL && timeInfo.tm_year + 1900 >= 2025)
+  {
+    snprintf(csvFileName, sizeof(csvFileName), "log_%04d%02d%02d_%02d%02d%02d.csv",
+             timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+             timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+  }
+  else
+  {
+    for (int n = 1; n < 1000; n++)
+    {
+      snprintf(csvFileName, sizeof(csvFileName), "log_%03d.csv", n);
+      snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
+
+      struct stat st;
+      if (stat(csvPath, &st) != 0) break;
+    }
+  }
+
+  snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
 
   FILE *file = fopen(csvPath, "w");
+
   if (file == NULL)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 파일 생성 실패");
-    if (labelHomeCsvPreview)
-    {
-      char msg[220];
-      snprintf(msg, sizeof(msg), "CSV 파일을 만들 수 없습니다.\n%s", csvPath);
-      lv_label_set_text(labelHomeCsvPreview, msg);
-    }
-    Serial.print("CSV snapshot open failed: ");
-    Serial.println(csvPath);
+    char note[160];
+    snprintf(note, sizeof(note), "파일을 만들 수 없습니다: %s", csvFileName);
+    lv_label_set_text(labelSelectedSdFile, note);
+    Serial.printf("[CSV] open failed: %s\n", csvPath);
     return;
   }
 
-  fprintf(file, "no,time_s,sensor,primary_value,primary_unit,secondary_value,secondary_unit\n");
+  fprintf(file, CSV_HEADER_LINE "\n");
 
   for (int i = 0; i < sampleCount; i++)
   {
-    if (activeSensorHasPressure() && pressureValueValid(pressureHistory[i]))
-    {
-      fprintf(
-        file,
-        "%d,%lu,%s,%.4f,%s,%.4f,%s\n",
-        noHistory[i] > 0 ? noHistory[i] : (i + 1),
-        (unsigned long)timeHistory[i],
-        activeSensorName(),
-        tempHistory[i],
-        activePrimaryUnit(),
-        pressureHistory[i],
-        activeSecondaryUnit()
-      );
-    }
-    else
-    {
-      fprintf(
-        file,
-        "%d,%lu,%s,%.4f,%s,,,\n",
-        noHistory[i] > 0 ? noHistory[i] : (i + 1),
-        (unsigned long)timeHistory[i],
-        activeSensorName(),
-        tempHistory[i],
-        activePrimaryUnit()
-      );
-    }
+    char columns[160];
+    formatCsvValueColumns(tempHistory[i], pressureHistory[i], humidityHistory[i],
+                          columns, sizeof(columns));
+
+    fprintf(file, "%d,%lu,%s,%s\n",
+            noHistory[i] > 0 ? noHistory[i] : (i + 1),
+            (unsigned long)timeHistory[i], activeSensorName(), columns);
   }
 
   fclose(file);
 
-  // 이 버튼은 현재까지 누적된 측정 데이터를 한 번에 저장한다.
-  // 측정 루프의 자동 append 방식은 사용하지 않는다.
+  // The live append file, if one was open, is a different file now.
   csvLoggingEnabled = false;
   closeCsvFile();
 
-  if (labelSelectedSdFile)
-  {
-    char selected[96];
-    snprintf(selected, sizeof(selected), "저장: %s", csvFileName);
-    lv_label_set_text(labelSelectedSdFile, selected);
-  }
-
+  char note[160];
+  snprintf(note, sizeof(note), "저장됨: %s (%d개)", csvFileName, sampleCount);
+  lv_label_set_text(labelSelectedSdFile, note);
   updateSdStatusLabels();
-  updateDashboardCsvLabels();
 
-  if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 측정 데이터 저장됨");
-
-  if (labelHomeCsvPreview)
-  {
-    char msg[512];
-    snprintf(
-      msg,
-      sizeof(msg),
-      "측정 데이터 저장 완료\n파일: %s\n샘플 수: %d\n\n최근 데이터는 [미리보기], 저장 파일은 [파일 목록] 또는 [열기]로 확인하세요.",
-      csvPath,
-      sampleCount
-    );
-    lv_label_set_text(labelHomeCsvPreview, msg);
-  }
+  Serial.printf("[CSV] saved %s (%d rows)\n", csvPath, sampleCount);
 }
 
 bool endsWithIgnoreCase(const char *text, const char *suffix)
@@ -6388,26 +7793,6 @@ void openSdTextFileByName(const char *fileName)
   }
 }
 
-static void csv_viewer_prev_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (strlen(csvFileViewName) == 0) return;
-
-  long nextOffset = csvFileViewOffset - CSV_FILE_VIEW_PAGE_BYTES;
-  if (nextOffset < 0) nextOffset = 0;
-  loadSdTextFilePage(csvFileViewName, nextOffset);
-}
-
-static void csv_viewer_next_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (strlen(csvFileViewName) == 0) return;
-
-  long nextOffset = csvFileViewOffset + CSV_FILE_VIEW_PAGE_BYTES;
-  if (nextOffset >= csvFileViewSize) nextOffset = csvFileViewOffset;
-  loadSdTextFilePage(csvFileViewName, nextOffset);
-}
-
 static void sd_file_item_event_cb(lv_event_t *e)
 {
   lv_event_code_t code = lv_event_get_code(e);
@@ -6607,7 +7992,11 @@ void createHomeCodeEditor()
   lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
 
+  // The sheet closes on a tap outside the card; the card itself absorbs taps.
+  lv_obj_add_event_cb(homeCodeEditor, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
+
   lv_obj_t *card = makePanel(homeCodeEditor, 162, 36, 700, 190);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
   makeHeading(card, "모둠코드", 28, 22, UI_TEXT);
   makeSmallLabel(card, "지능형 과학실 ON에서 받은 코드를 입력하세요.", 28, 58, UI_TEXT_3);
@@ -6629,6 +8018,15 @@ void createHomeCodeEditor()
   makePrimaryButton(card, "저장", 562, 144, 110, 40, UI_ACCENT, home_code_confirm_event_cb);
 }
 
+// Tapping the empty part of a screen puts its keyboard away. The keyboard
+// covers the lower third of the screen and had no way down except 확인.
+static void screen_tap_dismiss_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  hideAllFloatingUi();
+  closeHomeCodeEditor();
+}
+
 void createHomeUi()
 {
   homeScreen = lv_obj_create(NULL);
@@ -6637,6 +8035,7 @@ void createHomeUi()
   lv_obj_set_style_bg_color(homeScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(homeScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(homeScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(homeScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     homeScreen,
@@ -6647,74 +8046,37 @@ void createHomeUi()
   );
 
   // =====================================================
-  // The home screen asks one question: which sensor?
-  // Everything else — WiFi detail, upload mode, restart — lives one tap away
-  // in Settings, so a student meets six choices instead of fifteen controls.
+  // The home screen answers two questions: is my sensor on, and which kind of
+  // measurement am I doing. Every sensor arrives over BLE, so the top row is
+  // one card per linked node with its live numbers; below it, two cards for
+  // the two ways of measuring. Nothing here selects a sensor - a node is
+  // connected and chosen on the 블루투스 screen, and in a time measurement
+  // every linked node is recorded together.
   // =====================================================
-  makeHeading(homeScreen, "SENSOR", 28, 60, UI_TEXT);
+  makeHeading(homeScreen, "센서", 28, 58, UI_TEXT);
 
-  // Six tiles on a 3x2 grid. 316x112 leaves no room to hit two at once.
-  const int tileW = 316;
-  const int tileH = 112;
-  const int tileGapX = 14;
-  const int tileGapY = 14;
-  const int tileLeft = 28;
-  const int tileTop = 128;
+  const int cardW = 312;
+  const int cardGap = 16;
 
-  struct SensorTileSpec
+  for (int p = 0; p < HOME_NODE_CARD_COUNT; p++)
   {
-    const char *name;
-    const char *unit;
-    int mode;
-    lv_event_cb_t cb;
-  };
-
-  // Named by the quantity measured, not the part number: a student reads
-  // "이산화탄소", not "SCD41".
-  const SensorTileSpec tiles[6] = {
-    { "온도 · 기압", "°C · hPa", SENSOR_MODE_DPS310,  home_sensor_dps_event_cb },
-    { "수온",        "°C",       SENSOR_MODE_DS18B20, home_sensor_water_event_cb },
-    { "이산화탄소",  "ppm",      SENSOR_MODE_SCD41,   home_sensor_co2_event_cb },
-    { "조도",        "lx",       SENSOR_MODE_TSL2591, home_sensor_light_event_cb },
-    { "정밀 온도",   "°C",       SENSOR_MODE_TMP117,  home_sensor_tmp117_event_cb },
-    { "거리",        "mm",       SENSOR_MODE_VL53L1X, home_sensor_vl53_event_cb }
-  };
-
-  for (int i = 0; i < HOME_SENSOR_TILE_COUNT; i++)
-  {
-    const int col = i % 3;
-    const int row = i / 3;
-
-    homeSensorTileModes[i] = tiles[i].mode;
-    homeSensorTiles[i] = makeSensorTile(
-      homeScreen,
-      tiles[i].name,
-      tiles[i].unit,
-      tileLeft + col * (tileW + tileGapX),
-      tileTop + row * (tileH + tileGapY),
-      tileW,
-      tileH,
-      activeSensorMode == tiles[i].mode,
-      tiles[i].cb,
-      &homeSensorTileMarks[i]
-    );
+    homeNodeCardSlot[p] = -1;
+    homeNodeCards[p] = makeHomeNodeCard(homeScreen, p, 28 + p * (cardW + cardGap), 100, cardW, 136);
   }
 
-  // The selected tile already carries 선택됨, so no "선택: ..." line here.
-  labelHomeSensorMode = NULL;
+  makeHeading(homeScreen, "측정 방법", 28, 252, UI_TEXT);
 
-  labelHomeSensorStatus = makeSmallLabel(homeScreen, "상태: 준비", 604, 388, UI_TEXT_2);
-  lv_obj_set_width(labelHomeSensorStatus, 392);
-  lv_obj_set_style_text_align(labelHomeSensorStatus, LV_TEXT_ALIGN_RIGHT, 0);
-  lv_label_set_long_mode(labelHomeSensorStatus, LV_LABEL_LONG_CLIP);
+  makeModeCard(homeScreen, "연속 측정", 28, 290, 476, 96, go_measure_event_cb);
+  makeModeCard(homeScreen, "단계 측정", 520, 290, 476, 96, go_condition_event_cb);
+
+  // There is no selected tile any more, and no status line beside one.
+  labelHomeSensorMode = NULL;
+  labelHomeSensorStatus = NULL;
 
   // =====================================================
   // Group code: show the saved value, and only raise the keyboard on 변경.
-  // The old screen kept an always-open text field plus a save button.
   // =====================================================
-  // Resting state: the saved code is read-only text. Editing happens in a
-  // modal sheet, opened by 변경.
-  lv_obj_t *codePanel = makePanel(homeScreen, 28, 416, 604, 72);
+  lv_obj_t *codePanel = makePanel(homeScreen, 28, 430, 604, 72);
 
   makeSmallLabel(codePanel, "모둠코드", 18, 12, UI_TEXT_3);
 
@@ -6724,8 +8086,13 @@ void createHomeUi()
 
   makeQuietButton(codePanel, "변경", 486, 18, 100, 38, home_code_open_event_cb);
 
-  // The one primary action on this screen.
-  makePrimaryButton(homeScreen, "측정 시작", 652, 416, 344, 72, UI_ACCENT, go_measure_event_cb);
+  // The 측정 시작 button that used to sit here is the two mode cards now; its
+  // place says what is still missing before a lesson can be recorded.
+  lv_obj_t *readyPanel = makePanel(homeScreen, 652, 430, 344, 72);
+  makeSmallLabel(readyPanel, "WiFi", 18, 12, UI_TEXT_3);
+  labelHomeReady = makeLabel(readyPanel, "", 18, 34, UI_TEXT);
+  lv_obj_set_width(labelHomeReady, 308);
+  lv_label_set_long_mode(labelHomeReady, LV_LABEL_LONG_CLIP);
 
   // Upload mode and queue counts belong in Settings, not on the home screen.
   labelCloudMode = NULL;
@@ -6740,7 +8107,7 @@ void createHomeUi()
   lv_obj_set_style_text_font(homeKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(homeKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(homeScreen, 0);
+  createTabBar(homeScreen, TAB_HOME);
 
   updateCloudModeLabel();
   updateHomeWifiLabels();
@@ -6792,27 +8159,26 @@ void createMeasureUi()
   lv_label_set_long_mode(labelStatus, LV_LABEL_LONG_CLIP);
   lv_obj_align(labelStatus, LV_ALIGN_TOP_LEFT, colLeftX + colLeftW - 300, contentTop + 8);
 
-  // ---- the reading ----
-  labelTempBig = lv_label_create(measureScreen);
-  lv_label_set_text(labelTempBig, "--.-");
-  lv_obj_set_style_text_color(labelTempBig, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_text_font(labelTempBig, FONT_VALUE, 0);
-  lv_obj_align(labelTempBig, LV_ALIGN_TOP_LEFT, colLeftX, contentTop + 34);
+  // ---- the readings ----
+  // Three columns are always built; refreshMeasureValueLayout() sizes and
+  // hides them to match whatever the active sensor reports.
+  for (int i = 0; i < MEASURE_VALUE_MAX; i++)
+  {
+    labelValueCaption[i] = makeSmallLabel(measureScreen, "", colLeftX, contentTop + 34, UI_TEXT_3);
+    lv_label_set_long_mode(labelValueCaption[i], LV_LABEL_LONG_CLIP);
 
-  // Pinned to the value's own right edge rather than a fixed x, so it hugs
-  // the number whether it reads "28.2" or "1013.24".
-  labelMeasurePrimaryUnit = makeHeading(measureScreen, "℃", 0, 0, UI_TEXT_3);
-  lv_obj_align_to(labelMeasurePrimaryUnit, labelTempBig, LV_ALIGN_OUT_RIGHT_BOTTOM, 10, -12);
+    labelValueNumber[i] = lv_label_create(measureScreen);
+    lv_label_set_text(labelValueNumber[i], "--");
+    lv_obj_set_style_text_color(labelValueNumber[i], lv_color_hex(UI_TEXT), 0);
+    lv_obj_set_style_text_font(labelValueNumber[i], FONT_VALUE, 0);
 
-  // Secondary quantity, when the active sensor reports one.
-  labelPressureBig = makeLabel(measureScreen, "기압 ----.-- hPa", colLeftX, contentTop + 122, UI_TEXT_2);
-  lv_obj_set_width(labelPressureBig, 340);
-  lv_label_set_long_mode(labelPressureBig, LV_LABEL_LONG_CLIP);
+    labelValueUnit[i] = makeHeading(measureScreen, "", 0, 0, UI_TEXT_3);
+  }
 
-  labelHumidityBig = makeLabel(measureScreen, "", colLeftX + 356, contentTop + 122, UI_TEXT_2);
-  lv_obj_set_width(labelHumidityBig, 340);
-  lv_label_set_long_mode(labelHumidityBig, LV_LABEL_LONG_CLIP);
-  lv_obj_add_flag(labelHumidityBig, LV_OBJ_FLAG_HIDDEN);
+  // The older update paths still write through these names.
+  labelTempBig = labelValueNumber[0];
+  labelPressureBig = labelValueNumber[1];
+  labelHumidityBig = labelValueNumber[2];
 
   // =====================================================
   // Chart
@@ -6924,6 +8290,7 @@ void createMeasureUi()
 
   // Secondary actions, kept quiet so they do not compete with 시작/정지.
   makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
+  makeQuietButton(measureScreen, "단계 측정", railX, contentTop + 288, 126, 44, go_condition_event_cb);
   makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
   // The primary control. Start is the accent; stop is the only red on screen,
@@ -6932,7 +8299,7 @@ void createMeasureUi()
   btnMeasureStop = makePrimaryButton(measureScreen, "측정 정지", railX, 466, railW, 64, UI_DANGER, stop_event_cb);
   lv_obj_add_flag(btnMeasureStop, LV_OBJ_FLAG_HIDDEN);
 
-  createTabBar(measureScreen, 1);
+  createTabBar(measureScreen, TAB_MEASURE);
 
   // Aliases kept for the older update paths.
   labelNow = labelDateTime;
@@ -6962,6 +8329,7 @@ void createIslUi()
   lv_obj_set_style_bg_color(islScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(islScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(islScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(islScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     islScreen,
@@ -6974,7 +8342,7 @@ void createIslUi()
   makeHeading(islScreen, "전송 설정", 28, 58, UI_TEXT);
   makeSmallLabel(islScreen, "지능형 과학실 ON으로 측정값을 보내기 위한 값입니다.", 28, 92, UI_TEXT_3);
 
-  lv_obj_t *card = makePanel(islScreen, 28, 124, 968, 250);
+  lv_obj_t *card = makePanel(islScreen, 28, 124, 968, 304);
 
   makeSmallLabel(card, "인증키 (serviceKey)", 24, 18, UI_TEXT_3);
 
@@ -7021,17 +8389,31 @@ void createIslUi()
   makePrimaryButton(card, "저장", 600, 128, 150, 46, UI_ACCENT, dashboard_isl_save_event_cb);
   makeQuietButton(card, "전송 시작", 760, 128, 184, 46, dashboard_isl_start_event_cb);
 
-  makeSmallLabel(card, "전송 방식", 24, 194, UI_TEXT_3);
-  makeQuietButton(card, "실시간", 120, 186, 130, 40, dashboard_cloud_realtime_event_cb);
-  makeQuietButton(card, "일괄전송", 260, 186, 150, 40, dashboard_cloud_batch_event_cb);
-  makeQuietButton(card, "전송 중지", 420, 186, 150, 40, dashboard_isl_stop_event_cb);
+  // 전송 방식은 더 이상 고르는 것이 아닙니다. 측정하면 실시간으로 나가고,
+  // 일괄전송은 측정 화면의 버튼을 누른 그때 한 번만 일어납니다. 모드가 남아
+  // 있으면 측정은 되는데 아무것도 안 나가는 상태가 생기고, 그건 보드가 고장난
+  // 것처럼 보입니다.
+  makeSmallLabel(card, "전송", 24, 194, UI_TEXT_3);
+  makeQuietButton(card, "전송 중지", 120, 186, 150, 40, dashboard_isl_stop_event_cb);
+  makeSmallLabel(card, "측정을 시작하면 실시간으로 전송됩니다.", 290, 196, UI_TEXT_3);
 
   labelCloudMode = makeSmallLabel(card, "", 588, 198, UI_TEXT_3);
   lv_obj_set_width(labelCloudMode, 356);
   lv_obj_set_style_text_align(labelCloudMode, LV_TEXT_ALIGN_RIGHT, 0);
   lv_label_set_long_mode(labelCloudMode, LV_LABEL_LONG_CLIP);
 
-  lv_obj_t *statusCard = makePanel(islScreen, 28, 390, 968, 100);
+  // 인증키는 서버마다 따로 발급되므로 서버를 바꾸면 그 서버의 키로 함께 바뀝니다.
+  // 시연하다 수업으로 돌아올 때 운영 키를 다시 타이핑하지 않게 하려는 것입니다.
+  makeSmallLabel(card, "서버", 24, 262, UI_TEXT_3);
+  makeQuietButton(card, "운영", 120, 254, 130, 40, dashboard_isl_server_prod_event_cb);
+  makeQuietButton(card, "테스트", 260, 254, 150, 40, dashboard_isl_server_test_event_cb);
+
+  labelIslServer = makeSmallLabel(card, "", 430, 266, UI_TEXT_3);
+  lv_obj_set_width(labelIslServer, 514);
+  lv_obj_set_style_text_align(labelIslServer, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_long_mode(labelIslServer, LV_LABEL_LONG_CLIP);
+
+  lv_obj_t *statusCard = makePanel(islScreen, 28, 438, 968, 100);
 
   makeSmallLabel(statusCard, "상태", 24, 16, UI_TEXT_3);
 
@@ -7047,9 +8429,10 @@ void createIslUi()
   lv_obj_set_style_text_font(islKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(islKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(islScreen, 3);
+  createTabBar(islScreen, TAB_DEVICE);
 
   updateCloudModeLabel();
+  updateIslServerLabel();
   updateIslStatusLabels();
 }
 
@@ -7057,55 +8440,6 @@ void createIslUi()
 // =====================================================
 // CSV/TXT File Viewer UI
 // =====================================================
-void createFileViewerUi()
-{
-  fileViewerScreen = lv_obj_create(NULL);
-  lv_obj_set_size(fileViewerScreen, LCD_H_RES, LCD_V_RES);
-  lv_obj_set_style_text_font(fileViewerScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(fileViewerScreen, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(fileViewerScreen, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(fileViewerScreen, LV_OBJ_FLAG_SCROLLABLE);
-
-  createStatusBar(
-    fileViewerScreen,
-    "",
-    &labelBarFileViewerTime,
-    &labelBarFileViewerWifi,
-    &labelBarFileViewerSd
-  );
-
-  labelFileViewerTitle = makeHeading(fileViewerScreen, "파일 보기", 28, 58, UI_TEXT);
-  lv_obj_set_width(labelFileViewerTitle, 700);
-  lv_label_set_long_mode(labelFileViewerTitle, LV_LABEL_LONG_CLIP);
-
-  makeQuietButton(fileViewerScreen, "이전", 700, 60, 92, 40, csv_viewer_prev_event_cb);
-  makeQuietButton(fileViewerScreen, "다음", 800, 60, 92, 40, csv_viewer_next_event_cb);
-  makeQuietButton(fileViewerScreen, "기록", 900, 60, 96, 40, go_csv_event_cb);
-
-  lv_obj_t *card = makePanel(fileViewerScreen, 28, 110, 968, 372);
-
-  // Read-only: this is a viewer, and an editable field invites a keyboard the
-  // screen has no room for.
-  fileViewerTextArea = lv_textarea_create(card);
-  lv_obj_set_size(fileViewerTextArea, 940, 344);
-  lv_obj_align(fileViewerTextArea, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_textarea_set_one_line(fileViewerTextArea, false);
-  lv_textarea_set_text(fileViewerTextArea, "기록 화면에서 파일을 열면 여기에 표시됩니다.");
-  lv_textarea_set_cursor_click_pos(fileViewerTextArea, false);
-  lv_obj_set_style_text_font(fileViewerTextArea, FONT_KR_SMALL, 0);
-  lv_obj_set_style_bg_opa(fileViewerTextArea, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_text_color(fileViewerTextArea, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_border_width(fileViewerTextArea, 0, 0);
-  lv_obj_set_style_pad_all(fileViewerTextArea, 0, 0);
-  lv_obj_set_scrollbar_mode(fileViewerTextArea, LV_SCROLLBAR_MODE_AUTO);
-
-  labelFileViewerPageInfo = makeSmallLabel(fileViewerScreen, "0 / 0 bytes", 28, 494, UI_TEXT_3);
-  lv_obj_set_width(labelFileViewerPageInfo, 968);
-  lv_label_set_long_mode(labelFileViewerPageInfo, LV_LABEL_LONG_CLIP);
-
-  createTabBar(fileViewerScreen, 2);
-}
-
 // =====================================================
 // CSV UI
 // =====================================================
@@ -7117,6 +8451,7 @@ void createCsvUi()
   lv_obj_set_style_bg_color(csvScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(csvScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(csvScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(csvScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     csvScreen,
@@ -7172,71 +8507,26 @@ void createCsvUi()
   lv_label_set_long_mode(labelCsvRowRange, LV_LABEL_LONG_CLIP);
 
   // =====================================================
-  // File side
+  // Saving: one button. The card is mounted when it is needed and the file
+  // is named by the clock, so there is nothing to set up first.
   // =====================================================
   lv_obj_t *fileCard = makePanel(csvScreen, 668, 104, 328, 412);
 
-  // SD is not mounted at boot: SDMMC can collide with the C6 SDIO link that
-  // WiFi and Bluetooth ride on, so it is brought up on demand. The redesign
-  // dropped this control, which left no way to mount the card at all.
   makeSmallLabel(fileCard, "SD 카드", 16, 14, UI_TEXT_3);
+  makePrimaryButton(fileCard, "저장하기", 16, 44, 296, 60, UI_ACCENT, csv_save_measurement_data_event_cb);
 
-  labelHomeCsv = makeSmallLabel(fileCard, "SD: 마운트 안 됨", 16, 36, UI_TEXT_2);
-  lv_obj_set_width(labelHomeCsv, 296);
-  lv_label_set_long_mode(labelHomeCsv, LV_LABEL_LONG_CLIP);
-
-  makeQuietButton(fileCard, "마운트", 16, 62, 142, 40, dashboard_csv_mount_event_cb);
-  makeQuietButton(fileCard, "자동 저장", 170, 62, 142, 40, dashboard_csv_toggle_event_cb);
-
-  makeSmallLabel(fileCard, "저장 파일", 16, 118, UI_TEXT_3);
-
-  homeCsvFileTa = lv_textarea_create(fileCard);
-  lv_obj_set_size(homeCsvFileTa, 296, 44);
-  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 16, 140);
-  lv_textarea_set_one_line(homeCsvFileTa, true);
-  lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
-  lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
-  lv_obj_set_style_bg_color(homeCsvFileTa, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(homeCsvFileTa, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(homeCsvFileTa, 0, 0);
-  lv_obj_set_style_radius(homeCsvFileTa, 10, 0);
-  lv_obj_set_style_text_color(homeCsvFileTa, lv_color_hex(UI_TEXT), 0);
-  lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-  lv_textarea_set_text(homeCsvFileTa, csvFileName);
-
-  makePrimaryButton(fileCard, "측정값 저장", 16, 192, 296, 44, UI_ACCENT, csv_save_measurement_data_event_cb);
-
-  makeQuietButton(fileCard, "미리보기", 16, 244, 142, 40, dashboard_csv_preview_event_cb);
-  makeQuietButton(fileCard, "파일 목록", 170, 244, 142, 40, settings_sd_list_event_cb);
-
-  labelSelectedSdFile = makeSmallLabel(fileCard, "선택: 없음", 16, 292, UI_TEXT_3);
+  labelSelectedSdFile = makeSmallLabel(fileCard, "", 16, 122, UI_TEXT_2);
   lv_obj_set_width(labelSelectedSdFile, 296);
-  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_CLIP);
+  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_WRAP);
 
-  sdFileList = lv_list_create(fileCard);
-  lv_obj_set_size(sdFileList, 296, 88);
-  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 16, 316);
-  lv_obj_set_style_text_font(sdFileList, FONT_KR_SMALL, 0);
-  lv_obj_set_style_bg_opa(sdFileList, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(sdFileList, 0, 0);
-  lv_obj_set_style_pad_all(sdFileList, 0, 0);
-  lv_list_add_text(sdFileList, "SD 파일 목록 대기");
+  // Gone with the mount button, the file name, the preview and the list.
+  labelHomeCsv = NULL;
+  homeCsvFileTa = NULL;
+  sdFileList = NULL;
+  labelHomeCsvPreview = NULL;
+  csvKeyboard = NULL;
 
-  // The preview is only meaningful once a file is opened, so it sits behind
-  // 미리보기 rather than taking permanent space.
-  labelHomeCsvPreview = makeSmallLabel(csvScreen, "", 28, 522, UI_TEXT_3);
-  lv_obj_set_width(labelHomeCsvPreview, 968);
-  lv_label_set_long_mode(labelHomeCsvPreview, LV_LABEL_LONG_CLIP);
-
-  csvKeyboard = lv_keyboard_create(csvScreen);
-  lv_obj_set_size(csvKeyboard, LCD_H_RES, 220);
-  lv_obj_align(csvKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_event_cb(csvKeyboard, csv_keyboard_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_set_style_text_font(csvKeyboard, &lv_font_montserrat_16, 0);
-  lv_btnmatrix_set_btn_ctrl_all(csvKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
-
-  createTabBar(csvScreen, 2);
+  createTabBar(csvScreen, TAB_RECORD);
 
   resetTable();
   updateTable();
@@ -7277,6 +8567,44 @@ static void ble_enable_event_cb(lv_event_t *e)
   }
 }
 
+static void i2c_scan_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (measuring) { setIslStatusText("측정 정지 후 센서 검색"); return; }
+
+  pendingI2cScan = true;
+}
+
+static void ble_row_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int index = (int)(intptr_t)lv_event_get_user_data(e);
+  if (index < 0 || index >= BLE_SCAN_MAX_RESULTS) return;
+
+  pendingBleConnectIndex = index;
+}
+
+static void ble_disconnect_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  pendingBleDisconnect = true;
+}
+
+static void ble_use_sensor_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  if (!bleLinkSlotIsSubscribed(activeBleSlot))
+  {
+    setIslStatusText("먼저 센서 노드에 연결하세요");
+    return;
+  }
+
+  pendingSensorMode = SENSOR_MODE_BLE;
+  requestScreenSwitch(measureScreen);
+}
+
 static void ble_scan_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -7291,61 +8619,159 @@ static void go_ble_event_cb(lv_event_t *e)
   requestScreenSwitch(bleScreen);
 }
 
+static void go_device_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  requestScreenSwitch(deviceScreen);
+}
+
+// One card per connected node, so a room with three of them reads at a glance,
+// and a plain list underneath of everything else the scan saw.
+//
+// The layout is fixed rather than flowed: LVGL clips a label to the width it
+// is given, and the previous version stacked four full-width status lines and
+// then overlapped the buttons with the hint text, which is what made this
+// screen look broken.
+static lv_obj_t *bleNodeCards[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardName[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardState[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardValue[BLE_LINK_MAX_NODES];
+static lv_obj_t *bleNodeCardUse[BLE_LINK_MAX_NODES];
+
+static void ble_slot_use_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int slot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (!bleLinkSlotIsSubscribed(slot)) return;
+
+  activeBleSlot = slot;
+  bleNodeRefreshMetadata();
+
+  if (activeSensorMode == SENSOR_MODE_BLE) updateActiveSensorUiLabels();
+  else pendingSensorMode = SENSOR_MODE_BLE;
+
+  refreshBleScreen();
+
+  // The graph, the 시작/정지 pair and 일괄전송 all live on the measurement
+  // screen, so staying here would leave the node connected with no way to
+  // record it - which is exactly how it looked.
+  requestScreenSwitch(measureScreen);
+}
+
+static void ble_slot_drop_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  pendingBleDropSlot = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+}
+
+// Everything the node is reporting, on one line: "온도 26.9C · 기압 1003.6hPa".
+static void bleSlotValueSummary(int slot, char *out, size_t outSize)
+{
+  out[0] = 0;
+
+  const int count = bleLinkValueCount(slot);
+
+  for (int i = 0; i < count && i < BLE_LINK_MAX_VALUES; i++)
+  {
+    float value = NAN;
+    char quantity[24] = "";
+    char unit[24] = "";
+
+    if (!bleLinkValueAt(slot, i, &value, quantity, unit, NULL)) break;
+
+    char entry[48];
+    snprintf(entry, sizeof(entry), "%s%s %.4g%s", out[0] ? "  ·  " : "",
+             quantity, value, bleDisplayUnit(unit));
+    strncat(out, entry, outSize - strlen(out) - 1);
+  }
+
+  if (out[0] == 0) snprintf(out, outSize, "값 대기 중");
+}
+
 void refreshBleScreen()
 {
   if (bleList == NULL) return;
 
-  if (labelBleState)
+  // ---- the connected nodes -------------------------------------------------
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
   {
+    if (bleNodeCards[slot] == NULL) continue;
+
+    const bool live = bleLinkSlotIsSubscribed(slot);
+    const bool busy = bleLinkSlotIsBusy(slot);
+    const bool active = live && slot == activeBleSlot;
+
+    if (!live && !busy)
+    {
+      lv_obj_add_flag(bleNodeCards[slot], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+
+    lv_obj_clear_flag(bleNodeCards[slot], LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_set_style_bg_color(bleNodeCards[slot],
+                              lv_color_hex(active ? UI_ACCENT_TINT : UI_SURFACE), 0);
+    lv_obj_set_style_border_width(bleNodeCards[slot], active ? 2 : 0, 0);
+    lv_obj_set_style_border_color(bleNodeCards[slot], lv_color_hex(UI_ACCENT), 0);
+
+    lv_label_set_text(bleNodeCardName[slot], bleLinkSlotName(slot));
+    lv_label_set_text(bleNodeCardState[slot],
+                      active ? "측정 중" : bleLinkSlotState(slot));
+    lv_obj_set_style_text_color(bleNodeCardState[slot],
+                                lv_color_hex(active ? UI_ACCENT : UI_TEXT_3), 0);
+
+    char values[96];
+    bleSlotValueSummary(slot, values, sizeof(values));
+    lv_label_set_text(bleNodeCardValue[slot], values);
+
+    if (active) lv_obj_add_flag(bleNodeCardUse[slot], LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_clear_flag(bleNodeCardUse[slot], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- the summary line ----------------------------------------------------
+  if (labelBleLink)
+  {
+    char text[120];
+    const int linked = bleLinkNodeCount();
+
     if (!bleEnabled)
     {
-      lv_label_set_text(labelBleState, "블루투스가 꺼져 있습니다.");
+      snprintf(text, sizeof(text), "블루투스가 꺼져 있습니다");
     }
-    else if (bleScanIsRunning())
+    else if (linked == 0)
     {
-      lv_label_set_text(labelBleState, "검색 중...");
+      snprintf(text, sizeof(text), "연결된 노드 없음 · 아래 목록에서 센서를 누르세요");
     }
     else
     {
-      char text[96];
-      const int candidates = bleScanCandidateCount();
-      snprintf(
-        text,
-        sizeof(text),
-        "센서 후보 %d개 · 이름 없는 기기 %d개 · 내 이름 %s",
-        candidates,
-        bleScanResultCount() - candidates,
-        bleAdvertisedName()
-      );
-      lv_label_set_text(labelBleState, text);
+      snprintf(text, sizeof(text), "노드 %d/%d 연결됨", linked, BLE_LINK_MAX_NODES);
     }
+
+    lv_label_set_text(labelBleLink, text);
   }
 
-  // Rebuild only when the count changed, so the list does not flicker while a
-  // scan is filling in.
-  static int lastShownCount = -1;
-  static bool lastScanning = false;
-  const int count = bleScanResultCount();
-  const bool scanning = bleScanIsRunning();
-
-  if (count == lastShownCount && scanning == lastScanning) return;
-  lastShownCount = count;
-  lastScanning = scanning;
-
+  // ---- the scan list -------------------------------------------------------
   lv_obj_clean(bleList);
 
-  if (count == 0)
+  const bool scanning = bleScanIsRunning();
+  const int count = bleScanResultCount();
+
+  if (labelBleState)
   {
-    lv_obj_t *empty = lv_label_create(bleList);
-    lv_label_set_text(empty, scanning ? "검색 중입니다." : "찾은 기기가 없습니다. 센서 전원을 켜고 다시 검색하세요.");
-    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_3), 0);
-    return;
+    char text[80];
+
+    if (scanning) snprintf(text, sizeof(text), "검색 중...");
+    else if (count == 0) snprintf(text, sizeof(text), "검색된 기기 없음");
+    else snprintf(text, sizeof(text), "검색된 기기 %d개", count);
+
+    lv_label_set_text(labelBleState, text);
   }
 
-  // Anonymous devices are collapsed into one line: thirteen rows of random
-  // addresses hide the one row that matters.
+  int rowCount = 0;
   int anonymous = 0;
+  int listed = 0;
 
   for (int i = 0; i < count; i++)
   {
@@ -7354,8 +8780,14 @@ void refreshBleScreen()
 
     if (!bleScanResultIsCandidate(&r)) { anonymous++; continue; }
 
+    const int slot = bleLinkSlotForAddress(r.address);
+    const bool live = slot >= 0 && bleLinkSlotIsSubscribed(slot);
+
+    // A node already shown as a card above does not need a second entry.
+    if (live) continue;
+
     lv_obj_t *row = lv_obj_create(bleList);
-    lv_obj_set_size(row, 908, 52);
+    lv_obj_set_size(row, 936, 56);
     lv_obj_set_style_bg_color(row, lv_color_hex(UI_SURFACE), 0);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(row, 10, 0);
@@ -7364,52 +8796,78 @@ void refreshBleScreen()
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+    if (rowCount < BLE_SCAN_MAX_RESULTS)
+    {
+      snprintf(bleRowAddress[rowCount], sizeof(bleRowAddress[rowCount]), "%s", r.address);
+      bleRowIsSensorNode[rowCount] = strstr(r.services, "6e5f0001") != NULL;
+      lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_add_event_cb(row, ble_row_event_cb, LV_EVENT_CLICKED,
+                          (void *)(intptr_t)rowCount);
+      rowCount++;
+    }
+
     lv_obj_t *name = lv_label_create(row);
     lv_label_set_text(name, r.name[0] ? r.name : "(이름 없음)");
     lv_obj_set_style_text_font(name, FONT_KR, 0);
     lv_obj_set_style_text_color(name, lv_color_hex(r.name[0] ? UI_TEXT : UI_TEXT_3), 0);
-    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 14, 6);
+    lv_obj_set_width(name, 520);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_align(name, LV_ALIGN_TOP_LEFT, 16, 8);
 
-    // The service UUID is the field that identifies an unknown sensor, so it
-    // is shown rather than hidden behind a detail view.
+    const bool isSensorNode = strstr(r.services, "6e5f0001") != NULL;
+
+    const int rowSlot = bleLinkSlotForAddress(r.address);
+
     lv_obj_t *detail = lv_label_create(row);
-    char text[96];
-    snprintf(text, sizeof(text), "%s  ·  %s", r.address,
-             r.services[0] ? r.services : "서비스 광고 없음");
-    lv_label_set_text(detail, text);
+
+    if (isSensorNode) lv_label_set_text(detail, "이 보드용 센서 노드");
+    else if (rowSlot >= 0 && bleLinkSlotIsExploring(rowSlot))
+      lv_label_set_text(detail, bleLinkExploreSummary(rowSlot)[0]
+                                  ? bleLinkExploreSummary(rowSlot)
+                                  : bleLinkSlotState(rowSlot));
+    else lv_label_set_text(detail, "눌러서 분석");
     lv_obj_set_style_text_font(detail, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(detail, lv_color_hex(UI_TEXT_3), 0);
-    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 14, 28);
+    lv_obj_set_style_text_color(detail,
+                                lv_color_hex(isSensorNode ? UI_OK : UI_TEXT_3), 0);
+    lv_obj_set_width(detail, 520);
+    lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 16, 32);
 
     lv_obj_t *rssi = lv_label_create(row);
-    snprintf(text, sizeof(text), "%d dBm", r.rssi);
+    char text[40];
+    snprintf(text, sizeof(text), "%s%d dBm",
+             (slot >= 0 && bleLinkSlotIsBusy(slot)) ? "연결 중  ·  " : "", r.rssi);
     lv_label_set_text(rssi, text);
     lv_obj_set_style_text_font(rssi, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(rssi, lv_color_hex(UI_TEXT_2), 0);
-    lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -14, 0);
+    lv_obj_align(rssi, LV_ALIGN_RIGHT_MID, -16, 0);
+
+    listed++;
   }
 
-  if (anonymous > 0)
+  if (listed == 0 && !scanning)
+  {
+    lv_obj_t *empty = lv_label_create(bleList);
+    lv_label_set_text(
+      empty,
+      count == 0
+        ? "센서 노드의 전원을 켜고 [다시 검색]을 누르세요."
+        : "연결할 수 있는 센서를 찾지 못했습니다. 이름도 서비스도 알리지 않는 주변 기기는 숨겼습니다."
+    );
+    lv_obj_set_width(empty, 900);
+    lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
+    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_3), 0);
+  }
+
+  if (anonymous > 0 && listed > 0)
   {
     lv_obj_t *note = lv_label_create(bleList);
     char text[96];
-    snprintf(
-      text,
-      sizeof(text),
-      "이름도 서비스도 알리지 않는 기기 %d개는 숨겼습니다. 주변 휴대폰·노트북입니다.",
-      anonymous
-    );
+    snprintf(text, sizeof(text), "주변 휴대폰·노트북 %d개는 숨겼습니다.", anonymous);
     lv_label_set_text(note, text);
     lv_obj_set_style_text_font(note, FONT_KR_SMALL, 0);
     lv_obj_set_style_text_color(note, lv_color_hex(UI_TEXT_3), 0);
-  }
-
-  if (count > 0 && anonymous == count)
-  {
-    lv_obj_t *empty = lv_label_create(bleList);
-    lv_label_set_text(empty, "연결할 수 있는 센서를 찾지 못했습니다. 센서 전원을 켜고 가까이에서 다시 검색하세요.");
-    lv_obj_set_style_text_font(empty, FONT_KR_SMALL, 0);
-    lv_obj_set_style_text_color(empty, lv_color_hex(UI_TEXT_2), 0);
   }
 }
 
@@ -7430,22 +8888,57 @@ void createBleUi()
     &labelBarBleSd
   );
 
-  makeHeading(bleScreen, "블루투스 센서", 28, 58, UI_TEXT);
+  makeHeading(bleScreen, "블루투스", 28, 58, UI_TEXT);
 
-  labelBleState = makeSmallLabel(bleScreen, "검색 전", 28, 94, UI_TEXT_3);
-  lv_obj_set_width(labelBleState, 600);
-  lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_CLIP);
+  labelBleLink = makeSmallLabel(bleScreen, "연결된 노드 없음", 28, 92, UI_TEXT_2);
+  lv_obj_set_width(labelBleLink, 580);
+  lv_label_set_long_mode(labelBleLink, LV_LABEL_LONG_DOT);
 
-  makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
   makeQuietButton(bleScreen, "켜기/끄기", 648, 60, 168, 44, ble_enable_event_cb);
+  makeQuietButton(bleScreen, "다시 검색", 828, 60, 168, 44, ble_scan_event_cb);
 
-  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 116, UI_TEXT_2);
-  lv_obj_set_width(labelBleEnabledState, 968);
-  lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_CLIP);
+  // ---- one card per connected node ------------------------------------------
+  const int cardW = 312;
+  const int cardGap = 16;
+
+  for (int slot = 0; slot < BLE_LINK_MAX_NODES; slot++)
+  {
+    lv_obj_t *card = makePanel(bleScreen, 28 + slot * (cardW + cardGap), 120, cardW, 140);
+    bleNodeCards[slot] = card;
+
+    bleNodeCardName[slot] = makeLabel(card, "", 16, 12, UI_TEXT);
+    lv_obj_set_width(bleNodeCardName[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardName[slot], LV_LABEL_LONG_DOT);
+
+    bleNodeCardState[slot] = makeSmallLabel(card, "", 16, 42, UI_TEXT_3);
+    lv_obj_set_width(bleNodeCardState[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardState[slot], LV_LABEL_LONG_DOT);
+
+    bleNodeCardValue[slot] = makeSmallLabel(card, "", 16, 66, UI_TEXT_2);
+    lv_obj_set_width(bleNodeCardValue[slot], cardW - 32);
+    lv_label_set_long_mode(bleNodeCardValue[slot], LV_LABEL_LONG_DOT);
+
+    // The slot travels on the button itself: the helpers attach the handler,
+    // so adding a second one here would fire it twice, the first time with a
+    // null user_data that reads back as slot 0.
+    bleNodeCardUse[slot] = makePrimaryButton(card, "이 센서로 측정", 16, 94,
+                                             170, 36, UI_ACCENT, ble_slot_use_event_cb);
+    lv_obj_set_user_data(bleNodeCardUse[slot], (void *)(intptr_t)slot);
+
+    lv_obj_t *drop = makeQuietButton(card, "해제", 196, 94, 100, 36, ble_slot_drop_event_cb);
+    lv_obj_set_user_data(drop, (void *)(intptr_t)slot);
+
+    lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // ---- everything else the scan saw -----------------------------------------
+  labelBleState = makeSmallLabel(bleScreen, "검색 전", 28, 274, UI_TEXT_3);
+  lv_obj_set_width(labelBleState, 500);
+  lv_label_set_long_mode(labelBleState, LV_LABEL_LONG_DOT);
 
   bleList = lv_obj_create(bleScreen);
-  lv_obj_set_size(bleList, 968, 336);
-  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 148);
+  lv_obj_set_size(bleList, 968, 202);
+  lv_obj_align(bleList, LV_ALIGN_TOP_LEFT, 28, 300);
   lv_obj_set_style_bg_color(bleList, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(bleList, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(bleList, 0, 0);
@@ -7455,20 +8948,1554 @@ void createBleUi()
   lv_obj_set_flex_flow(bleList, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_scrollbar_mode(bleList, LV_SCROLLBAR_MODE_AUTO);
 
-  makeSmallLabel(
-    bleScreen,
-    "센서를 연결하려면 그 센서가 광고하는 서비스 UUID를 알아야 합니다. 위 목록의 UUID를 확인하세요.",
-    28,
-    500,
-    UI_TEXT_3
-  );
+  labelBleEnabledState = makeSmallLabel(bleScreen, "", 28, 512, UI_TEXT_3);
+  lv_obj_set_width(labelBleEnabledState, 968);
+  lv_label_set_long_mode(labelBleEnabledState, LV_LABEL_LONG_DOT);
 
   lv_label_set_text(
     labelBleEnabledState,
-    bleEnabled ? "블루투스: 켜짐" : "블루투스: 꺼짐 — 켜면 다음 시작부터 검색할 수 있습니다."
+    bleEnabled ? "목록에서 센서를 누르면 연결합니다."
+               : "블루투스가 꺼져 있습니다. 켜면 다음 시작부터 검색할 수 있습니다."
   );
 
-  createTabBar(bleScreen, 3);
+  createTabBar(bleScreen, TAB_BLE);
+}
+
+// The dropdown follows the active mode, not the other way round: a change is
+// requested through pendingSensorMode like any other, and this is what makes
+// the control agree with the board afterwards.
+void syncWiredSensorDropdown()
+{
+  if (wiredSensorDropdown == NULL) return;
+
+  for (int i = 0; i < WIRED_SENSOR_OPTION_COUNT; i++)
+  {
+    if (kWiredSensorModes[i] == activeSensorMode)
+    {
+      lv_dropdown_set_selected(wiredSensorDropdown, (uint16_t)i);
+      return;
+    }
+  }
+}
+
+// 설정: what is left once WiFi and 블루투스 have tabs of their own - the
+// device itself.
+void createDeviceUi()
+{
+  deviceScreen = lv_obj_create(NULL);
+  lv_obj_set_size(deviceScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(deviceScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(deviceScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(deviceScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(deviceScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  createStatusBar(
+    deviceScreen,
+    "",
+    &labelBarDeviceTime,
+    &labelBarDeviceWifi,
+    &labelBarDeviceSd
+  );
+
+  makeHeading(deviceScreen, "설정", 28, 58, UI_TEXT);
+
+  lv_obj_t *card = makePanel(deviceScreen, 28, 104, 968, 250);
+
+  makeSmallLabel(card, "센서", 20, 16, UI_TEXT_3);
+  makeQuietButton(card, "센서 검색", 20, 44, 180, 52, i2c_scan_event_cb);
+  makeSmallLabel(card,
+                 "센서 버스에 응답하는 장치와, 엔코더 신호가 들어오는 핀을 찾습니다.",
+                 216, 60, UI_TEXT_3);
+
+  makeSmallLabel(card, "지능형 과학실", 20, 110, UI_TEXT_3);
+  makeQuietButton(card, "전송 설정", 20, 138, 180, 52, go_isl_event_cb);
+  makeSmallLabel(card, "모듈 코드와 전송 방식을 확인합니다.", 216, 154, UI_TEXT_3);
+
+  makeQuietButton(card, "다시 시작", 788, 138, 160, 52, board_restart_event_cb);
+
+  // The sensors wired to this board, as a fallback. The home screen no longer
+  // offers them: every sensor is expected over Bluetooth now, but the port is
+  // still there and so are the drivers.
+  makeSmallLabel(card, "유선 센서 (예비)", 20, 212, UI_TEXT_3);
+
+  wiredSensorDropdown = lv_dropdown_create(card);
+  lv_obj_set_size(wiredSensorDropdown, 400, 48);
+  lv_obj_align(wiredSensorDropdown, LV_ALIGN_TOP_LEFT, 216, 196);
+  lv_dropdown_set_options_static(wiredSensorDropdown, kWiredSensorOptions);
+  lv_obj_set_style_text_font(wiredSensorDropdown, FONT_KR, 0);
+  // The arrow is a symbol glyph the Korean face does not carry.
+  lv_obj_set_style_text_font(wiredSensorDropdown, &lv_font_montserrat_16, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(wiredSensorDropdown, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_border_width(wiredSensorDropdown, 0, 0);
+  lv_obj_set_style_radius(wiredSensorDropdown, 10, 0);
+  lv_obj_set_style_text_color(wiredSensorDropdown, lv_color_hex(UI_TEXT), 0);
+  lv_obj_add_event_cb(wiredSensorDropdown, wired_sensor_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  // The list exists from the constructor in LVGL 8.3, so it can be styled now.
+  // Nine rows at 16 px would be a thumb-wide strip; the line spacing makes
+  // each one a target, and the height cap keeps it on the screen.
+  lv_obj_t *wiredList = lv_dropdown_get_list(wiredSensorDropdown);
+  if (wiredList)
+  {
+    lv_obj_set_style_text_font(wiredList, FONT_KR, 0);
+    lv_obj_set_style_text_line_space(wiredList, 20, 0);
+    lv_obj_set_style_max_height(wiredList, 300, 0);
+  }
+
+  syncWiredSensorDropdown();
+
+  labelDeviceNote = makeSmallLabel(deviceScreen, "", 28, 366, UI_TEXT_3);
+  lv_obj_set_width(labelDeviceNote, 968);
+  lv_label_set_long_mode(labelDeviceNote, LV_LABEL_LONG_WRAP);
+
+  createTabBar(deviceScreen, TAB_DEVICE);
+}
+
+// =====================================================
+// 조건 측정
+// =====================================================
+
+static const CondPreset *condPreset()
+{
+  return &kCondPresets[condPresetIndex];
+}
+
+// The variable a preset reads from a sensor, or NULL when both are by hand.
+static const CondVariable *condSensorVariable(const CondPreset *P)
+{
+  if (P->x.source != COND_SRC_MANUAL) return &P->x;
+  if (P->y.source != COND_SRC_MANUAL) return &P->y;
+  return NULL;
+}
+
+static const CondVariable *condManualVariable(const CondPreset *P)
+{
+  if (P->x.source == COND_SRC_MANUAL) return &P->x;
+  if (P->y.source == COND_SRC_MANUAL) return &P->y;
+  return NULL;
+}
+
+// Reads a variable that comes from a node. The lead slot is tried first, then
+// every other one, and every quantity each reports, comparing the node's unit
+// with the variable's aliases - so a PASCO sensor saying kPa and a node
+// saying hPa both feed 압력, brought to one unit. Only a fresh value counts.
+//
+// This walks bleLinkValueAt() directly rather than the measurement screen's
+// three-value readout, which is capped across nodes: a CO2 node reporting
+// three quantities would otherwise hide a pressure sensor in the next slot.
+static bool condReadFromNodes(const CondVariable *v, float *out,
+                              char *nodeOut, size_t nodeOutSize,
+                              char *nameOut, char *unitOut, size_t textSize)
+{
+  for (int pass = 0; pass <= BLE_LINK_MAX_NODES; pass++)
+  {
+    const int slot = pass == 0 ? activeBleSlot : pass - 1;
+    if (pass > 0 && slot == activeBleSlot) continue;
+    if (slot < 0 || slot >= BLE_LINK_MAX_NODES) continue;
+    if (!bleLinkSlotIsSubscribed(slot)) continue;
+
+    const int count = bleLinkValueCount(slot);
+
+    for (int i = 0; i < count; i++)
+    {
+      // 일반 takes the first thing a node says and nothing else.
+      if (v->source == COND_SRC_SENSOR_ANY && i > 0) break;
+
+      float value = NAN;
+      char quantity[24] = "";
+      char unit[24] = "";
+      uint32_t ageMs = 0;
+
+      if (!bleLinkValueAt(slot, i, &value, quantity, unit, &ageMs)) break;
+      if (isnan(value) || ageMs > BLE_READING_MAX_AGE_MS) continue;
+
+      float scale = 1.0f;
+      float offset = 0.0f;
+      bool matched = v->source == COND_SRC_SENSOR_ANY;
+
+      if (v->source == COND_SRC_SENSOR)
+      {
+        for (int a = 0; a < COND_MAX_ALIASES && v->aliases[a].unit != NULL; a++)
+        {
+          if (strcmp(v->aliases[a].unit, unit) != 0) continue;
+          matched = true;
+          scale = v->aliases[a].scale;
+          offset = v->aliases[a].offset;
+          break;
+        }
+      }
+
+      if (!matched) continue;
+
+      *out = value * scale + offset;
+      if (nodeOut) snprintf(nodeOut, nodeOutSize, "%s", bleLinkSlotName(slot));
+      if (nameOut) snprintf(nameOut, textSize, "%s", quantity);
+      if (unitOut) snprintf(unitOut, textSize, "%s", unit);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// A sensor wired to this board, chosen on the 설정 screen, can feed a
+// variable too: the idle preview holds its latest readings.
+static bool condReadFromWired(const CondVariable *v, float *out,
+                              char *nameOut, char *unitOut, size_t textSize)
+{
+  if (activeSensorMode == SENSOR_MODE_BLE || !previewValid) return false;
+
+  const char *units[2] = { activePrimaryUnit(), activeSecondaryUnit() };
+  const char *names[2] = { activePrimaryName(), activeSecondaryName() };
+
+  for (int i = 0; i < 2; i++)
+  {
+    const float value = previewValues[i];
+    if (isnan(value)) continue;
+    // The second preview slot is a pressure only for the DPS310; an SCD41
+    // puts its temperature there, which the pressure range would reject.
+    if (i == 1 && activeSensorHasPressure() && !pressureValueValid(value)) continue;
+    if (v->source == COND_SRC_SENSOR_ANY && i > 0) break;
+
+    float scale = 1.0f;
+    float offset = 0.0f;
+    bool matched = v->source == COND_SRC_SENSOR_ANY;
+
+    if (v->source == COND_SRC_SENSOR)
+    {
+      for (int a = 0; a < COND_MAX_ALIASES && v->aliases[a].unit != NULL; a++)
+      {
+        if (strcmp(v->aliases[a].unit, units[i]) != 0) continue;
+        matched = true;
+        scale = v->aliases[a].scale;
+        offset = v->aliases[a].offset;
+        break;
+      }
+    }
+
+    if (!matched) continue;
+
+    *out = value * scale + offset;
+    if (nameOut) snprintf(nameOut, textSize, "%s", names[i]);
+    if (unitOut) snprintf(unitOut, textSize, "%s", units[i]);
+    return true;
+  }
+
+  return false;
+}
+
+// The current number for a variable, wherever it comes from. `nodeOut` names
+// the node it came from, or the board itself.
+static bool condReadVariable(const CondVariable *v, float *out,
+                             char *nodeOut, size_t nodeOutSize,
+                             char *nameOut, char *unitOut, size_t textSize)
+{
+  if (v->source == COND_SRC_MANUAL)
+  {
+    *out = condManual[condPresetIndex];
+    if (nodeOut) nodeOut[0] = 0;
+    if (nameOut) snprintf(nameOut, textSize, "%s", v->name);
+    if (unitOut) snprintf(unitOut, textSize, "%s", v->unit);
+    return true;
+  }
+
+  if (condReadFromNodes(v, out, nodeOut, nodeOutSize, nameOut, unitOut, textSize)) return true;
+
+  if (condReadFromWired(v, out, nameOut, unitOut, textSize))
+  {
+    if (nodeOut) snprintf(nodeOut, nodeOutSize, "%s", "보드 센서");
+    return true;
+  }
+
+  return false;
+}
+
+// The variable's own unit for display: a preset's, or for 일반 whatever the
+// node said when the run began (or is saying now, before the first point).
+static const char *condDisplayUnit(const CondVariable *v)
+{
+  if (v->source == COND_SRC_SENSOR_ANY)
+  {
+    return bleDisplayUnit(condAnyUnit);
+  }
+
+  return v->unit;
+}
+
+static const char *condDisplayName(const CondVariable *v)
+{
+  if (v->source == COND_SRC_SENSOR_ANY && condAnyName[0]) return condAnyName;
+  return v->name;
+}
+
+static int condDecimals(const CondVariable *v)
+{
+  return v->decimals;
+}
+
+static float condDerivedValue(const CondPreset *P, float x, float y)
+{
+  if (P->derived == COND_DERIVED_PRODUCT) return x * y;
+
+  if (P->derived == COND_DERIVED_RATIO)
+  {
+    const float d = x + P->derivedOffsetX;
+    return fabsf(d) < 1e-6f ? NAN : y / d;
+  }
+
+  return NAN;
+}
+
+// The fit through the points, in the shape the preset expects.
+static void condComputeFit(const CondPreset *P, int pi, CondFit *fit)
+{
+  memset(fit, 0, sizeof(*fit));
+  fit->k = NAN;
+  fit->a = NAN;
+  fit->b = NAN;
+  fit->derivedMean = NAN;
+
+  const int n = condPointCount[pi];
+  if (n == 0) return;
+
+  if (P->derived != COND_DERIVED_NONE)
+  {
+    float sum = 0.0f;
+    int used = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+      const float d = condDerivedValue(P, condX[pi][i], condY[pi][i]);
+      if (isnan(d)) continue;
+      sum += d;
+      used++;
+    }
+
+    if (used > 0) fit->derivedMean = sum / (float)used;
+  }
+
+  if (P->fit == COND_FIT_INVERSE)
+  {
+    float sum = 0.0f;
+    int used = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+      if (fabsf(condX[pi][i]) < 1e-6f) continue;
+      sum += condX[pi][i] * condY[pi][i];
+      used++;
+    }
+
+    if (used > 0)
+    {
+      fit->k = sum / (float)used;
+      fit->valid = true;
+    }
+  }
+  else if (P->fit == COND_FIT_LINEAR && n >= 2)
+  {
+    float xm = 0.0f;
+    float ym = 0.0f;
+
+    for (int i = 0; i < n; i++)
+    {
+      xm += condX[pi][i];
+      ym += condY[pi][i];
+    }
+
+    xm /= (float)n;
+    ym /= (float)n;
+
+    float sxx = 0.0f;
+    float sxy = 0.0f;
+
+    for (int i = 0; i < n; i++)
+    {
+      sxx += (condX[pi][i] - xm) * (condX[pi][i] - xm);
+      sxy += (condX[pi][i] - xm) * (condY[pi][i] - ym);
+    }
+
+    // Two readings at the same temperature give no slope at all.
+    if (sxx > 1e-6f)
+    {
+      fit->b = sxy / sxx;
+      fit->a = ym - fit->b * xm;
+      fit->valid = true;
+    }
+  }
+}
+
+// The axis a set of values is drawn on: the preset's range, widened to the
+// grid by any point outside it; or, when the preset leaves it to the data,
+// the data's range rounded out to the grid.
+static CondAxis condAxisRange(float presetMin, float presetMax, float step,
+                              const float *values, int n, bool stretchTop)
+{
+  CondAxis axis;
+  if (step <= 0.0f) step = 1.0f;
+
+  float dataMin = NAN;
+  float dataMax = NAN;
+
+  for (int i = 0; i < n; i++)
+  {
+    if (isnan(dataMin) || values[i] < dataMin) dataMin = values[i];
+    if (isnan(dataMax) || values[i] > dataMax) dataMax = values[i];
+  }
+
+  if (isnan(dataMin)) { dataMin = 0.0f; dataMax = 0.0f; }
+
+  axis.lo = isnan(presetMin) ? floorf(dataMin / step) * step : presetMin;
+
+  if (isnan(presetMax))
+  {
+    // Some headroom above the highest point, so it does not sit on the edge.
+    const float top = stretchTop ? dataMax + 0.1f * (dataMax - axis.lo) : dataMax;
+    axis.hi = ceilf(top / step) * step;
+  }
+  else
+  {
+    axis.hi = presetMax;
+  }
+
+  if (dataMin < axis.lo) axis.lo = floorf(dataMin / step) * step;
+  if (dataMax > axis.hi) axis.hi = ceilf(dataMax / step) * step;
+  if (axis.hi - axis.lo < step) axis.hi = axis.lo + step;
+
+  axis.span = axis.hi - axis.lo;
+  return axis;
+}
+
+static void condSetNote(const char *text)
+{
+  if (labelConditionNote) lv_label_set_text(labelConditionNote, text);
+}
+
+// ---- buttons -----------------------------------------------------------------
+
+static void condition_preset_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int index = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  if (index < 0 || index >= COND_PRESET_COUNT) return;
+
+  // Points are kept per preset, so this is a change of view, not of data.
+  condPresetIndex = index;
+  condDirty = true;
+  condSetNote("");
+  refreshConditionScreen();
+}
+
+static void condition_step_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const CondVariable *v = condManualVariable(P);
+  if (v == NULL) return;
+
+  // The index rides on the button; the size of the step is the preset's, so
+  // one set of four buttons serves every experiment.
+  const int index = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
+  const float tiny = v->stepSmall / 10.0f;
+  const float steps[6] = { -v->stepLarge, -v->stepSmall, -tiny, tiny, v->stepSmall, v->stepLarge };
+  if (index < 0 || index > 5) return;
+
+  float value = condManual[condPresetIndex] + steps[index];
+  if (value < v->minValue) value = v->minValue;
+  if (value > v->maxValue) value = v->maxValue;
+  condManual[condPresetIndex] = value;
+
+  refreshConditionScreen();
+}
+
+static void condition_record_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+
+  if (n >= COND_MAX_POINTS)
+  {
+    condSetNote("점이 가득 찼습니다. 지우고 다시 시작하세요.");
+    return;
+  }
+
+  float x = NAN;
+  float y = NAN;
+  char name[24] = "";
+  char unit[24] = "";
+
+  const CondVariable *sensorVar = condSensorVariable(P);
+
+  if (!condReadVariable(&P->x, &x, NULL, 0, name, unit, sizeof(name)) ||
+      !condReadVariable(&P->y, &y, NULL, 0, name, unit, sizeof(name)))
+  {
+    char note[120];
+    snprintf(note, sizeof(note), "%s 값을 읽을 수 없습니다. 센서가 연결되어 있는지 확인하세요.",
+             sensorVar ? sensorVar->name : "센서");
+    condSetNote(note);
+    return;
+  }
+
+  // 일반 records whatever the node says, so the run has to remember what that
+  // was: a second quantity in the same column would be two experiments.
+  if (sensorVar && sensorVar->source == COND_SRC_SENSOR_ANY)
+  {
+    // Two nodes with the same unit are still two sensors: a run that began
+    // on one must not quietly continue on the other when the first goes quiet.
+    float again = NAN;
+    char node[32] = "";
+    condReadVariable(sensorVar, &again, node, sizeof(node), NULL, NULL, 0);
+
+    if (n == 0)
+    {
+      snprintf(condAnyName, sizeof(condAnyName), "%s", name);
+      snprintf(condAnyUnit, sizeof(condAnyUnit), "%s", unit);
+      snprintf(condAnyNode, sizeof(condAnyNode), "%s", node);
+    }
+    else if (strcmp(condAnyUnit, unit) != 0 || strcmp(condAnyNode, node) != 0)
+    {
+      char note[140];
+      snprintf(note, sizeof(note), "%s의 값이 아닙니다. 그 센서를 다시 연결하거나, 지우기 후 기록하세요.",
+               condAnyNode[0] ? condAnyNode : "처음 센서");
+      condSetNote(note);
+      return;
+    }
+  }
+
+  // A repeat at a condition the student set is a correction, not a second
+  // reading - but only when the condition is the one set by hand. In 샤를 the
+  // temperature is what varies, and two readings at one volume are both real.
+  int slot = n;
+
+  if (P->x.source == COND_SRC_MANUAL)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      if (fabsf(condX[pi][i] - x) < 0.05f)
+      {
+        slot = i;
+        break;
+      }
+    }
+  }
+
+  condX[pi][slot] = x;
+  condY[pi][slot] = y;
+  if (slot == n) condPointCount[pi] = n + 1;
+
+  Serial.printf("[COND] %s: %s %.3f -> %s %.3f (%s %.3f)\n", P->title,
+                condDisplayName(&P->x), x, condDisplayName(&P->y), y,
+                P->derivedName ? P->derivedName : "-", condDerivedValue(P, x, y));
+
+  condDirty = true;
+  condSetNote(slot == n ? "" : "같은 조건의 점을 새 값으로 바꿨습니다.");
+  refreshConditionScreen();
+}
+
+static void condition_undo_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const int pi = condPresetIndex;
+  if (condPointCount[pi] > 0) condPointCount[pi]--;
+
+  if (condPointCount[pi] == 0 && condSensorVariable(condPreset()) != NULL &&
+      condSensorVariable(condPreset())->source == COND_SRC_SENSOR_ANY)
+  {
+    condAnyName[0] = 0;
+    condAnyUnit[0] = 0;
+    condAnyNode[0] = 0;
+  }
+
+  condDirty = true;
+  refreshConditionScreen();
+}
+
+static void condition_clear_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  condPointCount[condPresetIndex] = 0;
+
+  const CondVariable *sensorVar = condSensorVariable(condPreset());
+  if (sensorVar && sensorVar->source == COND_SRC_SENSOR_ANY)
+  {
+    condAnyName[0] = 0;
+    condAnyUnit[0] = 0;
+    condAnyNode[0] = 0;
+  }
+
+  condDirty = true;
+  condSetNote("");
+  refreshConditionScreen();
+}
+
+static void condition_save_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+
+  if (n == 0)
+  {
+    condSetNote("저장할 점이 없습니다.");
+    return;
+  }
+
+  if (!sdReady)
+  {
+    sdReady = initSdCard();
+    updateSdStatusLabels();
+  }
+
+  if (!sdReady)
+  {
+    condSetNote("SD 카드를 읽을 수 없습니다.");
+    return;
+  }
+
+  char path[160];
+  snprintf(path, sizeof(path), "%s/%s.csv", MOUNT_POINT, P->csvFile);
+
+  FILE *file = fopen(path, "w");
+
+  if (file == NULL)
+  {
+    char note[120];
+    snprintf(note, sizeof(note), "%s.csv를 만들 수 없습니다.", P->csvFile);
+    condSetNote(note);
+    return;
+  }
+
+  // The derived column is the whole point of the experiment, so the file
+  // carries it rather than leaving every student to work it out by hand.
+  if (P->derivedCsvName) fprintf(file, "no,%s,%s,%s\n", P->x.csvName, P->y.csvName, P->derivedCsvName);
+  else fprintf(file, "no,%s,%s\n", P->x.csvName, P->y.csvName);
+
+  for (int i = 0; i < n; i++)
+  {
+    fprintf(file, "%d,%.*f,%.*f", i + 1,
+            condDecimals(&P->x) + 1, condX[pi][i],
+            condDecimals(&P->y) + 1, condY[pi][i]);
+
+    if (P->derivedCsvName) fprintf(file, ",%.4f", condDerivedValue(P, condX[pi][i], condY[pi][i]));
+
+    fprintf(file, "\n");
+  }
+
+  fclose(file);
+
+  char note[120];
+  snprintf(note, sizeof(note), "%s.csv 저장됨: %d개 점", P->csvFile, n);
+  condSetNote(note);
+}
+
+// The 지능형 과학실 helpers live with the rest of the upload code, well below
+// this screen.
+bool extractJsonStringValue(const String &json, const char *key, char *out, size_t outLen);
+bool httpPostJsonReliable(const char *url, const String &payload, String *response,
+                          const char *label, int maxAttempts, int delayMs);
+bool httpPostJsonReliableCode(const char *url, const String &payload, String *response,
+                             const char *label, const char *ok1, const char *ok2,
+                             const char *ok3);
+String jsonEscapeString(const char *text);
+void formatDirectAxisTick(uint32_t timeS, char *out, size_t outSize);
+bool directIslStartProcess(const char *modumId);
+bool directIslSetStatusOnIfNeeded();
+
+// What goes up for one variable: the platform's code for it, the name it is
+// shown under, and the channel. A sensor variable maps by its unit through the
+// same table the measurement screen uses; a hand-set volume has its own
+// probed code; anything else stays on the board.
+typedef struct
+{
+  const char *sensorType;
+  const char *nickname;
+  const char *channel;
+  const char *collectUnit;
+  bool isVolume;
+  const float *values;
+} CondIslItem;
+
+static int condIslItems(const CondPreset *P, int pi, CondIslItem *items, char *skipped, size_t skippedSize)
+{
+  const CondVariable *vars[2] = { &P->x, &P->y };
+  const float *values[2] = { condX[pi], condY[pi] };
+  int count = 0;
+  bool channelOneTaken = false;
+
+  skipped[0] = 0;
+
+  for (int i = 0; i < 2; i++)
+  {
+    const CondVariable *v = vars[i];
+
+    if (v->source == COND_SRC_MANUAL)
+    {
+      if (v->islType == NULL)
+      {
+        strncat(skipped, skipped[0] ? ", " : "", skippedSize - strlen(skipped) - 1);
+        strncat(skipped, v->name, skippedSize - strlen(skipped) - 1);
+        continue;
+      }
+
+      items[count].sensorType = v->islType;
+      items[count].nickname = v->islNickname;
+      items[count].channel = "01";
+      items[count].collectUnit = v->unit;
+      items[count].isVolume = true;
+      items[count].values = values[i];
+      count++;
+      continue;
+    }
+
+    // Mapped by the unit the number is IN - the preset's own, after any
+    // kPa-to-hPa scaling - so the figure and its label agree on the server.
+    const char *unit = v->source == COND_SRC_SENSOR_ANY ? condAnyUnit : v->unit;
+    const BleIslMapping *m = bleIslMappingForUnit(unit);
+
+    if (m == NULL)
+    {
+      strncat(skipped, skipped[0] ? ", " : "", skippedSize - strlen(skipped) - 1);
+      strncat(skipped, condDisplayName(v), skippedSize - strlen(skipped) - 1);
+      continue;
+    }
+
+    items[count].sensorType = m->sensorType;
+    items[count].nickname = m->nickname;
+    items[count].channel = m->channel;
+    items[count].collectUnit = m->collectUnit;
+    items[count].isVolume = false;
+    items[count].values = values[i];
+    if (strcmp(m->channel, "01") == 0) channelOneTaken = true;
+    count++;
+  }
+
+  // Two items cannot share a channel. Pressure already pairs with temperature
+  // as 02, so the volume takes 02 when the sensor beside it holds 01.
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume && channelOneTaken) items[i].channel = "02";
+  }
+
+  return count;
+}
+
+static String condIslTypeItems(const CondIslItem *items, int count, const char *volumeType)
+{
+  String out = "";
+
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume && volumeType == NULL) continue;
+
+    if (out.length()) out += ",";
+    out += "{\"sensorType\":\"";
+    out += items[i].isVolume ? volumeType : items[i].sensorType;
+    out += "\",\"sensorNicNm\":\"";
+    out += items[i].nickname;
+    out += "\",\"channelCode\":\"";
+    out += items[i].channel;
+    out += "\"}";
+  }
+
+  return out;
+}
+
+// Registers the run's variables. The volume code is unknown to the appendix,
+// so the candidates are tried in turn and, failing all of them, the sensor
+// goes up on its own.
+static bool condRegisterSensorTypes(const CondIslItem *items, int count)
+{
+  bool haveVolume = false;
+  int sensorItems = 0;
+
+  for (int i = 0; i < count; i++)
+  {
+    if (items[i].isVolume) haveVolume = true;
+    else sensorItems++;
+  }
+
+  const int candidateCount = (int)(sizeof(kCondVolumeTypes) / sizeof(kCondVolumeTypes[0]));
+  const int passes = haveVolume ? candidateCount + 1 : 1;
+
+  for (int pass = 0; pass < passes; pass++)
+  {
+    const bool withVolume = haveVolume && pass < candidateCount;
+    const char *volumeType = withVolume ? kCondVolumeTypes[pass] : NULL;
+    const int registered = sensorItems + (withVolume ? 1 : 0);
+
+    if (registered == 0) break;
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":";
+    payload += registered;
+    payload += ",\"items\":[";
+    payload += condIslTypeItems(items, count, volumeType);
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "COND_TYPE", 2, 700))
+    {
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      snprintf(condVolumeSensorType, sizeof(condVolumeSensorType), "%s", withVolume ? volumeType : "");
+
+      if (withVolume) Serial.printf("[COND] volume accepted as %s\n", volumeType);
+      else if (haveVolume) Serial.println("[COND] no volume type accepted; sending the sensor only");
+
+      return true;
+    }
+
+    Serial.print("[COND] sensor type refused: ");
+    Serial.println(response);
+  }
+
+  return false;
+}
+
+// Sends the recorded points to 지능형 과학실. The platform's data model is a
+// value against a time, so the point number stands in for the time: the
+// points go up in the order they were taken, each variable as its own item.
+void conditionUploadToIsl()
+{
+  const int pi = condUploadPreset;
+  const CondPreset *P = &kCondPresets[pi];
+  const int n = condPointCount[pi];
+
+  if (n == 0)
+  {
+    condSetNote("전송할 점이 없습니다.");
+    return;
+  }
+
+  CondIslItem items[2];
+  char skipped[80];
+  const int count = condIslItems(P, pi, items, skipped, sizeof(skipped));
+
+  if (count == 0)
+  {
+    char note[140];
+    snprintf(note, sizeof(note), "전송할 수 있는 단위가 없습니다 (%s)", skipped);
+    condSetNote(note);
+    return;
+  }
+
+  if (!cloudModumConfigured())
+  {
+    condSetNote("모둠코드를 먼저 입력하세요.");
+    return;
+  }
+
+  if (!ensureWifiReadyForHttp("조건전송", 20000))
+  {
+    condSetNote("WiFi가 연결되어 있지 않습니다.");
+    return;
+  }
+
+  char modumId[64];
+  copyCurrentModumIdTo(modumId, sizeof(modumId));
+
+  // A fresh session: these points are one experiment, not a continuation of
+  // whatever the measurement screen was last doing.
+  resetDirectIslSessionCache("condition upload");
+
+  if (!directIslStartProcess(modumId))
+  {
+    condSetNote("탐구 시작 요청 실패");
+    return;
+  }
+
+  if (!condRegisterSensorTypes(items, count))
+  {
+    condSetNote("센서등록 실패");
+    return;
+  }
+
+  directIslSensorTypeOk = true;
+
+  if (!directIslSetStatusOnIfNeeded())
+  {
+    condSetNote("상태 전환 실패");
+    return;
+  }
+
+  int sent = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    // Written before each round trip: written after, the screen stayed blank
+    // until the first upload returned, which is exactly the stretch where a
+    // person wonders whether the button did anything. Pumped twice because
+    // LVGL draws on one pass and flushes on the next.
+    char progress[80];
+    snprintf(progress, sizeof(progress), "전송 중 %d/%d", i + 1, n);
+    condSetNote(progress);
+    uiTimerHandler();
+    uiTimerHandler();
+
+    char axisTick[24];
+    formatDirectAxisTick((uint32_t)(i + 1), axisTick, sizeof(axisTick));
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"transMethod\":\"02\",\"items\":[";
+
+    bool first = true;
+
+    for (int k = 0; k < count; k++)
+    {
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) continue;
+
+      char value[24];
+      snprintf(value, sizeof(value), "%.4f", items[k].values[i]);
+
+      if (!first) payload += ",";
+      first = false;
+
+      payload += "{\"sensorType\":\"";
+      payload += items[k].isVolume ? condVolumeSensorType : items[k].sensorType;
+      payload += "\",\"sensorNicNm\":\"";
+      payload += items[k].nickname;
+      payload += "\",\"channelCode\":\"";
+      payload += items[k].channel;
+      payload += "\",\"sensorData\":\"";
+      payload += value;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"";
+      payload += items[k].collectUnit;
+      payload += "\"}";
+    }
+
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliableCode(DIRECT_ISL_DATA_URL, payload, &response, "COND_DATA", "001", NULL, NULL))
+    {
+      break;
+    }
+
+    sent++;
+  }
+
+  char note[160];
+
+  if (sent == n)
+  {
+    char types[60] = "";
+
+    for (int k = 0; k < count; k++)
+    {
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) continue;
+      if (types[0]) strncat(types, " · ", sizeof(types) - strlen(types) - 1);
+      strncat(types, items[k].isVolume ? condVolumeSensorType : items[k].sensorType,
+              sizeof(types) - strlen(types) - 1);
+    }
+
+    bool volumeDropped = false;
+    for (int k = 0; k < count; k++)
+    {
+      if (items[k].isVolume && condVolumeSensorType[0] == 0) volumeDropped = true;
+    }
+
+    if (volumeDropped)
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s) · 부피 제외: 서버가 부피 코드를 받지 않음", sent, types);
+    }
+    else if (skipped[0])
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s) · 제외: %s", sent, types, skipped);
+    }
+    else
+    {
+      snprintf(note, sizeof(note), "전송 완료: %d개 점 (%s)", sent, types);
+    }
+  }
+  else
+  {
+    snprintf(note, sizeof(note), "전송 중단: %d/%d개만 전송됨", sent, n);
+  }
+
+  condSetNote(note);
+  Serial.printf("[COND] %s\n", note);
+}
+
+static void condition_send_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+  // The network work is long and blocking, so the button only asks.
+  condSetNote("지능형 과학실로 전송 중...");
+  condUploadPreset = condPresetIndex;
+  pendingConditionUpload = true;
+}
+
+static void go_condition_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  condDirty = true;
+  requestScreenSwitch(conditionScreen);
+}
+
+// ---- the screen ----------------------------------------------------------------
+
+// Formats a number with a variable's unit: "20.0 mL", "23.4 ℃", "12" when the
+// variable carries no unit.
+static void condFormatValue(const CondVariable *v, float value, char *out, size_t outSize)
+{
+  const char *unit = condDisplayUnit(v);
+
+  if (unit[0]) snprintf(out, outSize, "%.*f %s", condDecimals(v), value, unit);
+  else snprintf(out, outSize, "%.*f", condDecimals(v), value);
+}
+
+static void condRestyleButtonLabel(lv_obj_t *btn, const char *text)
+{
+  lv_obj_t *label = lv_obj_get_child(btn, 0);
+  if (label) lv_label_set_text(label, text);
+}
+
+// A tick value with as many decimals as the axis needs: five ticks across a
+// span of one unit printed as whole numbers read "1003 1003 1004 1004 1004".
+static void condFormatTick(float value, float span, char *out, size_t outSize)
+{
+  const int decimals = span >= 20.0f ? 0 : (span >= 2.0f ? 1 : 2);
+  const float unit = decimals == 0 ? 1.0f : (decimals == 1 ? 0.1f : 0.01f);
+
+  // "-0" is what %.0f makes of -0.4.
+  if (fabsf(value) < 0.5f * unit) value = 0.0f;
+
+  snprintf(out, outSize, "%.*f", decimals, value);
+}
+
+// Everything on the screen that depends on which preset is chosen, which
+// points exist, and what the sensor says right now. The table and the graph
+// are rebuilt only when a point changes; the live number every second.
+void refreshConditionScreen()
+{
+  if (conditionChart == NULL) return;
+
+  const CondPreset *P = condPreset();
+  const int pi = condPresetIndex;
+  const int n = condPointCount[pi];
+  const CondVariable *manualVar = condManualVariable(P);
+  const CondVariable *sensorVar = condSensorVariable(P);
+
+  // ---- which experiment -----------------------------------------------------
+  for (int i = 0; i < COND_PRESET_COUNT; i++)
+  {
+    if (conditionPresetBtn[i] == NULL) continue;
+
+    const bool selected = i == pi;
+    lv_obj_set_style_bg_color(conditionPresetBtn[i],
+                              lv_color_hex(selected ? UI_ACCENT : UI_ACCENT_TINT), 0);
+
+    lv_obj_t *label = lv_obj_get_child(conditionPresetBtn[i], 0);
+    if (label) lv_obj_set_style_text_color(label, lv_color_hex(selected ? UI_SURFACE : UI_ACCENT), 0);
+  }
+
+  // ---- the hand-set variable ------------------------------------------------
+  if (manualVar)
+  {
+    char text[64];
+
+    if (labelConditionManualCaption)
+    {
+      snprintf(text, sizeof(text), "%s (직접 설정)", manualVar->name);
+      lv_label_set_text(labelConditionManualCaption, text);
+    }
+
+    if (labelConditionManual)
+    {
+      condFormatValue(manualVar, condManual[pi], text, sizeof(text));
+      lv_label_set_text(labelConditionManual, text);
+    }
+
+    const float tiny = manualVar->stepSmall / 10.0f;
+    const float steps[6] = { -manualVar->stepLarge, -manualVar->stepSmall, -tiny,
+                             tiny, manualVar->stepSmall, manualVar->stepLarge };
+
+    for (int i = 0; i < 6; i++)
+    {
+      if (conditionStepBtn[i] == NULL) continue;
+      snprintf(text, sizeof(text), "%+g", steps[i]);
+      condRestyleButtonLabel(conditionStepBtn[i], text);
+    }
+  }
+
+  // ---- the live reading -----------------------------------------------------
+  if (sensorVar)
+  {
+    char text[96];
+    float value = NAN;
+    char node[32] = "";
+    char name[24] = "";
+    char unit[24] = "";
+    const bool have = condReadVariable(sensorVar, &value, node, sizeof(node), name, unit, sizeof(name));
+
+    if (labelConditionSensorCaption)
+    {
+      // The node's own quantity name goes on the line below with the node;
+      // this caption is 86 px and "현재 이산화탄소" is not.
+      snprintf(text, sizeof(text), "현재 %s",
+               sensorVar->source == COND_SRC_SENSOR_ANY ? "값" : sensorVar->name);
+      lv_label_set_text(labelConditionSensorCaption, text);
+    }
+
+    if (labelConditionSensorNow)
+    {
+      if (have)
+      {
+        const char *shownUnit = sensorVar->source == COND_SRC_SENSOR_ANY
+                                  ? bleDisplayUnit(condAnyUnit[0] ? condAnyUnit : unit)
+                                  : sensorVar->unit;
+        if (shownUnit[0]) snprintf(text, sizeof(text), "%.*f %s", condDecimals(sensorVar), value, shownUnit);
+        else snprintf(text, sizeof(text), "%.*f", condDecimals(sensorVar), value);
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "---- %s", sensorVar->unit);
+      }
+
+      lv_label_set_text(labelConditionSensorNow, text);
+    }
+
+    if (labelConditionSensorNode)
+    {
+      if (have) snprintf(condSourceNode, sizeof(condSourceNode), "%s", node);
+
+      if (have && sensorVar->source == COND_SRC_SENSOR_ANY)
+      {
+        snprintf(text, sizeof(text), "← %s · %s", node, condAnyName[0] ? condAnyName : name);
+      }
+      else if (have) snprintf(text, sizeof(text), "← %s", node);
+      else snprintf(text, sizeof(text), "센서 없음");
+      lv_label_set_text(labelConditionSensorNode, text);
+    }
+  }
+
+  if (conditionRecordBtn) condRestyleButtonLabel(conditionRecordBtn, P->recordText);
+
+  if (!condDirty) return;
+  condDirty = false;
+
+  // ---- titles that name the two variables -----------------------------------
+  {
+    char text[96];
+    const char *xu = condDisplayUnit(&P->x);
+    const char *yu = condDisplayUnit(&P->y);
+
+    if (labelConditionChartTitle)
+    {
+      snprintf(text, sizeof(text), "%s%s%s%s - %s%s%s%s",
+               condDisplayName(&P->x), xu[0] ? "(" : "", xu, xu[0] ? ")" : "",
+               condDisplayName(&P->y), yu[0] ? "(" : "", yu, yu[0] ? ")" : "");
+      lv_label_set_text(labelConditionChartTitle, text);
+    }
+  }
+
+  // ---- the table ------------------------------------------------------------
+  if (tableCondition)
+  {
+    char cell[32];
+
+    lv_table_set_row_cnt(tableCondition, (uint16_t)(n + 1));
+    lv_table_set_cell_value(tableCondition, 0, 0, "No");
+
+    const char *xu = condDisplayUnit(&P->x);
+    const char *yu = condDisplayUnit(&P->y);
+
+    if (xu[0]) snprintf(cell, sizeof(cell), "%s(%s)", condDisplayName(&P->x), xu);
+    else snprintf(cell, sizeof(cell), "%s", condDisplayName(&P->x));
+    lv_table_set_cell_value(tableCondition, 0, 1, cell);
+
+    if (yu[0]) snprintf(cell, sizeof(cell), "%s(%s)", condDisplayName(&P->y), yu);
+    else snprintf(cell, sizeof(cell), "%s", condDisplayName(&P->y));
+    lv_table_set_cell_value(tableCondition, 0, 2, cell);
+
+    lv_table_set_cell_value(tableCondition, 0, 3, P->derivedName ? P->derivedName : "-");
+
+    for (int i = 0; i < n; i++)
+    {
+      const int r = i + 1;
+
+      snprintf(cell, sizeof(cell), "%d", r);
+      lv_table_set_cell_value(tableCondition, r, 0, cell);
+      snprintf(cell, sizeof(cell), "%.*f", condDecimals(&P->x), condX[pi][i]);
+      lv_table_set_cell_value(tableCondition, r, 1, cell);
+      snprintf(cell, sizeof(cell), "%.*f", condDecimals(&P->y), condY[pi][i]);
+      lv_table_set_cell_value(tableCondition, r, 2, cell);
+
+      const float d = condDerivedValue(P, condX[pi][i], condY[pi][i]);
+      if (isnan(d)) snprintf(cell, sizeof(cell), "-");
+      else if (P->derived == COND_DERIVED_PRODUCT) snprintf(cell, sizeof(cell), "%.0f", d);
+      else snprintf(cell, sizeof(cell), "%.3f", d);
+      lv_table_set_cell_value(tableCondition, r, 3, cell);
+    }
+  }
+
+  // ---- the graph ------------------------------------------------------------
+  lv_chart_set_all_value(conditionChart, conditionSeries, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(conditionChart, conditionCurve, LV_CHART_POINT_NONE);
+
+  for (int i = 0; i < COND_MAX_POINTS; i++)
+  {
+    if (labelConditionPointText[i]) lv_obj_add_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  if (n == 0)
+  {
+    for (int i = 0; i < COND_AXIS_TICKS; i++)
+    {
+      if (labelConditionXTicks[i]) lv_label_set_text(labelConditionXTicks[i], "");
+      if (labelConditionYTicks[i]) lv_label_set_text(labelConditionYTicks[i], "");
+    }
+
+    if (labelConditionSummary) lv_label_set_text(labelConditionSummary, "");
+    lv_chart_refresh(conditionChart);
+    return;
+  }
+
+  // Neither axis has to start at zero. A hyperbola reads as one against its
+  // asymptotes, but nothing here is measured below 20 mL or much below
+  // atmospheric pressure, and a panel spent on ground the experiment never
+  // visits costs more resolution than the shape is worth.
+  const CondAxis xa = condAxisRange(P->xAxisMin, P->xAxisMax, P->xAxisStep, condX[pi], n, false);
+  const CondAxis ya = condAxisRange(P->yAxisMin, P->yAxisMax, P->yAxisStep, condY[pi], n, true);
+
+  lv_chart_set_range(conditionChart, LV_CHART_AXIS_PRIMARY_X, 0, 1000);
+  lv_chart_set_range(conditionChart, LV_CHART_AXIS_PRIMARY_Y, 0, 1000);
+
+  CondFit fit;
+  condComputeFit(P, pi, &fit);
+
+  // The fitted curve, sampled densely enough to read as one; samples that
+  // leave the panel carry no information and are skipped.
+  if (fit.valid)
+  {
+    for (int i = 0; i < COND_CURVE_POINTS; i++)
+    {
+      const float x = xa.lo + xa.span * ((float)i / (float)(COND_CURVE_POINTS - 1));
+      float y = NAN;
+
+      if (P->fit == COND_FIT_INVERSE)
+      {
+        if (fabsf(x) < 1e-6f) continue;
+        y = fit.k / x;
+      }
+      else if (P->fit == COND_FIT_LINEAR)
+      {
+        y = fit.a + fit.b * x;
+      }
+
+      if (isnan(y) || y > ya.hi || y < ya.lo) continue;
+
+      lv_chart_set_value_by_id2(
+        conditionChart, conditionCurve, i,
+        (int)lroundf((x - xa.lo) / xa.span * 1000.0f),
+        (int)lroundf((y - ya.lo) / ya.span * 1000.0f)
+      );
+    }
+  }
+
+  // ---- the measured points, each carrying its own numbers -------------------
+  const lv_coord_t chartW = lv_obj_get_width(conditionChart);
+  const lv_coord_t chartH = lv_obj_get_height(conditionChart);
+  const lv_coord_t chartX = lv_obj_get_x(conditionChart);
+  const lv_coord_t chartY = lv_obj_get_y(conditionChart);
+
+  lv_coord_t placedX[COND_MAX_POINTS];
+  lv_coord_t placedY[COND_MAX_POINTS];
+  int placed = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    const float fx = (condX[pi][i] - xa.lo) / xa.span;
+    const float fy = (condY[pi][i] - ya.lo) / ya.span;
+
+    lv_chart_set_value_by_id2(conditionChart, conditionSeries, i,
+                              (int)lroundf(fx * 1000.0f),
+                              (int)lroundf(fy * 1000.0f));
+
+    if (labelConditionPointText[i] == NULL) continue;
+
+    // Sat just above and left of the point, nudged back inside near an edge.
+    lv_coord_t lx = chartX + (lv_coord_t)(fx * chartW) - 26;
+    lv_coord_t ly = chartY + chartH - (lv_coord_t)(fy * chartH) - 22;
+
+    if (lx < chartX - 20) lx = chartX - 20;
+    if (lx > chartX + chartW - 56) lx = chartX + chartW - 56;
+    if (ly < chartY - 4) ly = chartY - 4;
+
+    // Points bunch up where the curve is flat, and labels printed on top of
+    // each other are worse than no labels: the table has every number anyway.
+    bool room = true;
+
+    for (int j = 0; j < placed; j++)
+    {
+      if (labs(lx - placedX[j]) < 62 && labs(ly - placedY[j]) < 20)
+      {
+        room = false;
+        break;
+      }
+    }
+
+    if (!room) continue;
+
+    char text[32];
+    snprintf(text, sizeof(text), "%.*f / %.*f",
+             condDecimals(&P->x) > 1 ? 1 : condDecimals(&P->x), condX[pi][i],
+             condDecimals(&P->y) > 1 ? 1 : condDecimals(&P->y), condY[pi][i]);
+    lv_label_set_text(labelConditionPointText[i], text);
+    lv_obj_clear_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(labelConditionPointText[i], lx, ly);
+
+    placedX[placed] = lx;
+    placedY[placed] = ly;
+    placed++;
+  }
+
+  // LVGL's scatter renderer draws a point's marker as the end of a pair of
+  // real points, or as the series' very last id. With the ids after the
+  // newest point empty, that point - every run's first point among them -
+  // had no marker. Repeating it at the last id gives it one, and the line
+  // between the two is zero length.
+  if (n > 0)
+  {
+    lv_chart_set_value_by_id2(conditionChart, conditionSeries, COND_CURVE_POINTS - 1,
+                              (int)lroundf((condX[pi][n - 1] - xa.lo) / xa.span * 1000.0f),
+                              (int)lroundf((condY[pi][n - 1] - ya.lo) / ya.span * 1000.0f));
+  }
+
+  lv_chart_refresh(conditionChart);
+
+  // ---- what the axes mean ---------------------------------------------------
+  for (int i = 0; i < COND_AXIS_TICKS; i++)
+  {
+    char text[16];
+
+    if (labelConditionXTicks[i])
+    {
+      condFormatTick(xa.lo + xa.span * (float)(i + 1) / (float)COND_AXIS_TICKS, xa.span, text, sizeof(text));
+      lv_label_set_text(labelConditionXTicks[i], text);
+    }
+
+    if (labelConditionYTicks[i])
+    {
+      condFormatTick(ya.lo + ya.span * (float)(i + 1) / (float)COND_AXIS_TICKS, ya.span, text, sizeof(text));
+      lv_label_set_text(labelConditionYTicks[i], text);
+    }
+  }
+
+  // ---- the result, in the lesson's own letters ------------------------------
+  if (labelConditionSummary)
+  {
+    char text[200];
+    const char *xn = condDisplayName(&P->x);
+    const char *yn = condDisplayName(&P->y);
+
+    if (P->fit == COND_FIT_INVERSE && fit.valid)
+    {
+      snprintf(text, sizeof(text), "점 %d개 · %s 평균 %.0f · 곡선: %s = %.0f / %s",
+               n, P->derivedName ? P->derivedName : "x·y", fit.derivedMean, yn, fit.k, xn);
+    }
+    else if (P->fit == COND_FIT_LINEAR && fit.valid)
+    {
+      // The intercept on the x axis is the payoff of a 샤를 lesson: where the
+      // volume would reach zero is an estimate of absolute zero.
+      if (P->derivedOffsetX > 0.0f && fabsf(fit.b) > 1e-9f)
+      {
+        // The per-row ratio is in the table; the line keeps to the fit and
+        // its intercept so it fits the card. ("약" because no face here has ≈.)
+        snprintf(text, sizeof(text), "점 %d개 · %s = %.2f + %.3f×%s · %s=0 일 때 %s 약 %.0f %s",
+                 n, yn, fit.a, fit.b, xn, yn, xn, -fit.a / fit.b, condDisplayUnit(&P->x));
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "점 %d개 · %s = %.2f + %.3f×%s", n, yn, fit.a, fit.b, xn);
+      }
+    }
+    else if (P->fit != COND_FIT_NONE)
+    {
+      snprintf(text, sizeof(text), "점 %d개 · 곡선을 그리려면 서로 다른 조건의 점이 2개 이상 필요합니다", n);
+    }
+    else
+    {
+      snprintf(text, sizeof(text), "점 %d개 · %s %.1f~%.1f", n, xn, xa.lo, xa.hi);
+    }
+
+    lv_label_set_text(labelConditionSummary, text);
+  }
+}
+
+void createConditionUi()
+{
+  conditionScreen = lv_obj_create(NULL);
+  lv_obj_set_size(conditionScreen, LCD_H_RES, LCD_V_RES);
+  lv_obj_set_style_text_font(conditionScreen, FONT_KR, 0);
+  lv_obj_set_style_bg_color(conditionScreen, lv_color_hex(UI_BG), 0);
+  lv_obj_set_style_bg_opa(conditionScreen, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(conditionScreen, LV_OBJ_FLAG_SCROLLABLE);
+
+  createStatusBar(conditionScreen, "", &labelBarConditionTime, &labelBarConditionWifi, &labelBarConditionSd);
+
+  for (int i = 0; i < COND_PRESET_COUNT; i++)
+  {
+    condPointCount[i] = 0;
+    const CondVariable *manualVar = condManualVariable(&kCondPresets[i]);
+    condManual[i] = manualVar ? manualVar->defaultValue : 0.0f;
+  }
+
+  makeHeading(conditionScreen, "단계 측정", 28, 58, UI_TEXT);
+
+  // ---- which experiment -----------------------------------------------------
+  const int presetX[3] = { 152, 288, 424 };
+  const int presetW[3] = { 128, 128, 104 };
+
+  for (int i = 0; i < COND_PRESET_COUNT && i < 3; i++)
+  {
+    conditionPresetBtn[i] = makeQuietButton(conditionScreen, kCondPresets[i].title,
+                                            presetX[i], 60, presetW[i], 44, condition_preset_event_cb);
+    lv_obj_set_user_data(conditionPresetBtn[i], (void *)(intptr_t)i);
+  }
+
+  makeQuietButton(conditionScreen, "되돌리기", 548, 60, 100, 44, condition_undo_event_cb);
+  makeQuietButton(conditionScreen, "지우기", 656, 60, 90, 44, condition_clear_event_cb);
+  makeQuietButton(conditionScreen, "CSV 저장", 754, 60, 110, 44, condition_save_event_cb);
+  makePrimaryButton(conditionScreen, "전송", 872, 60, 124, 44, UI_ACCENT, condition_send_event_cb);
+
+  // ---- setting the condition ------------------------------------------------
+  lv_obj_t *setup = makePanel(conditionScreen, 28, 104, 380, 170);
+
+  labelConditionManualCaption = makeSmallLabel(setup, "", 20, 12, UI_TEXT_3);
+  lv_obj_set_width(labelConditionManualCaption, 340);
+  lv_label_set_long_mode(labelConditionManualCaption, LV_LABEL_LONG_DOT);
+
+  // Only ever digits and an ASCII unit, so the heading face is safe.
+  labelConditionManual = makeHeading(setup, "", 20, 32, UI_TEXT);
+
+  // -5 -1 -0.1 | +0.1 +1 +5
+  for (int i = 0; i < 6; i++)
+  {
+    conditionStepBtn[i] = makeQuietButton(setup, "", 12 + i * 62, 72, 56, 44, condition_step_event_cb);
+    lv_obj_set_user_data(conditionStepBtn[i], (void *)(intptr_t)i);
+  }
+
+  labelConditionSensorCaption = makeSmallLabel(setup, "", 20, 128, UI_TEXT_3);
+  lv_obj_set_width(labelConditionSensorCaption, 86);
+  lv_label_set_long_mode(labelConditionSensorCaption, LV_LABEL_LONG_DOT);
+
+  labelConditionSensorNow = makeLabel(setup, "", 110, 124, UI_ACCENT);
+  lv_obj_set_width(labelConditionSensorNow, 250);
+  lv_label_set_long_mode(labelConditionSensorNow, LV_LABEL_LONG_CLIP);
+
+  // Which node the number comes from: with two temperature sensors in the
+  // room, this is how a student knows which one the graph is listening to.
+  labelConditionSensorNode = makeSmallLabel(setup, "", 20, 148, UI_TEXT_4);
+  lv_obj_set_width(labelConditionSensorNode, 340);
+  lv_label_set_long_mode(labelConditionSensorNode, LV_LABEL_LONG_DOT);
+
+  // ---- the points -----------------------------------------------------------
+  conditionRecordBtn = makePrimaryButton(conditionScreen, "이 조건으로 기록", 28, 282, 380, 56, UI_ACCENT,
+                                         condition_record_event_cb);
+
+  // Wide enough that no heading wraps, tall enough for six rows; the rest
+  // scroll.
+  tableCondition = lv_table_create(conditionScreen);
+  lv_obj_set_size(tableCondition, 380, 166);
+  lv_obj_align(tableCondition, LV_ALIGN_TOP_LEFT, 28, 346);
+  lv_obj_set_style_text_font(tableCondition, FONT_KR, 0);
+  lv_obj_set_style_border_width(tableCondition, 0, 0);
+  lv_obj_set_style_bg_color(tableCondition, lv_color_hex(UI_SURFACE), 0);
+  lv_table_set_col_cnt(tableCondition, 4);
+  lv_table_set_row_cnt(tableCondition, 1);
+  lv_table_set_col_width(tableCondition, 0, 48);
+  lv_table_set_col_width(tableCondition, 1, 104);
+  lv_table_set_col_width(tableCondition, 2, 118);
+  lv_table_set_col_width(tableCondition, 3, 110);
+  lv_obj_set_scrollbar_mode(tableCondition, LV_SCROLLBAR_MODE_AUTO);
+
+  // ---- one quantity against the other ----------------------------------------
+  lv_obj_t *chartCard = makePanel(conditionScreen, COND_CARD_X, COND_CARD_Y, COND_CARD_W, COND_CARD_H);
+
+  // Both units live in the heading. As separate axis captions the x one sat
+  // on top of the last tick value.
+  labelConditionChartTitle = makeSmallLabel(chartCard, "", 18, 12, UI_TEXT_3);
+  lv_obj_set_width(labelConditionChartTitle, 400);
+  lv_label_set_long_mode(labelConditionChartTitle, LV_LABEL_LONG_DOT);
+
+  conditionChart = lv_chart_create(chartCard);
+  lv_obj_set_size(conditionChart, COND_CHART_W, COND_CHART_H);
+  lv_obj_align(conditionChart, LV_ALIGN_TOP_LEFT, COND_CHART_X, COND_CHART_Y);
+  lv_obj_set_style_bg_color(conditionChart, lv_color_hex(UI_SURFACE), 0);
+  lv_obj_set_style_border_width(conditionChart, 0, 0);
+  lv_obj_set_style_line_color(conditionChart, lv_color_hex(UI_LINE), LV_PART_MAIN);
+  lv_obj_set_style_size(conditionChart, 6, LV_PART_INDICATOR);
+
+  // Scatter, because the condition is chosen rather than swept: the points do
+  // not arrive evenly spaced and must not be drawn as though they did.
+  lv_chart_set_type(conditionChart, LV_CHART_TYPE_SCATTER);
+  lv_chart_set_point_count(conditionChart, COND_CURVE_POINTS);
+  lv_chart_set_div_line_count(conditionChart, 6, 6);
+
+  // The fitted curve goes on first so the measured points sit over it.
+  conditionCurve = lv_chart_add_series(conditionChart, lv_color_hex(UI_TEXT_4), LV_CHART_AXIS_PRIMARY_Y);
+  conditionSeries = lv_chart_add_series(conditionChart, lv_color_hex(UI_ACCENT), LV_CHART_AXIS_PRIMARY_Y);
+
+  for (int i = 0; i < COND_AXIS_TICKS; i++)
+  {
+    const int x = COND_CHART_X + (i + 1) * COND_CHART_W / COND_AXIS_TICKS;
+    labelConditionXTicks[i] = makeSmallLabel(chartCard, "", x - 14, COND_CHART_Y + COND_CHART_H + 8, UI_TEXT_3);
+
+    const int y = COND_CHART_Y + COND_CHART_H - (i + 1) * COND_CHART_H / COND_AXIS_TICKS;
+    labelConditionYTicks[i] = makeSmallLabel(chartCard, "", 0, y - 8, UI_TEXT_3);
+    lv_obj_set_width(labelConditionYTicks[i], COND_CHART_X - 8);
+    lv_obj_set_style_text_align(labelConditionYTicks[i], LV_TEXT_ALIGN_RIGHT, 0);
+  }
+
+  for (int i = 0; i < COND_MAX_POINTS; i++)
+  {
+    labelConditionPointText[i] = makeSmallLabel(chartCard, "", 0, 0, UI_TEXT_2);
+    lv_obj_add_flag(labelConditionPointText[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // The result lives inside the card, on its own line, so a message from
+  // 전송 or 저장 below is never written over.
+  labelConditionSummary = makeSmallLabel(chartCard, "", 18, COND_CHART_Y + COND_CHART_H + 32, UI_TEXT_2);
+  lv_obj_set_width(labelConditionSummary, COND_CARD_W - 36);
+  lv_label_set_long_mode(labelConditionSummary, LV_LABEL_LONG_DOT);
+
+  labelConditionNote = makeSmallLabel(conditionScreen, "", 28, 518, UI_TEXT_3);
+  lv_obj_set_width(labelConditionNote, 968);
+  lv_label_set_long_mode(labelConditionNote, LV_LABEL_LONG_DOT);
+
+  // No tab is "this screen", so every tab stays tappable - the old Boyle
+  // screen lit 측정 and thereby made that tab dead.
+  createTabBar(conditionScreen, -1);
+
+  condDirty = true;
+  refreshConditionScreen();
 }
 
 void createSettingsUi()
@@ -7479,6 +10506,7 @@ void createSettingsUi()
   lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(settingsScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(settingsScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(settingsScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     settingsScreen,
@@ -7488,7 +10516,7 @@ void createSettingsUi()
     &labelBarSettingsSd
   );
 
-  makeHeading(settingsScreen, "설정", 28, 58, UI_TEXT);
+  makeHeading(settingsScreen, "WiFi", 28, 58, UI_TEXT);
 
   // =====================================================
   // WiFi
@@ -7544,12 +10572,8 @@ void createSettingsUi()
   lv_obj_set_width(labelWifiMode, 580);
   lv_label_set_long_mode(labelWifiMode, LV_LABEL_LONG_CLIP);
 
-  // Device-level entries that are not WiFi.
-  makeQuietButton(wifiCard, "블루투스 센서", 20, 330, 200, 46, go_ble_event_cb);
-  makeQuietButton(wifiCard, "전송 설정", 230, 330, 170, 46, go_isl_event_cb);
-  makeQuietButton(wifiCard, "다시 시작", 410, 330, 150, 46, board_restart_event_cb);
-
-  labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 384, UI_TEXT_3);
+  // Everything that is not WiFi moved to the 설정 tab.
+  labelSettingsNote = makeSmallLabel(wifiCard, "", 20, 330, UI_TEXT_3);
   lv_obj_set_width(labelSettingsNote, 580);
   lv_label_set_long_mode(labelSettingsNote, LV_LABEL_LONG_CLIP);
 
@@ -7581,7 +10605,7 @@ void createSettingsUi()
   lv_obj_set_style_text_font(wifiKeyboard, &lv_font_montserrat_16, 0);
   lv_btnmatrix_set_btn_ctrl_all(wifiKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
 
-  createTabBar(settingsScreen, 3);
+  createTabBar(settingsScreen, TAB_WIFI);
 
   updateWifiRuntimeLabels();
 }
@@ -7765,6 +10789,13 @@ void clearWifiCredentials()
   Serial.println("WiFi credentials cleared");
 }
 
+// 두 서버는 인증키가 다릅니다. 한 칸에 덮어쓰면 시연할 때마다 반대쪽 키를 잃으니,
+// 고른 서버의 칸에 넣습니다.
+static const char *islServiceKeyNvsName()
+{
+  return islUseTestServer ? "keyTest" : "serviceKey";
+}
+
 void saveIslServiceKey(const char *key)
 {
   if (key == NULL || strlen(key) == 0) return;
@@ -7778,7 +10809,7 @@ void saveIslServiceKey(const char *key)
     return;
   }
 
-  ret = nvs_set_str(handle, "serviceKey", key);
+  ret = nvs_set_str(handle, islServiceKeyNvsName(), key);
   if (ret == ESP_OK) ret = nvs_commit(handle);
   nvs_close(handle);
 
@@ -7786,23 +10817,120 @@ void saveIslServiceKey(const char *key)
   else Serial.println("NVS ISL serviceKey save failed");
 }
 
-bool loadIslServiceKey()
+static bool islReadServiceKeySlot(const char *name)
 {
   nvs_handle_t handle;
-  esp_err_t ret = nvs_open("isl_cfg", NVS_READONLY, &handle);
-  if (ret != ESP_OK) return false;
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return false;
 
-  size_t keyLen = sizeof(islServiceKey);
-  ret = nvs_get_str(handle, "serviceKey", islServiceKey, &keyLen);
+  char stored[sizeof(islServiceKey)];
+  stored[0] = '\0';
+
+  size_t keyLen = sizeof(stored);
+  esp_err_t ret = nvs_get_str(handle, name, stored, &keyLen);
   nvs_close(handle);
 
-  if (ret == ESP_OK && strlen(islServiceKey) > 0)
+  if (ret != ESP_OK || strlen(stored) == 0) return false;
+
+  snprintf(islServiceKey, sizeof(islServiceKey), "%s", stored);
+  return true;
+}
+
+bool loadIslServiceKey()
+{
+  if (islReadServiceKeySlot(islServiceKeyNvsName()))
   {
-    Serial.println("NVS ISL serviceKey loaded");
+    Serial.printf("NVS ISL serviceKey loaded (%s)\n", islServiceKeyNvsName());
+    return true;
+  }
+
+  // 운영과 테스트가 같은 인증키를 쓰는 경우가 있습니다. 고른 서버 칸이 비었다고
+  // 마흔 글자를 다시 타이핑하게 만드느니 반대쪽 칸의 키를 가져와 이 칸에도 넣어
+  // 둡니다. 키가 정말 다른 서버라면 그쪽이 거절해서 알려 줍니다 - 조용히 비어
+  // 있는 것보다 나은 실패입니다.
+  const char *other = islUseTestServer ? "serviceKey" : "keyTest";
+
+  if (islReadServiceKeySlot(other))
+  {
+    Serial.printf("NVS ISL serviceKey carried over from %s\n", other);
+    saveIslServiceKey(islServiceKey);
     return true;
   }
 
   return false;
+}
+
+void saveIslServerChoice()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READWRITE, &handle) != ESP_OK) return;
+
+  nvs_set_u8(handle, "server", islUseTestServer ? 1 : 0);
+  nvs_commit(handle);
+  nvs_close(handle);
+}
+
+void loadIslServerChoice()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return;
+
+  uint8_t stored = 0;
+  if (nvs_get_u8(handle, "server", &stored) == ESP_OK) islUseTestServer = (stored != 0);
+
+  char host[sizeof(islTestHost)];
+  size_t hostLen = sizeof(host);
+  if (nvs_get_str(handle, "testHost", host, &hostLen) == ESP_OK && strlen(host) > 0)
+  {
+    snprintf(islTestHost, sizeof(islTestHost), "%s", host);
+  }
+
+  nvs_close(handle);
+}
+
+void saveIslTestHost()
+{
+  nvs_handle_t handle;
+  if (nvs_open("isl_cfg", NVS_READWRITE, &handle) != ESP_OK) return;
+
+  nvs_set_str(handle, "testHost", islTestHost);
+  nvs_commit(handle);
+  nvs_close(handle);
+}
+
+bool loadIslModuleCode();
+
+void islApplyServerChoice(bool useTest, bool persist)
+{
+  islUseTestServer = useTest;
+  islBuildApiUrls();
+  if (persist) saveIslServerChoice();
+
+  // The other server's uniqueCode means nothing here, so the next 전송 시작
+  // opens a fresh 탐구 rather than posting into a session that does not exist.
+  resetDirectIslSessionCache(useTest ? "test server selected" : "production server selected");
+
+  // 이 서버의 키로 갈아탑니다. 그 칸이 비어 있으면 loadIslServiceKey()가
+  // 반대쪽 키를 가져옵니다.
+  islServiceKey[0] = '\0';
+  loadIslServiceKey();
+
+  if (islServiceKeyTa)
+  {
+    const bool haveKey = strlen(islServiceKey) > 0 &&
+                         strcmp(islServiceKey, "PUT_YOUR_SERVICE_KEY") != 0;
+    lv_textarea_set_text(islServiceKeyTa, haveKey ? islServiceKey : "");
+  }
+
+  // 탐구도 서버 소속입니다. 운영의 모둠코드를 테스트 서버에 보내봐야 그 탐구가
+  // 없으니, 서버를 바꾸면 모둠코드도 그 서버의 것으로 함께 바뀌어야 합니다.
+  islRuntimeSerialNumber[0] = '\0';
+  loadIslModuleCode();
+
+  if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
+  if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+
+  updateIslServerLabel();
+  updateIslStatusLabels();
 }
 
 void sanitizeIslModuleCode(const char *src, char *dst, size_t dstLen)
@@ -7822,6 +10950,13 @@ void sanitizeIslModuleCode(const char *src, char *dst, size_t dstLen)
   dst[j] = '\0';
 }
 
+// 탐구는 서버마다 따로 만들어지므로 모둠코드도 서버마다 다릅니다 - 운영의
+// 탐구와 테스트의 탐구는 다른 수업입니다. 인증키와 같은 이유로 칸을 나눕니다.
+static const char *islModumNvsName()
+{
+  return islUseTestServer ? "moduleTest" : "module";
+}
+
 void saveIslModuleCode(const char *code)
 {
   if (code == NULL || strlen(code) == 0) return;
@@ -7835,7 +10970,7 @@ void saveIslModuleCode(const char *code)
     return;
   }
 
-  ret = nvs_set_str(handle, "module", code);
+  ret = nvs_set_str(handle, islModumNvsName(), code);
   if (ret == ESP_OK) ret = nvs_commit(handle);
   nvs_close(handle);
 
@@ -7850,13 +10985,28 @@ bool loadIslModuleCode()
   if (ret != ESP_OK) return false;
 
   size_t codeLen = sizeof(islRuntimeSerialNumber);
-  ret = nvs_get_str(handle, "module", islRuntimeSerialNumber, &codeLen);
+  ret = nvs_get_str(handle, islModumNvsName(), islRuntimeSerialNumber, &codeLen);
   nvs_close(handle);
 
   if (ret == ESP_OK && strlen(islRuntimeSerialNumber) > 0)
   {
-    Serial.print("NVS ISL module loaded: ");
-    Serial.println(islRuntimeSerialNumber);
+    Serial.printf("NVS ISL module loaded (%s): %s\n", islModumNvsName(), islRuntimeSerialNumber);
+    return true;
+  }
+
+  // 이 서버 칸이 비어 있으면 반대쪽 것을 빌려 씁니다. 틀린 코드라면 서버가
+  // 거절하고 그 이유가 화면에 나오니, 빈 칸으로 두는 것보다 낫습니다.
+  const char *other = islUseTestServer ? "module" : "moduleTest";
+
+  if (nvs_open("isl_cfg", NVS_READONLY, &handle) != ESP_OK) return false;
+
+  codeLen = sizeof(islRuntimeSerialNumber);
+  ret = nvs_get_str(handle, other, islRuntimeSerialNumber, &codeLen);
+  nvs_close(handle);
+
+  if (ret == ESP_OK && strlen(islRuntimeSerialNumber) > 0)
+  {
+    Serial.printf("NVS ISL module carried over from %s: %s\n", other, islRuntimeSerialNumber);
     return true;
   }
 
@@ -7917,6 +11067,136 @@ void updateIslModuleCodeFromUi()
   islApiConfigured = cloudModumConfigured();
 }
 
+// 44자짜리 인증키를 가려진 터치 키보드로 넣다 보면 글자가 빠집니다. 오늘 전송이
+// 막힌 이유가 정확히 그것이었습니다 - 42자가 들어가 있었고, 서버는 013으로
+// 그렇게 말했는데 화면에는 "start 응답 오류"로만 보였습니다. 붙여넣을 길을 둡니다.
+//
+//   status                지금 무엇으로 보내려 하는지
+//   key <값>              고른 서버의 인증키
+//   modum <코드>          모둠코드
+//   server prod|test      운영 / 테스트
+//   host <주소>           테스트 서버의 호스트
+//   start                 인증 3단계만 실행
+static void handleSerialCommand(char *line)
+{
+  while (*line == ' ') line++;
+  if (*line == '\0') return;
+
+  char *arg = strchr(line, ' ');
+
+  if (arg != NULL)
+  {
+    *arg = '\0';
+    arg++;
+    while (*arg == ' ') arg++;
+
+    // 붙여넣기에 딸려 오는 꼬리 공백은 키의 일부가 아닙니다.
+    size_t end = strlen(arg);
+    while (end > 0 && (arg[end - 1] == ' ' || arg[end - 1] == '\t')) arg[--end] = '\0';
+  }
+
+  if (strcmp(line, "status") == 0)
+  {
+    // 길이만으로는 어느 키인지 모릅니다 - 틀린 키와 맞는 키가 같은 길이일 수
+    // 있으니까요. 양 끝 네 글자면 눈으로 가려집니다. 전부 찍지는 않습니다.
+    const size_t keyLen = strlen(islServiceKey);
+    char ends[16] = "(없음)";
+
+    if (keyLen >= 8)
+    {
+      snprintf(ends, sizeof(ends), "%.4s...%s", islServiceKey, islServiceKey + keyLen - 4);
+    }
+
+    Serial.printf("[CMD] server=%s mode=%s key=%d자 %s modum=%s\n",
+                  islApiHost, cloudUploadModeName(), (int)keyLen, ends,
+                  strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+    return;
+  }
+
+  // 인증 3단계만 따로 두드려 봅니다. 측정을 시작하지 않고도 서버가 이 키와
+  // 모둠코드를 받아들이는지 알 수 있어야, 주소 후보를 빠르게 가릴 수 있습니다.
+  if (strcmp(line, "start") == 0)
+  {
+    resetDirectIslSessionCache("start command");
+    clearCloudQueue();
+    queueCloudAction("start");
+    Serial.printf("[CMD] start 요청: %s / %s\n", islApiHost, islRuntimeSerialNumber);
+    return;
+  }
+
+  if (strcmp(line, "host") == 0 && arg != NULL && *arg != '\0')
+  {
+    snprintf(islTestHost, sizeof(islTestHost), "%s", arg);
+    saveIslTestHost();
+
+    // 이 주소를 쓰려면 테스트 서버가 골라져 있어야 합니다.
+    islApplyServerChoice(true, true);
+
+    Serial.printf("[CMD] test host=%s (지금 %s)\n", islTestHost, islApiHost);
+    return;
+  }
+
+  if (strcmp(line, "key") == 0 && arg != NULL && *arg != '\0')
+  {
+    snprintf(islServiceKey, sizeof(islServiceKey), "%s", arg);
+    saveIslServiceKey(islServiceKey);
+    resetDirectIslSessionCache("service key changed");
+
+    if (islServiceKeyTa) lv_textarea_set_text(islServiceKeyTa, islServiceKey);
+    updateIslServerLabel();
+
+    Serial.printf("[CMD] %s 인증키 저장: %d자\n", islApiHost, (int)strlen(islServiceKey));
+    return;
+  }
+
+  if (strcmp(line, "modum") == 0 && arg != NULL && *arg != '\0')
+  {
+    sanitizeIslModuleCode(arg, islRuntimeSerialNumber, sizeof(islRuntimeSerialNumber));
+    saveIslModuleCode(islRuntimeSerialNumber);
+    resetDirectIslSessionCache("modum code changed");
+
+    if (islModuleTa) lv_textarea_set_text(islModuleTa, islRuntimeSerialNumber);
+    if (homeIslModuleTa) lv_textarea_set_text(homeIslModuleTa, islRuntimeSerialNumber);
+    updateIslStatusLabels();
+
+    Serial.printf("[CMD] %s 모둠코드 저장: %s\n", islApiHost, islRuntimeSerialNumber);
+    return;
+  }
+
+  if (strcmp(line, "server") == 0 && arg != NULL)
+  {
+    islApplyServerChoice(strcmp(arg, "test") == 0, true);
+    Serial.printf("[CMD] server=%s key=%d자 modum=%s\n", islApiHost,
+                  (int)strlen(islServiceKey), islRuntimeSerialNumber);
+    return;
+  }
+
+  Serial.println("[CMD] status | key <값> | modum <코드> | server prod|test | host <주소> | start");
+}
+
+void serviceSerialConsole()
+{
+  static char line[192];
+  static size_t used = 0;
+
+  while (Serial.available() > 0)
+  {
+    const char c = (char)Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c != '\n')
+    {
+      if (used < sizeof(line) - 1) line[used++] = c;
+      continue;
+    }
+
+    line[used] = '\0';
+    used = 0;
+    handleSerialCommand(line);
+  }
+}
+
 void updateIslStatusLabels()
 {
   updateDashboardIslLabels();
@@ -7949,6 +11229,11 @@ bool ensureEspHostedTransport()
 #endif
 }
 
+#if HAS_IDF_WIFI
+// Defined with the rest of the WiFi failure reporting, below.
+static void wifiEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data);
+#endif
+
 bool ensureHostedWifiStarted()
 {
 #if !HAS_ESP_HOSTED
@@ -7980,6 +11265,9 @@ bool ensureHostedWifiStarted()
     {
       wifiStaNetif = esp_netif_create_default_wifi_sta();
     }
+
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                        wifiEventHandler, NULL, NULL);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&cfg);
@@ -8014,10 +11302,6 @@ bool ensureHostedWifiStarted()
 }
 #endif
 
-// The host every upload depends on. Resolving it is the difference between a
-// usable network and one that only looks connected.
-#define ISL_API_HOST "api-scion.kosac.re.kr"
-
 // Public resolvers to fall back through when the network's own cannot answer.
 static const char *kFallbackDnsServers[] = { "8.8.8.8", "1.1.1.1" };
 
@@ -8045,7 +11329,9 @@ static bool resolvesApiHost()
   hints.ai_socktype = SOCK_STREAM;
 
   struct addrinfo *res = NULL;
-  const int rc = getaddrinfo(ISL_API_HOST, "443", &hints, &res);
+  // The host every upload depends on. Resolving it is the difference between a
+  // usable network and one that only looks connected.
+  const int rc = getaddrinfo(islApiHost, "443", &hints, &res);
 
   if (rc == 0 && res != NULL)
   {
@@ -8054,13 +11340,13 @@ static bool resolvesApiHost()
     esp_ip4_addr_t ip4;
     ip4.addr = addr->sin_addr.s_addr;
     snprintf(text, sizeof(text), IPSTR, IP2STR(&ip4));
-    Serial.printf("[DNS] %s -> %s\n", ISL_API_HOST, text);
+    Serial.printf("[DNS] %s -> %s\n", islApiHost, text);
     freeaddrinfo(res);
     return true;
   }
 
   if (res != NULL) freeaddrinfo(res);
-  Serial.printf("[DNS] %s did not resolve (rc=%d)\n", ISL_API_HOST, rc);
+  Serial.printf("[DNS] %s did not resolve (rc=%d)\n", islApiHost, rc);
   return false;
 }
 
@@ -8134,6 +11420,73 @@ void verifyDnsOrFallback()
 #endif
 }
 
+// The C6 says why it dropped us, in an event nobody was listening to. Twelve
+// seconds of silence followed by "timeout" cannot tell a wrong password from a
+// network that is not on the air, and those need opposite fixes.
+static volatile int lastWifiDisconnectReason = 0;
+
+static const char *wifiDisconnectReasonText(int reason)
+{
+  switch (reason)
+  {
+    case 0:   return "";
+    case 201: return "그 이름의 네트워크가 보이지 않습니다 (5GHz 전용이거나 범위 밖)";
+    case 202: return "비밀번호가 맞지 않습니다";
+    case 15:  return "비밀번호가 맞지 않습니다 (4-way handshake 실패)";
+    case 205: return "공유기가 응답하다 끊었습니다 (신호가 약합니다)";
+    case 203: return "공유기가 접속을 거절했습니다";
+    case 2:   return "인증이 만료되었습니다";
+    case 4:   return "연결이 만료되었습니다";
+    case 8:   return "공유기가 연결을 끊었습니다";
+    default:  return "공유기가 연결을 끊었습니다";
+  }
+}
+
+#if HAS_IDF_WIFI
+static void wifiEventHandler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+  (void)arg;
+
+  if (base != WIFI_EVENT || id != WIFI_EVENT_STA_DISCONNECTED) return;
+
+  wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)data;
+  if (event == NULL) return;
+
+  lastWifiDisconnectReason = (int)event->reason;
+
+  Serial.printf("[WIFI] disconnected: reason %d - %s\n", (int)event->reason,
+                wifiDisconnectReasonText((int)event->reason));
+}
+#endif
+
+int c6WifiScan(WifiNetworkInfo *results, int maxResults);
+
+// True when a network of this name is on the air, and says how loud it is.
+// Asked only after a failure, to separate "wrong password" from "not there".
+static bool wifiSsidIsVisible(const char *ssid, int *rssiOut)
+{
+#if HAS_IDF_WIFI
+  WifiNetworkInfo found[WIFI_SCAN_MAX];
+  const int count = c6WifiScan(found, WIFI_SCAN_MAX);
+
+  for (int i = 0; i < count; i++)
+  {
+    if (strcmp(found[i].ssid, ssid) == 0)
+    {
+      if (rssiOut) *rssiOut = found[i].rssi;
+      return true;
+    }
+  }
+
+  Serial.printf("[WIFI] %s not among the %d networks on the air\n", ssid, count);
+  return false;
+#else
+  (void)ssid;
+  (void)rssiOut;
+  return true;
+#endif
+}
+
 bool c6WifiConnect(const char *ssid, const char *password)
 {
   if (ssid == NULL || strlen(ssid) == 0)
@@ -8161,6 +11514,8 @@ bool c6WifiConnect(const char *ssid, const char *password)
   }
 
   esp_wifi_disconnect();
+
+  lastWifiDisconnectReason = 0;
 
   esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifiConfig);
   if (ret != ESP_OK)
@@ -8212,13 +11567,43 @@ bool c6WifiConnect(const char *ssid, const char *password)
       }
 
       Serial.println("WiFi connected, but DHCP IP is not assigned yet");
+      setIslStatusText("WiFi: 접속했지만 IP를 못 받았습니다");
       return false;
     }
 
     delay(100);
   }
 
-  Serial.println("WiFi connect timeout");
+  // Twelve seconds gone. The C6 usually said why while we were waiting; if it
+  // said nothing at all, the network is most likely not on the air, so ask.
+  const int reason = lastWifiDisconnectReason;
+  char note[160];
+
+  if (reason != 0)
+  {
+    Serial.printf("WiFi connect failed: reason %d - %s\n", reason,
+                  wifiDisconnectReasonText(reason));
+    snprintf(note, sizeof(note), "WiFi: %s", wifiDisconnectReasonText(reason));
+  }
+  else
+  {
+    int rssi = 0;
+
+    if (wifiSsidIsVisible(ssid, &rssi))
+    {
+      Serial.printf("WiFi connect timeout; %s is on the air at %d dBm\n", ssid, rssi);
+      snprintf(note, sizeof(note),
+               "WiFi: %s는 보이는데(%d dBm) 접속이 안 됩니다 - 비밀번호를 확인하세요",
+               ssid, rssi);
+    }
+    else
+    {
+      snprintf(note, sizeof(note),
+               "WiFi: %s가 보이지 않습니다 - 이 보드는 2.4GHz만 됩니다", ssid);
+    }
+  }
+
+  setIslStatusText(note);
   return false;
 #else
 #if HAS_ARDUINO_WIFI
@@ -8564,6 +11949,29 @@ void httpCloseConnection(const char *reason)
 void httpCloseConnection(const char *reason) { (void)reason; }
 #endif
 
+// A TLS handshake asks ESP-Hosted for DMA-capable internal buffers, and when
+// it cannot get one the SDIO driver asserts and the board reboots - which in a
+// classroom looks like the board randomly restarting mid-experiment. Below
+// this, refuse the upload and say why instead.
+//
+// 32 kB was the largest free block on the reboot that produced this check;
+// 56 kB leaves the handshake room to breathe.
+#define HTTP_MIN_DMA_BLOCK 56000
+
+static bool httpHasRoomForTls(const char *context)
+{
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  if (largest >= HTTP_MIN_DMA_BLOCK) return true;
+
+  Serial.printf("[HTTP] %s refused: largest DMA block %u < %u\n",
+                context, (unsigned)largest, (unsigned)HTTP_MIN_DMA_BLOCK);
+
+  setIslStatusText(bleEnabled
+                     ? "메모리 부족: 블루투스를 끄고 전송하세요"
+                     : "메모리 부족: 보드를 다시 시작하세요");
+  return false;
+}
+
 void logHeapState(const char *context)
 {
   Serial.printf(
@@ -8588,6 +11996,10 @@ bool httpPostJson(const char *url, const String &payload, String *response)
 
   Serial.println("----- HTTP POST START -----");
   logHeapState("before POST");
+
+  if (!httpHasRoomForTls("POST")) return false;
+
+  if (!httpHasRoomForTls("POST")) return false;
   Serial.print("URL: ");
   Serial.println(url);
   Serial.print("Payload length: ");
@@ -8919,10 +12331,42 @@ bool directIslConfigured()
 #endif
 }
 
+// 서버는 왜 거절했는지 한국어로 말해 줍니다 - "해당 센서의 인증키가 일치하지
+// 않습니다" 같이, 다음에 무엇을 할지 알려 주는 문장으로요. 그걸 버리고
+// "응답 오류"라고 쓰면 이유를 알려고 시리얼 케이블을 꽂아야 합니다.
+static void setIslStatusFromResponse(const char *stage, const String &response)
+{
+  char code[12] = "";
+  char message[140] = "";
+
+  extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+  extractJsonStringValue(response, "\"message\"", message, sizeof(message));
+
+  char note[200];
+
+  if (strlen(message) > 0)
+  {
+    snprintf(note, sizeof(note), "%s %s: %s", stage, code[0] ? code : "?", message);
+  }
+  else
+  {
+    snprintf(note, sizeof(note), "직접전송: %s 응답 오류", stage);
+  }
+
+  setIslStatusText(note);
+}
+
 bool directIslStartProcess(const char *modumId)
 {
 #if REALTIME_DIRECT_ISL_ENABLED
   if (!ensureWifiReadyForHttp("직접전송", 20000)) return false;
+
+  // 전송이 안 될 때 물어볼 것이 셋뿐입니다: 어느 서버인가, 키가 있는가,
+  // 모둠코드가 있는가. 세 답을 한 줄로 남깁니다.
+  Serial.printf("[ISL] start: host=%s key=%d자 modum=%s\n",
+                islApiHost, (int)strlen(islServiceKey),
+                strlen(islRuntimeSerialNumber) > 0 ? islRuntimeSerialNumber : "(없음)");
+
   if (!directIslConfigured())
   {
     setIslStatusText("직접전송: serviceKey/모둠코드 필요");
@@ -8968,7 +12412,7 @@ bool directIslStartProcess(const char *modumId)
   {
     Serial.print("Direct ISL start bad response: ");
     Serial.println(response);
-    setIslStatusText("직접전송: start 응답 오류");
+    setIslStatusFromResponse("탐구 시작", response);
     return false;
   }
 
@@ -9113,6 +12557,157 @@ bool directIslSendSensorTypeIfNeeded()
   }
 
   // =====================================================
+  // BLE 노드: whichever of its quantities carry a unit we can map.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_BLE)
+  {
+    const int mapped = bleIslMappedCount();
+
+    if (mapped == 0)
+    {
+      setIslStatusText("블루투스: 전송할 수 있는 단위가 없음");
+      return false;
+    }
+
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":";
+    payload += mapped;
+    payload += ",\"items\":[";
+
+    bool first = true;
+
+    for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+    {
+      const BleIslMapping *m = bleIslMappingForValue(i);
+      if (m == NULL) continue;
+
+      if (!first) payload += ",";
+      first = false;
+
+      payload += "{\"sensorType\":\"";
+      payload += m->sensorType;
+      payload += "\",\"sensorNicNm\":\"";
+      payload += m->nickname;
+      payload += "\",\"channelCode\":\"";
+      payload += m->channel;
+      payload += "\"}";
+    }
+
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_BLE", 2, 700))
+    {
+      setIslStatusText("블루투스 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+
+      char skipped[120] = "";
+      bleIslUnmappedSummary(skipped, sizeof(skipped));
+
+      char line[200];
+      if (skipped[0]) snprintf(line, sizeof(line), "블루투스 센서등록 OK / 제외: %s", skipped);
+      else snprintf(line, sizeof(line), "블루투스 센서등록 OK: %d개", mapped);
+
+      setIslStatusText(line);
+      return true;
+    }
+
+    Serial.print("BLE node sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("블루투스 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
+  // 회전 엔코더: 각도와 각속도.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_ENCODER)
+  {
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":2,\"items\":[";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\"}";
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_ENCODER", 2, 700))
+    {
+      setIslStatusText("회전 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+      setIslStatusText("회전 센서등록 OK: ANGL/ANGV");
+      return true;
+    }
+
+    Serial.print("Encoder sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("회전 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
+  // INA228: three quantities from one reading, like SCD41.
+  // =====================================================
+  if (activeSensorMode == SENSOR_MODE_INA228)
+  {
+    String payload = "{";
+    payload += "\"serviceKey\":\"";
+    payload += jsonEscapeString(islServiceKey);
+    payload += "\",\"uniqueCode\":\"";
+    payload += jsonEscapeString(directIslUniqueCode);
+    payload += "\",\"sensorCount\":3,\"items\":[";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\"},";
+    payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\"}";
+    payload += "]}";
+
+    String response;
+    if (!httpPostJsonReliable(DIRECT_ISL_SENSOR_TYPE_URL, payload, &response, "DIRECT_TYPE_INA228", 2, 700))
+    {
+      setIslStatusText("전압·전류 센서등록 실패");
+      return false;
+    }
+
+    char code[12] = "";
+    extractJsonStringValue(response, "\"code\"", code, sizeof(code));
+
+    if (strcmp(code, "001") == 0 || strcmp(code, "015") == 0)
+    {
+      directIslSensorTypeOk = true;
+      setIslStatusText("전압·전류 센서등록 OK: VOLT/ECRT/EPOW");
+      return true;
+    }
+
+    Serial.print("INA228 sensor type response: ");
+    Serial.println(response);
+    setIslStatusText("전압·전류 센서등록 거부: 코드 확인 필요");
+    return false;
+  }
+
+  // =====================================================
   // VL53L1X 거리: try the appendix code, then plausible alternatives.
   // =====================================================
   if (activeSensorMode == SENSOR_MODE_VL53L1X)
@@ -9218,7 +12813,7 @@ bool directIslSendSensorTypeIfNeeded()
 
   Serial.print("Direct ISL sensor type bad response: ");
   Serial.println(response);
-  setIslStatusText("직접전송: 센서등록 응답 오류");
+  setIslStatusFromResponse("센서등록", response);
   return false;
 #else
   return false;
@@ -9254,7 +12849,7 @@ bool directIslSetStatusOnIfNeeded()
 
   Serial.print("Direct ISL status bad response: ");
   Serial.println(response);
-  setIslStatusText("직접전송: status 응답 오류");
+  setIslStatusFromResponse("상태 전환", response);
   return false;
 #else
   return false;
@@ -9341,6 +12936,91 @@ bool directIslSendSamplePacket(const CloudSamplePacket &packet)
       payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
       payload += axisTick;
       payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
+    }
+    else if (activeSensorMode == SENSOR_MODE_BLE)
+    {
+      const float nodeValues[BLE_LINK_MAX_VALUES] = {
+        NAN, packet.pressureHpa, packet.humidityPct
+      };
+
+      bool first = true;
+
+      for (int i = 0; i < bleNodeValueCount && i < BLE_LINK_MAX_VALUES; i++)
+      {
+        const BleIslMapping *m = bleIslMappingForValue(i);
+        if (m == NULL) continue;
+
+        char number[24];
+        if (i == 0) snprintf(number, sizeof(number), "%s", primaryValue);
+        else if (isnan(nodeValues[i])) continue;
+        else snprintf(number, sizeof(number), "%.4f", nodeValues[i]);
+
+        if (!first) payload += ",";
+        first = false;
+
+        payload += "{\"sensorType\":\"";
+        payload += m->sensorType;
+        payload += "\",\"sensorNicNm\":\"";
+        payload += m->nickname;
+        payload += "\",\"channelCode\":\"";
+        payload += m->channel;
+        payload += "\",\"sensorData\":\"";
+        payload += number;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"";
+        payload += m->collectUnit;
+        payload += "\"}";
+      }
+    }
+    else if (activeSensorMode == SENSOR_MODE_ENCODER)
+    {
+      payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+      payload += primaryValue;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGLE "\"}";
+
+      if (!isnan(packet.pressureHpa))
+      {
+        char rate[24];
+        snprintf(rate, sizeof(rate), "%.4f", packet.pressureHpa);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += rate;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGVEL "\"}";
+      }
+    }
+    else if (activeSensorMode == SENSOR_MODE_INA228)
+    {
+      payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+      payload += primaryValue;
+      payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+      payload += axisTick;
+      payload += "\",\"collectUnit\":\"" ISL_UNIT_CURRENT "\"}";
+
+      if (!isnan(packet.pressureHpa))
+      {
+        char busV[24];
+        snprintf(busV, sizeof(busV), "%.4f", packet.pressureHpa);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += busV;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_VOLTAGE "\"}";
+      }
+
+      if (!isnan(packet.humidityPct))
+      {
+        char watts[24];
+        snprintf(watts, sizeof(watts), "%.4f", packet.humidityPct);
+        payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += watts;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_POWER "\"}";
+      }
     }
     else if (activeSensorMode == SENSOR_MODE_VL53L1X)
     {
@@ -9640,6 +13320,93 @@ bool cloudSendBatchHistory()
         payload += axisTick;
         payload += "\",\"collectUnit\":\"" ISL_UNIT_LIGHT "\"}";
       }
+      else if (activeSensorMode == SENSOR_MODE_BLE)
+      {
+        // The node's units are read from its most recent packet, on the
+        // assumption that a node does not change what it measures mid-run.
+        const float nodeValues[BLE_LINK_MAX_VALUES] = {
+          NAN, pressureHistory[i], humidityHistory[i]
+        };
+
+        bool firstItem = true;
+
+        for (int v = 0; v < bleNodeValueCount && v < BLE_LINK_MAX_VALUES; v++)
+        {
+          const BleIslMapping *m = bleIslMappingForValue(v);
+          if (m == NULL) continue;
+
+          char number[24];
+          if (v == 0) snprintf(number, sizeof(number), "%s", tempValue);
+          else if (isnan(nodeValues[v])) continue;
+          else snprintf(number, sizeof(number), "%.4f", nodeValues[v]);
+
+          if (!firstItem) payload += ",";
+          firstItem = false;
+
+          payload += "{\"sensorType\":\"";
+          payload += m->sensorType;
+          payload += "\",\"sensorNicNm\":\"";
+          payload += m->nickname;
+          payload += "\",\"channelCode\":\"";
+          payload += m->channel;
+          payload += "\",\"sensorData\":\"";
+          payload += number;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"";
+          payload += m->collectUnit;
+          payload += "\"}";
+        }
+      }
+      else if (activeSensorMode == SENSOR_MODE_ENCODER)
+      {
+        payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGLE "\",\"sensorNicNm\":\"각도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += tempValue;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGLE "\"}";
+
+        if (!isnan(pressureHistory[i]))
+        {
+          char rate[24];
+          snprintf(rate, sizeof(rate), "%.4f", pressureHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_ANGVEL "\",\"sensorNicNm\":\"각속도센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += rate;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_ANGVEL "\"}";
+        }
+      }
+      else if (activeSensorMode == SENSOR_MODE_INA228)
+      {
+        payload += "{\"sensorType\":\"" ISL_SENSOR_TYPE_CURRENT "\",\"sensorNicNm\":\"전류센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+        payload += tempValue;
+        payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+        payload += axisTick;
+        payload += "\",\"collectUnit\":\"" ISL_UNIT_CURRENT "\"}";
+
+        if (!isnan(pressureHistory[i]))
+        {
+          char busV[24];
+          snprintf(busV, sizeof(busV), "%.4f", pressureHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_VOLTAGE "\",\"sensorNicNm\":\"전압센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += busV;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_VOLTAGE "\"}";
+        }
+
+        if (!isnan(humidityHistory[i]))
+        {
+          char watts[24];
+          snprintf(watts, sizeof(watts), "%.4f", humidityHistory[i]);
+          payload += ",{\"sensorType\":\"" ISL_SENSOR_TYPE_POWER "\",\"sensorNicNm\":\"전력센서\",\"channelCode\":\"01\",\"sensorData\":\"";
+          payload += watts;
+          payload += "\",\"dataType\":\"01\",\"collectDate\":\"";
+          payload += axisTick;
+          payload += "\",\"collectUnit\":\"" ISL_UNIT_POWER "\"}";
+        }
+      }
       else if (activeSensorMode == SENSOR_MODE_VL53L1X)
       {
         payload += "{\"sensorType\":\"";
@@ -9881,7 +13648,12 @@ void queueCloudSample(int no, uint32_t timeS, float tempC, float pressureHpa)
   {
     if (no % 10 == 0)
     {
-      setIslStatusText("일괄전송 중");
+      // "일괄전송 중"이라고 쓰면 보내는 중으로 읽힙니다. 이 모드는 측정하는
+      // 동안 아무것도 보내지 않고 쌓아 둡니다 - 버튼을 눌러야 나갑니다.
+      // 화면이 그렇게 말해야 합니다.
+      char note[96];
+      snprintf(note, sizeof(note), "일괄전송 모드: %d개 저장됨 (전송하려면 일괄전송 버튼)", no);
+      setIslStatusText(note);
       updateCloudModeLabel();
     }
     return;
@@ -10631,6 +14403,9 @@ void setup()
 
   initNvsStorage();
   // CSV disabled in stability build.
+  // The server choice comes first: the key that follows is the key for it.
+  loadIslServerChoice();
+  islBuildApiUrls();
   loadIslModuleCode();
   loadIslServiceKey();
 
@@ -10729,13 +14504,20 @@ void setup()
 
   lv_indev_drv_register(&indev_drv);
 
+  logHeapState("before building any screen");
   createHomeUi();
   createMeasureUi();
   createSettingsUi();
   createBleUi();
+  createDeviceUi();
+  createConditionUi();
   createCsvUi();
-  createFileViewerUi();
   createIslUi();
+
+  // Eight screens now carry a six-tab bar, and the 블루투스 tab holds three
+  // node cards. LVGL allocates from the system heap here, so this is the line
+  // to read if screens ever start coming up empty.
+  logHeapState("after building every screen");
   // its drawing buffers were cut down to stubs.
 
   // Allocate every main screen base during setup, not on the first user tap.
@@ -10783,7 +14565,10 @@ void setup()
   }
   else
   {
-    lv_label_set_text(labelStatus, "센서 초기화 실패");
+    // With a node as the default sensor this is every cold boot until one
+    // links, and "실패" is not what that is.
+    lv_label_set_text(labelStatus, activeSensorMode == SENSOR_MODE_BLE ? "노드 연결 대기"
+                                                                        : "센서 초기화 실패");
   }
 
   applyRestoredMeasurementToUi();
@@ -10861,6 +14646,8 @@ void loop()
     servicePendingScreenSwitch();
   }
 
+  serviceSerialConsole();
+
   // Sensor initialization and WiFi commands run outside LVGL callbacks.
   servicePendingSensorMode();
   servicePendingWifiCommand();
@@ -10878,6 +14665,160 @@ void loop()
       pendingBleScan = false;
       bleScanStart(6000);
     }
+
+    // Nothing linked and nothing being tried: look again. A node that is
+    // reset - or swapped for another board - otherwise stays disconnected
+    // until somebody finds the 블루투스 tab and presses 다시 검색.
+    static unsigned long lastRelinkScanMs = 0;
+
+    if (bleEnabled && bleLinkNodeCount() == 0 && !bleLinkIsBusy() &&
+        !bleScanIsRunning() && !measuring &&
+        (lastRelinkScanMs == 0 || now - lastRelinkScanMs >= 20000UL))
+    {
+      lastRelinkScanMs = now;
+      bleScanStart(4000);
+    }
+
+    // A scan that just finished is the one moment the result list is fresh.
+    static bool bleScanWasRunning = false;
+    const bool bleScanNow = bleScanIsRunning();
+
+    if (bleScanWasRunning && !bleScanNow && bleAutoLinkToSensorNode() > 0)
+    {
+      refreshBleScreen();
+    }
+
+    bleScanWasRunning = bleScanNow;
+
+    // The active slot has to follow reality: a node that drops should not
+    // leave the measurement screen showing its last number forever, and a node
+    // that connects while nothing else is linked should become the active one
+    // without anybody tapping.
+    if (!bleLinkSlotIsSubscribed(activeBleSlot))
+    {
+      const int firstLinked = bleLinkFirstSubscribedSlot();
+      if (firstLinked >= 0) activeBleSlot = firstLinked;
+    }
+
+    bleNodeRefreshMetadata();
+
+    // A node appears on the home grid as soon as it links, so this has to run
+    // on the clock rather than when the sensor changes - the tile is how the
+    // sensor gets changed.
+    bleLinkServiceExploration();
+
+    if (currentLoadedScreen == conditionScreen) refreshConditionScreen();
+
+    if (pendingConditionUpload)
+    {
+      pendingConditionUpload = false;
+
+      // Let the "전송 중" line reach the glass before the network work starts.
+      uiTimerHandler();
+      conditionUploadToIsl();
+    }
+    refreshHomeNodeCards();
+
+    // dpsReady is settled once when a sensor is chosen, which is wrong for a
+    // link that comes and goes; for a node it is simply whether it is linked.
+    // The measurement screen's status line follows it too, or a board that
+    // booted with nothing linked would say 연결 대기 forever.
+    if (activeSensorMode == SENSOR_MODE_BLE)
+    {
+      const bool linkedNow = bleLinkSlotIsSubscribed(activeBleSlot);
+
+      if (linkedNow != dpsReady && labelStatus && !measuring)
+      {
+        lv_label_set_text(labelStatus, linkedNow ? "준비" : "노드 연결 대기");
+      }
+
+      dpsReady = linkedNow;
+    }
+
+    if (pendingBleDisconnect)
+    {
+      pendingBleDisconnect = false;
+      bleLinkDisconnect();
+      refreshBleScreen();
+    }
+
+    if (pendingBleDropSlot >= 0)
+    {
+      const int slot = pendingBleDropSlot;
+      pendingBleDropSlot = -1;
+      bleLinkDisconnectSlot(slot);
+      refreshBleScreen();
+    }
+
+    if (pendingBleConnectIndex >= 0)
+    {
+      const int index = pendingBleConnectIndex;
+      pendingBleConnectIndex = -1;
+
+      if (index < BLE_SCAN_MAX_RESULTS && bleRowAddress[index][0])
+      {
+        // Already linked: the tap means "measure with this one" rather than
+        // "connect again".
+        const int slot = bleLinkSlotForAddress(bleRowAddress[index]);
+
+        if (slot >= 0 && bleLinkSlotIsSubscribed(slot))
+        {
+          activeBleSlot = slot;
+          bleNodeRefreshMetadata();
+          if (activeSensorMode == SENSOR_MODE_BLE) updateActiveSensorUiLabels();
+        }
+        else if (bleRowIsSensorNode[index])
+        {
+          bleLinkConnect(bleRowAddress[index]);
+        }
+        else
+        {
+          // Not one of this project's nodes. Connecting to read it would need
+          // a protocol nobody here knows yet, so ask the device what it has.
+          if (bleLinkExplore(bleRowAddress[index]))
+          {
+            setIslStatusText("센서 분석 중: 서비스와 특성을 확인합니다");
+          }
+          else
+          {
+            setIslStatusText("분석 실패: 연결 슬롯이 없습니다");
+          }
+        }
+
+        refreshBleScreen();
+      }
+    }
+
+    if (pendingI2cScan)
+    {
+      pendingI2cScan = false;
+
+      // The scan blocks for a few seconds, so say what is happening and get
+      // it on the glass before starting.
+      const char *busyText = "검색 중... 엔코더 바퀴를 계속 돌려 주세요";
+      setIslStatusText(busyText);
+      if (labelSettingsNote) lv_label_set_text(labelSettingsNote, busyText);
+      lv_refr_now(NULL);
+
+      char summary[160];
+      const int found = scanSensorI2cBus(summary, sizeof(summary));
+
+      // The encoder is not on the bus, so an address scan says nothing about
+      // the one sensor whose wiring cannot be confirmed that way. Watch every
+      // free pin instead and report whichever ones the wheel moves.
+      char activePins[160];
+      encoderFindActivePins(activePins, sizeof(activePins));
+
+      // Both the scan and the sweep left the shared pins as bare inputs.
+      dpsReady = activeSensorBegin();
+
+      char line[420];
+      snprintf(line, sizeof(line), "I2C %d개: %s\n엔코더 신호: %s", found, summary, activePins);
+      setIslStatusText(line);
+
+      if (labelSettingsNote) lv_label_set_text(labelSettingsNote, line);
+      if (labelDeviceNote) lv_label_set_text(labelDeviceNote, line);
+    }
   }
 
   // WiFi 검색/자동 연결/API 전송은 백그라운드 task에서 처리한다.
@@ -10888,6 +14829,30 @@ void loop()
   {
     setIslStatusText("일괄전송 요청 대기 >5초: WiFi task 확인");
     requestBatchUiRefresh();
+  }
+
+  // Idle preview. Same cadence as a run, but nothing is stored: no sample, no
+  // CSV row, no upload.
+  if (!measuring && dpsReady && !uiInputLocked && now - lastPreviewMs >= readIntervalMs)
+  {
+    lastPreviewMs = now;
+
+    float previewPrimary = NAN;
+    float previewSecondary = NAN;
+
+    if (readActiveSensor(&previewPrimary, &previewSecondary))
+    {
+      previewValues[0] = previewPrimary;
+      previewValues[1] = previewSecondary;
+      previewValues[2] = thirdValueForActiveSensor();
+      previewValid = true;
+    }
+    else
+    {
+      previewValid = false;
+    }
+
+    if (sampleCount == 0) refreshLatestMeasurementLabels();
   }
 
   if (measuring && dpsReady)

@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src" / "main.cpp"
 OUTPUT = ROOT / "src" / "korean_24_bold.c"
 DIGITS_OUTPUT = ROOT / "src" / "digits_64.c"
+DIGITS48_OUTPUT = ROOT / "src" / "digits_48.c"
 STAMP = ROOT / "src" / ".heading_font_stamp"
 TTF = Path("C:/Windows/Fonts/malgunbd.ttf")
 
@@ -103,7 +104,7 @@ def main() -> int:
     force = "--force" in sys.argv
 
     if not force and STAMP.exists() and STAMP.read_text().strip() == stamp \
-            and OUTPUT.exists() and DIGITS_OUTPUT.exists():
+            and OUTPUT.exists() and DIGITS_OUTPUT.exists() and DIGITS48_OUTPUT.exists():
         print(f"heading font up to date ({len(hangul)} syllables)")
         return 0
 
@@ -125,19 +126,22 @@ def main() -> int:
         print("error: lv_font_conv failed for korean_24_bold", file=sys.stderr)
         return rc
 
-    rc = run_conv([
-        "--size", "64",
-        "--symbols", "0123456789.:-+ ",
-        "--lv-font-name", "digits_64",
-        "-o", str(DIGITS_OUTPUT),
-    ])
-    if rc != 0:
-        print("error: lv_font_conv failed for digits_64", file=sys.stderr)
-        return rc
+    # 64 px for a single reading; 48 px when a sensor reports two or three and
+    # they share the row.
+    for size, out in ((64, DIGITS_OUTPUT), (48, DIGITS48_OUTPUT)):
+        rc = run_conv([
+            "--size", str(size),
+            "--symbols", "0123456789.:-+ ",
+            "--lv-font-name", "digits_%d" % size,
+            "-o", str(out),
+        ])
+        if rc != 0:
+            print("error: lv_font_conv failed for digits_%d" % size, file=sys.stderr)
+            return rc
 
     STAMP.write_text(stamp)
 
-    for path in (OUTPUT, DIGITS_OUTPUT):
+    for path in (OUTPUT, DIGITS_OUTPUT, DIGITS48_OUTPUT):
         print(f"wrote {path.relative_to(ROOT)} ({path.stat().st_size / 1024:.0f} kB of C source)")
     return 0
 
