@@ -1442,7 +1442,6 @@ static bool cloudModumConfigured();
 
 
 void createCsvUi();
-void createFileViewerUi();
 void createIslUi();
 void createBleUi();
 void refreshBleScreen();
@@ -1708,12 +1707,7 @@ static void dashboard_isl_save_event_cb(lv_event_t *e);
 static void dashboard_isl_start_event_cb(lv_event_t *e);
 static void dashboard_isl_stop_event_cb(lv_event_t *e);
 static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e);
-static void dashboard_csv_mount_event_cb(lv_event_t *e);
-static void dashboard_csv_toggle_event_cb(lv_event_t *e);
-static void dashboard_csv_preview_event_cb(lv_event_t *e);
 static void csv_save_measurement_data_event_cb(lv_event_t *e);
-static void csv_viewer_prev_event_cb(lv_event_t *e);
-static void csv_viewer_next_event_cb(lv_event_t *e);
 static void sd_file_item_event_cb(lv_event_t *e);
 static void board_restart_event_cb(lv_event_t *e);
 bool isTextViewFile(const char *name);
@@ -1724,8 +1718,6 @@ void loadSdTextFilePage(const char *fileName, long offset);
 static void dashboard_textarea_event_cb(lv_event_t *e);
 static void dashboard_keyboard_event_cb(lv_event_t *e);
 static void copy_label_event_cb(lv_event_t *e);
-static void csv_textarea_event_cb(lv_event_t *e);
-static void csv_keyboard_event_cb(lv_event_t *e);
 void updateDashboardCsvPreview();
 void updateDashboardCsvLabels();
 void updateDashboardIslLabels();
@@ -5941,31 +5933,6 @@ void enableCopyOnDoubleClick(lv_obj_t *label)
   lv_obj_add_event_cb(label, copy_label_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
-static void csv_textarea_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_FOCUSED) return;
-
-  if (csvKeyboard)
-  {
-    lv_keyboard_set_textarea(csvKeyboard, lv_event_get_target(e));
-    lv_obj_clear_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-  }
-}
-
-static void csv_keyboard_event_cb(lv_event_t *e)
-{
-  lv_event_code_t code = lv_event_get_code(e);
-
-  if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL)
-  {
-    if (csvKeyboard)
-    {
-      lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-      lv_keyboard_set_textarea(csvKeyboard, NULL);
-    }
-  }
-}
-
 // =====================================================
 // Table
 // =====================================================
@@ -7475,88 +7442,68 @@ static void dashboard_cloud_batch_upload_event_cb(lv_event_t *e)
   updateCloudModeLabel();
   updateIslStatusLabels();
 }
-static void dashboard_csv_mount_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-  sdReady = initSdCard();
-  updateSdStatusLabels();
-  updateDashboardCsvPreview();
-}
-
-static void dashboard_csv_toggle_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
-  csvLoggingEnabled = !csvLoggingEnabled;
-  if (!csvLoggingEnabled) closeCsvFile();
-
-  if (csvLoggingEnabled && !sdReady)
-  {
-    sdReady = initSdCard();
-  }
-
-  updateSdStatusLabels();
-  updateDashboardCsvPreview();
-}
-
-static void dashboard_csv_preview_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateDashboardCsvLabels();
-  updateDashboardCsvPreview();
-}
-
+// 저장하기: everything measured so far, as one CSV on the card. The card is
+// mounted here if it is not yet, and the file is named by the clock, so there
+// is nothing to set up first and two runs never overwrite each other.
 static void csv_save_measurement_data_event_cb(lv_event_t *e)
 {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-  updateCsvFileNameFromDashboard();
+  if (labelSelectedSdFile == NULL) return;
 
   if (sampleCount <= 0)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 저장할 데이터 없음");
-    if (labelHomeCsvPreview)
-    {
-      lv_label_set_text(labelHomeCsvPreview, "저장할 측정 데이터가 없습니다.\n먼저 센서 측정을 시작하세요.");
-    }
-    updateDashboardCsvLabels();
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 저장할 데이터 없음");
+    lv_label_set_text(labelSelectedSdFile, "저장할 측정값이 없습니다");
     return;
   }
 
   if (!sdReady)
   {
     sdReady = initSdCard();
+    updateSdStatusLabels();
   }
 
   if (!sdReady)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: SD 카드 오류");
-    if (labelHomeCsvPreview)
-    {
-      lv_label_set_text(labelHomeCsvPreview, "SD 카드를 마운트하지 못했습니다.\nSD 카드 삽입 상태와 핀 설정을 확인하세요.");
-    }
-    updateSdStatusLabels();
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: SD 카드 오류");
+    char note[120];
+    snprintf(note, sizeof(note), "SD 카드를 읽을 수 없습니다%s%s",
+             sdLastError[0] ? ": " : "", sdLastError);
+    lv_label_set_text(labelSelectedSdFile, note);
     return;
   }
 
+  // Named by the clock when it is known, by a counter otherwise.
+  time_t nowTime;
+  struct tm timeInfo;
+  time(&nowTime);
+
+  if (localtime_r(&nowTime, &timeInfo) != NULL && timeInfo.tm_year + 1900 >= 2025)
+  {
+    snprintf(csvFileName, sizeof(csvFileName), "log_%04d%02d%02d_%02d%02d%02d.csv",
+             timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+             timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+  }
+  else
+  {
+    for (int n = 1; n < 1000; n++)
+    {
+      snprintf(csvFileName, sizeof(csvFileName), "log_%03d.csv", n);
+      snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
+
+      struct stat st;
+      if (stat(csvPath, &st) != 0) break;
+    }
+  }
+
+  snprintf(csvPath, sizeof(csvPath), "%s/%s", MOUNT_POINT, csvFileName);
+
   FILE *file = fopen(csvPath, "w");
+
   if (file == NULL)
   {
-    if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 파일 생성 실패");
-    if (labelHomeCsvPreview)
-    {
-      char msg[220];
-      snprintf(msg, sizeof(msg), "CSV 파일을 만들 수 없습니다.\n%s", csvPath);
-      lv_label_set_text(labelHomeCsvPreview, msg);
-    }
-    Serial.print("CSV snapshot open failed: ");
-    Serial.println(csvPath);
+    char note[160];
+    snprintf(note, sizeof(note), "파일을 만들 수 없습니다: %s", csvFileName);
+    lv_label_set_text(labelSelectedSdFile, note);
+    Serial.printf("[CSV] open failed: %s\n", csvPath);
     return;
   }
 
@@ -7568,48 +7515,23 @@ static void csv_save_measurement_data_event_cb(lv_event_t *e)
     formatCsvValueColumns(tempHistory[i], pressureHistory[i], humidityHistory[i],
                           columns, sizeof(columns));
 
-    fprintf(
-      file,
-      "%d,%lu,%s,%s\n",
-      noHistory[i] > 0 ? noHistory[i] : (i + 1),
-      (unsigned long)timeHistory[i],
-      activeSensorName(),
-      columns
-    );
-
+    fprintf(file, "%d,%lu,%s,%s\n",
+            noHistory[i] > 0 ? noHistory[i] : (i + 1),
+            (unsigned long)timeHistory[i], activeSensorName(), columns);
   }
 
   fclose(file);
 
-  // 이 버튼은 현재까지 누적된 측정 데이터를 한 번에 저장한다.
-  // 측정 루프의 자동 append 방식은 사용하지 않는다.
+  // The live append file, if one was open, is a different file now.
   csvLoggingEnabled = false;
   closeCsvFile();
 
-  if (labelSelectedSdFile)
-  {
-    char selected[96];
-    snprintf(selected, sizeof(selected), "저장: %s", csvFileName);
-    lv_label_set_text(labelSelectedSdFile, selected);
-  }
-
+  char note[160];
+  snprintf(note, sizeof(note), "저장됨: %s (%d개)", csvFileName, sampleCount);
+  lv_label_set_text(labelSelectedSdFile, note);
   updateSdStatusLabels();
-  updateDashboardCsvLabels();
 
-  if (labelHomeCsv) lv_label_set_text(labelHomeCsv, "CSV: 측정 데이터 저장됨");
-
-  if (labelHomeCsvPreview)
-  {
-    char msg[512];
-    snprintf(
-      msg,
-      sizeof(msg),
-      "측정 데이터 저장 완료\n파일: %s\n샘플 수: %d\n\n최근 데이터는 [미리보기], 저장 파일은 [파일 목록] 또는 [열기]로 확인하세요.",
-      csvPath,
-      sampleCount
-    );
-    lv_label_set_text(labelHomeCsvPreview, msg);
-  }
+  Serial.printf("[CSV] saved %s (%d rows)\n", csvPath, sampleCount);
 }
 
 bool endsWithIgnoreCase(const char *text, const char *suffix)
@@ -7869,26 +7791,6 @@ void openSdTextFileByName(const char *fileName)
   {
     loadScreenSafe(fileViewerScreen);
   }
-}
-
-static void csv_viewer_prev_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (strlen(csvFileViewName) == 0) return;
-
-  long nextOffset = csvFileViewOffset - CSV_FILE_VIEW_PAGE_BYTES;
-  if (nextOffset < 0) nextOffset = 0;
-  loadSdTextFilePage(csvFileViewName, nextOffset);
-}
-
-static void csv_viewer_next_event_cb(lv_event_t *e)
-{
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (strlen(csvFileViewName) == 0) return;
-
-  long nextOffset = csvFileViewOffset + CSV_FILE_VIEW_PAGE_BYTES;
-  if (nextOffset >= csvFileViewSize) nextOffset = csvFileViewOffset;
-  loadSdTextFilePage(csvFileViewName, nextOffset);
 }
 
 static void sd_file_item_event_cb(lv_event_t *e)
@@ -8538,55 +8440,6 @@ void createIslUi()
 // =====================================================
 // CSV/TXT File Viewer UI
 // =====================================================
-void createFileViewerUi()
-{
-  fileViewerScreen = lv_obj_create(NULL);
-  lv_obj_set_size(fileViewerScreen, LCD_H_RES, LCD_V_RES);
-  lv_obj_set_style_text_font(fileViewerScreen, FONT_KR, 0);
-  lv_obj_set_style_bg_color(fileViewerScreen, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(fileViewerScreen, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(fileViewerScreen, LV_OBJ_FLAG_SCROLLABLE);
-
-  createStatusBar(
-    fileViewerScreen,
-    "",
-    &labelBarFileViewerTime,
-    &labelBarFileViewerWifi,
-    &labelBarFileViewerSd
-  );
-
-  labelFileViewerTitle = makeHeading(fileViewerScreen, "파일 보기", 28, 58, UI_TEXT);
-  lv_obj_set_width(labelFileViewerTitle, 700);
-  lv_label_set_long_mode(labelFileViewerTitle, LV_LABEL_LONG_CLIP);
-
-  makeQuietButton(fileViewerScreen, "이전", 700, 60, 92, 40, csv_viewer_prev_event_cb);
-  makeQuietButton(fileViewerScreen, "다음", 800, 60, 92, 40, csv_viewer_next_event_cb);
-  makeQuietButton(fileViewerScreen, "기록", 900, 60, 96, 40, go_csv_event_cb);
-
-  lv_obj_t *card = makePanel(fileViewerScreen, 28, 110, 968, 372);
-
-  // Read-only: this is a viewer, and an editable field invites a keyboard the
-  // screen has no room for.
-  fileViewerTextArea = lv_textarea_create(card);
-  lv_obj_set_size(fileViewerTextArea, 940, 344);
-  lv_obj_align(fileViewerTextArea, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_textarea_set_one_line(fileViewerTextArea, false);
-  lv_textarea_set_text(fileViewerTextArea, "기록 화면에서 파일을 열면 여기에 표시됩니다.");
-  lv_textarea_set_cursor_click_pos(fileViewerTextArea, false);
-  lv_obj_set_style_text_font(fileViewerTextArea, FONT_KR_SMALL, 0);
-  lv_obj_set_style_bg_opa(fileViewerTextArea, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_text_color(fileViewerTextArea, lv_color_hex(UI_TEXT), 0);
-  lv_obj_set_style_border_width(fileViewerTextArea, 0, 0);
-  lv_obj_set_style_pad_all(fileViewerTextArea, 0, 0);
-  lv_obj_set_scrollbar_mode(fileViewerTextArea, LV_SCROLLBAR_MODE_AUTO);
-
-  labelFileViewerPageInfo = makeSmallLabel(fileViewerScreen, "0 / 0 bytes", 28, 494, UI_TEXT_3);
-  lv_obj_set_width(labelFileViewerPageInfo, 968);
-  lv_label_set_long_mode(labelFileViewerPageInfo, LV_LABEL_LONG_CLIP);
-
-  createTabBar(fileViewerScreen, TAB_RECORD);
-}
-
 // =====================================================
 // CSV UI
 // =====================================================
@@ -8654,69 +8507,24 @@ void createCsvUi()
   lv_label_set_long_mode(labelCsvRowRange, LV_LABEL_LONG_CLIP);
 
   // =====================================================
-  // File side
+  // Saving: one button. The card is mounted when it is needed and the file
+  // is named by the clock, so there is nothing to set up first.
   // =====================================================
   lv_obj_t *fileCard = makePanel(csvScreen, 668, 104, 328, 412);
 
-  // SD is not mounted at boot: SDMMC can collide with the C6 SDIO link that
-  // WiFi and Bluetooth ride on, so it is brought up on demand. The redesign
-  // dropped this control, which left no way to mount the card at all.
   makeSmallLabel(fileCard, "SD 카드", 16, 14, UI_TEXT_3);
+  makePrimaryButton(fileCard, "저장하기", 16, 44, 296, 60, UI_ACCENT, csv_save_measurement_data_event_cb);
 
-  labelHomeCsv = makeSmallLabel(fileCard, "SD: 마운트 안 됨", 16, 36, UI_TEXT_2);
-  lv_obj_set_width(labelHomeCsv, 296);
-  lv_label_set_long_mode(labelHomeCsv, LV_LABEL_LONG_CLIP);
-
-  makeQuietButton(fileCard, "마운트", 16, 62, 142, 40, dashboard_csv_mount_event_cb);
-  makeQuietButton(fileCard, "자동 저장", 170, 62, 142, 40, dashboard_csv_toggle_event_cb);
-
-  makeSmallLabel(fileCard, "저장 파일", 16, 118, UI_TEXT_3);
-
-  homeCsvFileTa = lv_textarea_create(fileCard);
-  lv_obj_set_size(homeCsvFileTa, 296, 44);
-  lv_obj_align(homeCsvFileTa, LV_ALIGN_TOP_LEFT, 16, 140);
-  lv_textarea_set_one_line(homeCsvFileTa, true);
-  lv_textarea_set_placeholder_text(homeCsvFileTa, "dps310_log.csv");
-  lv_obj_set_style_text_font(homeCsvFileTa, FONT_KR, 0);
-  lv_obj_set_style_bg_color(homeCsvFileTa, lv_color_hex(UI_BG), 0);
-  lv_obj_set_style_bg_opa(homeCsvFileTa, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(homeCsvFileTa, 0, 0);
-  lv_obj_set_style_radius(homeCsvFileTa, 10, 0);
-  lv_obj_set_style_text_color(homeCsvFileTa, lv_color_hex(UI_TEXT), 0);
-  lv_obj_add_event_cb(homeCsvFileTa, csv_textarea_event_cb, LV_EVENT_FOCUSED, NULL);
-  lv_textarea_set_text(homeCsvFileTa, csvFileName);
-
-  makePrimaryButton(fileCard, "측정값 저장", 16, 192, 296, 44, UI_ACCENT, csv_save_measurement_data_event_cb);
-
-  makeQuietButton(fileCard, "미리보기", 16, 244, 142, 40, dashboard_csv_preview_event_cb);
-  makeQuietButton(fileCard, "파일 목록", 170, 244, 142, 40, settings_sd_list_event_cb);
-
-  labelSelectedSdFile = makeSmallLabel(fileCard, "선택: 없음", 16, 292, UI_TEXT_3);
+  labelSelectedSdFile = makeSmallLabel(fileCard, "", 16, 122, UI_TEXT_2);
   lv_obj_set_width(labelSelectedSdFile, 296);
-  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_CLIP);
+  lv_label_set_long_mode(labelSelectedSdFile, LV_LABEL_LONG_WRAP);
 
-  sdFileList = lv_list_create(fileCard);
-  lv_obj_set_size(sdFileList, 296, 88);
-  lv_obj_align(sdFileList, LV_ALIGN_TOP_LEFT, 16, 316);
-  lv_obj_set_style_text_font(sdFileList, FONT_KR_SMALL, 0);
-  lv_obj_set_style_bg_opa(sdFileList, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(sdFileList, 0, 0);
-  lv_obj_set_style_pad_all(sdFileList, 0, 0);
-  lv_list_add_text(sdFileList, "SD 파일 목록 대기");
-
-  // The preview is only meaningful once a file is opened, so it sits behind
-  // 미리보기 rather than taking permanent space.
-  labelHomeCsvPreview = makeSmallLabel(csvScreen, "", 28, 522, UI_TEXT_3);
-  lv_obj_set_width(labelHomeCsvPreview, 968);
-  lv_label_set_long_mode(labelHomeCsvPreview, LV_LABEL_LONG_CLIP);
-
-  csvKeyboard = lv_keyboard_create(csvScreen);
-  lv_obj_set_size(csvKeyboard, LCD_H_RES, 220);
-  lv_obj_align(csvKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_add_flag(csvKeyboard, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_event_cb(csvKeyboard, csv_keyboard_event_cb, LV_EVENT_ALL, NULL);
-  lv_obj_set_style_text_font(csvKeyboard, &lv_font_montserrat_16, 0);
-  lv_btnmatrix_set_btn_ctrl_all(csvKeyboard, LV_BTNMATRIX_CTRL_NO_REPEAT);
+  // Gone with the mount button, the file name, the preview and the list.
+  labelHomeCsv = NULL;
+  homeCsvFileTa = NULL;
+  sdFileList = NULL;
+  labelHomeCsvPreview = NULL;
+  csvKeyboard = NULL;
 
   createTabBar(csvScreen, TAB_RECORD);
 
@@ -14704,7 +14512,6 @@ void setup()
   createDeviceUi();
   createConditionUi();
   createCsvUi();
-  createFileViewerUi();
   createIslUi();
 
   // Eight screens now carry a six-tab bar, and the 블루투스 tab holds three
