@@ -1088,9 +1088,6 @@ static lv_obj_t *homeNodeCardNum[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
 static lv_obj_t *homeNodeCardUnit[HOME_NODE_CARD_COUNT][HOME_NODE_CARD_ROWS];
 // The slot shown at each position, or -1 for the "센서 연결" card.
 static int homeNodeCardSlot[HOME_NODE_CARD_COUNT];
-static lv_obj_t *labelHomeSensorSummary;
-static lv_obj_t *labelHomeModeTimeDetail;
-static lv_obj_t *labelHomeModeConditionDetail;
 static lv_obj_t *labelHomeReady;
 
 // 설정: the sensors wired to this board, kept reachable as a fallback. The
@@ -1242,7 +1239,7 @@ static const CondPreset kCondPresets[] = {
   // reports first - distance against mass, light against angle, and so on.
   { "일반 조건", "조건 정하고 값 안정되면 기록", "이 조건으로 기록", "condition",
     { "조건", "", "condition", COND_SRC_MANUAL, { COND_ALIAS_END },
-      -1000.0f, 1000.0f, 1.0f, 10.0f, 1.0f, 0, NULL, NULL },
+      -1000.0f, 1000.0f, 1.0f, 10.0f, 1.0f, 1, NULL, NULL },
     { "측정값", "", "value", COND_SRC_SENSOR_ANY, { COND_ALIAS_END },
       0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 2, NULL, NULL },
     COND_FIT_NONE, COND_DERIVED_NONE, NULL, NULL, 0.0f,
@@ -1291,9 +1288,8 @@ static lv_obj_t *conditionChart;
 static lv_chart_series_t *conditionSeries;
 static lv_chart_series_t *conditionCurve;
 static lv_obj_t *conditionPresetBtn[COND_PRESET_COUNT];
-static lv_obj_t *conditionStepBtn[4];
+static lv_obj_t *conditionStepBtn[6];
 static lv_obj_t *conditionRecordBtn;
-static lv_obj_t *labelConditionHint;
 static lv_obj_t *labelConditionManualCaption;
 static lv_obj_t *labelConditionManual;
 static lv_obj_t *labelConditionSensorCaption;
@@ -1312,13 +1308,13 @@ static lv_obj_t *labelBarConditionSd;
 
 // The graph takes most of the screen: the shape of the curve is the result of
 // the experiment.
-#define COND_CARD_X 344
+#define COND_CARD_X 424
 #define COND_CARD_Y 104
-#define COND_CARD_W 652
+#define COND_CARD_W 572
 #define COND_CARD_H 408
 #define COND_CHART_X 56
 #define COND_CHART_Y 44
-#define COND_CHART_W 574
+#define COND_CHART_W 500
 #define COND_CHART_H 310
 
 static lv_obj_t *labelDeviceNote;
@@ -1461,6 +1457,7 @@ static void go_settings_event_cb(lv_event_t *e);
 static void go_ble_event_cb(lv_event_t *e);
 static void go_device_event_cb(lv_event_t *e);
 static void go_condition_event_cb(lv_event_t *e);
+static void screen_tap_dismiss_event_cb(lv_event_t *e);
 static void go_isl_event_cb(lv_event_t *e);
 
 
@@ -1587,11 +1584,6 @@ void refreshHomeNodeCards()
       lv_obj_add_flag(homeNodeCardUnit[p][i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    // The explanation sits where a node's first reading would.
-    lv_label_set_text(homeNodeCardQty[p][0],
-                      bleEnabled ? "눌러서 블루투스 화면으로 갑니다"
-                                 : "꺼져 있습니다 · 켠 뒤 다시 시작하세요");
-    lv_obj_clear_flag(homeNodeCardQty[p][0], LV_OBJ_FLAG_HIDDEN);
   }
 
   for (; position < HOME_NODE_CARD_COUNT; position++)
@@ -1600,65 +1592,17 @@ void refreshHomeNodeCards()
     lv_obj_add_flag(homeNodeCards[position], LV_OBJ_FLAG_HIDDEN);
   }
 
-  // ---- the lines of text around the cards -----------------------------------
-  const bool wired = activeSensorMode != SENSOR_MODE_BLE;
-
-  if (labelHomeSensorSummary)
-  {
-    char text[160];
-
-    if (wired)
-    {
-      snprintf(text, sizeof(text), "유선 센서 사용 중: %s · 설정 탭에서 바꿀 수 있습니다",
-               activeMeasurementTitle());
-    }
-    else if (!bleEnabled)
-    {
-      snprintf(text, sizeof(text), "블루투스가 꺼져 있습니다 · 블루투스 탭에서 켜고 다시 시작하세요");
-    }
-    else if (linked == 0)
-    {
-      snprintf(text, sizeof(text), "연결된 센서 없음 · 블루투스 탭에서 센서를 누르면 연결됩니다");
-    }
-    else
-    {
-      snprintf(text, sizeof(text), "연결된 센서 %d개 · 시간 측정은 모두 함께 기록됩니다", linked);
-    }
-
-    lv_label_set_text(labelHomeSensorSummary, text);
-  }
-
-  const bool haveSensor = linked > 0 || wired;
-
-  if (labelHomeModeTimeDetail)
-  {
-    lv_label_set_text(labelHomeModeTimeDetail,
-                      haveSensor ? "예: 식어가는 물의 온도 · 1초마다 자동 기록" : "센서를 먼저 연결하세요");
-    lv_obj_set_style_text_color(labelHomeModeTimeDetail,
-                                lv_color_hex(haveSensor ? UI_TEXT_3 : UI_DANGER), 0);
-  }
-
-  if (labelHomeModeConditionDetail)
-  {
-    lv_label_set_text(labelHomeModeConditionDetail,
-                      haveSensor ? "보일의 법칙 · 샤를의 법칙 · 일반 조건" : "센서를 먼저 연결하세요");
-    lv_obj_set_style_text_color(labelHomeModeConditionDetail,
-                                lv_color_hex(haveSensor ? UI_TEXT_3 : UI_DANGER), 0);
-  }
-
-  // What stands between this board and a recorded, uploaded lesson - the
-  // worst problem first, and a green line when there is none.
+  // WiFi is the one thing on this screen a student cannot see for themselves.
   if (labelHomeReady)
   {
-    const char *text = "WiFi 연결됨 · 과학실 전송 준비";
-    uint32_t color = UI_OK;
+    char text[96];
 
-    if (!haveSensor) { text = "센서를 연결하세요"; color = UI_DANGER; }
-    else if (!cloudModumConfigured()) { text = "모둠코드를 입력하세요"; color = UI_DANGER; }
-    else if (!wifiConnected) { text = "WiFi 없음 · SD 카드에만 저장됩니다"; color = UI_TEXT_2; }
+    if (wifiConnected && strlen(wifiSavedSsid) > 0) snprintf(text, sizeof(text), "연결됨 · %s", wifiSavedSsid);
+    else if (wifiConnected) snprintf(text, sizeof(text), "연결됨");
+    else snprintf(text, sizeof(text), "연결 안 됨");
 
     lv_label_set_text(labelHomeReady, text);
-    lv_obj_set_style_text_color(labelHomeReady, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(labelHomeReady, lv_color_hex(wifiConnected ? UI_OK : UI_TEXT_3), 0);
   }
 }
 
@@ -5191,6 +5135,9 @@ lv_obj_t *makePanel(lv_obj_t *parent, int x, int y, int w, int h)
   lv_obj_set_style_pad_all(panel, 0, 0);
   lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_scrollbar_mode(panel, LV_SCROLLBAR_MODE_OFF);
+  // A tap on a panel is a tap on the screen behind it: that is what dismisses
+  // a keyboard.
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
   return panel;
 }
 
@@ -5341,21 +5288,13 @@ lv_obj_t *makeHomeNodeCard(lv_obj_t *parent, int position, int x, int y, int w, 
   return card;
 }
 
-// One of the two ways to measure. The title is a literal, so it may use the
-// heading face; the lines under it say what the mode is for in a student's
-// words, and the right edge carries an arrow so the card reads as a door.
-lv_obj_t *makeModeCard(lv_obj_t *parent, const char *title, const char *line2,
-                       lv_obj_t **detailOut, int x, int y, int w, int h, lv_event_cb_t cb)
+// One of the two ways to measure: a title and an arrow, nothing to read.
+lv_obj_t *makeModeCard(lv_obj_t *parent, const char *title, int x, int y, int w, int h, lv_event_cb_t cb)
 {
   lv_obj_t *card = makeCardButton(parent, x, y, w, h, cb);
 
-  makeHeading(card, title, 20, 18, UI_TEXT);
-  makeLabel(card, line2, 20, 56, UI_TEXT_2);
-
-  lv_obj_t *detail = makeSmallLabel(card, "", 20, 86, UI_TEXT_3);
-  lv_obj_set_width(detail, w - 80);
-  lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
-  if (detailOut) *detailOut = detail;
+  lv_obj_t *label = makeHeading(card, title, 24, 0, UI_TEXT);
+  lv_obj_align(label, LV_ALIGN_LEFT_MID, 24, 0);
 
   lv_obj_t *arrow = lv_label_create(card);
   lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
@@ -6925,6 +6864,7 @@ void ensureOpaqueScreenBase(lv_obj_t *screen)
     lv_obj_align(*slot, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_clear_flag(*slot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(*slot, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(*slot, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_set_style_radius(*slot, 0, 0);
     lv_obj_set_style_border_width(*slot, 0, 0);
@@ -8150,7 +8090,11 @@ void createHomeCodeEditor()
   lv_obj_clear_flag(homeCodeEditor, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(homeCodeEditor, LV_OBJ_FLAG_HIDDEN);
 
+  // The sheet closes on a tap outside the card; the card itself absorbs taps.
+  lv_obj_add_event_cb(homeCodeEditor, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
+
   lv_obj_t *card = makePanel(homeCodeEditor, 162, 36, 700, 190);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
   makeHeading(card, "모둠코드", 28, 22, UI_TEXT);
   makeSmallLabel(card, "지능형 과학실 ON에서 받은 코드를 입력하세요.", 28, 58, UI_TEXT_3);
@@ -8172,6 +8116,15 @@ void createHomeCodeEditor()
   makePrimaryButton(card, "저장", 562, 144, 110, 40, UI_ACCENT, home_code_confirm_event_cb);
 }
 
+// Tapping the empty part of a screen puts its keyboard away. The keyboard
+// covers the lower third of the screen and had no way down except 확인.
+static void screen_tap_dismiss_event_cb(lv_event_t *e)
+{
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  hideAllFloatingUi();
+  closeHomeCodeEditor();
+}
+
 void createHomeUi()
 {
   homeScreen = lv_obj_create(NULL);
@@ -8180,6 +8133,7 @@ void createHomeUi()
   lv_obj_set_style_bg_color(homeScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(homeScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(homeScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(homeScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     homeScreen,
@@ -8199,10 +8153,6 @@ void createHomeUi()
   // =====================================================
   makeHeading(homeScreen, "센서", 28, 58, UI_TEXT);
 
-  labelHomeSensorSummary = makeSmallLabel(homeScreen, "", 96, 66, UI_TEXT_3);
-  lv_obj_set_width(labelHomeSensorSummary, 900);
-  lv_label_set_long_mode(labelHomeSensorSummary, LV_LABEL_LONG_DOT);
-
   const int cardW = 312;
   const int cardGap = 16;
 
@@ -8214,10 +8164,8 @@ void createHomeUi()
 
   makeHeading(homeScreen, "측정 방법", 28, 252, UI_TEXT);
 
-  makeModeCard(homeScreen, "시간 측정", "시간에 따라 자동으로 기록합니다",
-               &labelHomeModeTimeDetail, 28, 290, 476, 120, go_measure_event_cb);
-  makeModeCard(homeScreen, "조건 측정", "조건을 맞추고 누를 때마다 한 점씩 기록합니다",
-               &labelHomeModeConditionDetail, 520, 290, 476, 120, go_condition_event_cb);
+  makeModeCard(homeScreen, "연속 측정", 28, 290, 476, 96, go_measure_event_cb);
+  makeModeCard(homeScreen, "단계 측정", 520, 290, 476, 96, go_condition_event_cb);
 
   // There is no selected tile any more, and no status line beside one.
   labelHomeSensorMode = NULL;
@@ -8239,7 +8187,7 @@ void createHomeUi()
   // The 측정 시작 button that used to sit here is the two mode cards now; its
   // place says what is still missing before a lesson can be recorded.
   lv_obj_t *readyPanel = makePanel(homeScreen, 652, 430, 344, 72);
-  makeSmallLabel(readyPanel, "준비 상태", 18, 12, UI_TEXT_3);
+  makeSmallLabel(readyPanel, "WiFi", 18, 12, UI_TEXT_3);
   labelHomeReady = makeLabel(readyPanel, "", 18, 34, UI_TEXT);
   lv_obj_set_width(labelHomeReady, 308);
   lv_label_set_long_mode(labelHomeReady, LV_LABEL_LONG_CLIP);
@@ -8440,7 +8388,7 @@ void createMeasureUi()
 
   // Secondary actions, kept quiet so they do not compete with 시작/정지.
   makeQuietButton(measureScreen, "일괄전송", railX, contentTop + 236, 126, 44, dashboard_cloud_batch_upload_event_cb);
-  makeQuietButton(measureScreen, "조건 측정", railX, contentTop + 288, 126, 44, go_condition_event_cb);
+  makeQuietButton(measureScreen, "단계 측정", railX, contentTop + 288, 126, 44, go_condition_event_cb);
   makeQuietButton(measureScreen, "초기화", railX + 134, contentTop + 236, 126, 44, clear_event_cb);
 
   // The primary control. Start is the accent; stop is the only red on screen,
@@ -8479,6 +8427,7 @@ void createIslUi()
   lv_obj_set_style_bg_color(islScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(islScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(islScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(islScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     islScreen,
@@ -8649,6 +8598,7 @@ void createCsvUi()
   lv_obj_set_style_bg_color(csvScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(csvScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(csvScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(csvScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     csvScreen,
@@ -9284,10 +9234,6 @@ void createDeviceUi()
     lv_obj_set_style_max_height(wiredList, 300, 0);
   }
 
-  lv_obj_t *wiredNote = makeSmallLabel(card, "보드에 꽂은 센서로 잴 때만 고릅니다.", 632, 212, UI_TEXT_3);
-  lv_obj_set_width(wiredNote, 316);
-  lv_label_set_long_mode(wiredNote, LV_LABEL_LONG_DOT);
-
   syncWiredSensorDropdown();
 
   labelDeviceNote = makeSmallLabel(deviceScreen, "", 28, 366, UI_TEXT_3);
@@ -9644,8 +9590,9 @@ static void condition_step_event_cb(lv_event_t *e)
   // The index rides on the button; the size of the step is the preset's, so
   // one set of four buttons serves every experiment.
   const int index = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-  const float steps[4] = { -v->stepLarge, -v->stepSmall, v->stepSmall, v->stepLarge };
-  if (index < 0 || index > 3) return;
+  const float tiny = v->stepSmall / 10.0f;
+  const float steps[6] = { -v->stepLarge, -v->stepSmall, -tiny, tiny, v->stepSmall, v->stepLarge };
+  if (index < 0 || index > 5) return;
 
   float value = condManual[condPresetIndex] + steps[index];
   if (value < v->minValue) value = v->minValue;
@@ -10260,8 +10207,6 @@ void refreshConditionScreen()
     if (label) lv_obj_set_style_text_color(label, lv_color_hex(selected ? UI_SURFACE : UI_ACCENT), 0);
   }
 
-  if (labelConditionHint) lv_label_set_text(labelConditionHint, P->hint);
-
   // ---- the hand-set variable ------------------------------------------------
   if (manualVar)
   {
@@ -10279,10 +10224,11 @@ void refreshConditionScreen()
       lv_label_set_text(labelConditionManual, text);
     }
 
-    const float steps[4] = { -manualVar->stepLarge, -manualVar->stepSmall,
-                             manualVar->stepSmall, manualVar->stepLarge };
+    const float tiny = manualVar->stepSmall / 10.0f;
+    const float steps[6] = { -manualVar->stepLarge, -manualVar->stepSmall, -tiny,
+                             tiny, manualVar->stepSmall, manualVar->stepLarge };
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 6; i++)
     {
       if (conditionStepBtn[i] == NULL) continue;
       snprintf(text, sizeof(text), "%+g", steps[i]);
@@ -10336,7 +10282,7 @@ void refreshConditionScreen()
         snprintf(text, sizeof(text), "← %s · %s", node, condAnyName[0] ? condAnyName : name);
       }
       else if (have) snprintf(text, sizeof(text), "← %s", node);
-      else snprintf(text, sizeof(text), "센서 없음 · 블루투스 탭에서 연결하세요");
+      else snprintf(text, sizeof(text), "센서 없음");
       lv_label_set_text(labelConditionSensorNode, text);
     }
   }
@@ -10613,11 +10559,11 @@ void createConditionUi()
     condManual[i] = manualVar ? manualVar->defaultValue : 0.0f;
   }
 
-  makeHeading(conditionScreen, "조건 측정", 28, 58, UI_TEXT);
+  makeHeading(conditionScreen, "단계 측정", 28, 58, UI_TEXT);
 
   // ---- which experiment -----------------------------------------------------
-  const int presetX[3] = { 152, 304, 456 };
-  const int presetW[3] = { 140, 140, 120 };
+  const int presetX[3] = { 152, 288, 424 };
+  const int presetW[3] = { 128, 128, 104 };
 
   for (int i = 0; i < COND_PRESET_COUNT && i < 3; i++)
   {
@@ -10626,63 +10572,60 @@ void createConditionUi()
     lv_obj_set_user_data(conditionPresetBtn[i], (void *)(intptr_t)i);
   }
 
-  makeQuietButton(conditionScreen, "CSV 저장", 692, 60, 136, 44, condition_save_event_cb);
-  makePrimaryButton(conditionScreen, "전송", 844, 60, 152, 44, UI_ACCENT, condition_send_event_cb);
+  makeQuietButton(conditionScreen, "되돌리기", 548, 60, 100, 44, condition_undo_event_cb);
+  makeQuietButton(conditionScreen, "지우기", 656, 60, 90, 44, condition_clear_event_cb);
+  makeQuietButton(conditionScreen, "CSV 저장", 754, 60, 110, 44, condition_save_event_cb);
+  makePrimaryButton(conditionScreen, "전송", 872, 60, 124, 44, UI_ACCENT, condition_send_event_cb);
 
   // ---- setting the condition ------------------------------------------------
-  lv_obj_t *setup = makePanel(conditionScreen, 28, 104, 300, 190);
+  lv_obj_t *setup = makePanel(conditionScreen, 28, 104, 380, 170);
 
-  labelConditionHint = makeSmallLabel(setup, "", 20, 12, UI_TEXT_3);
-  lv_obj_set_width(labelConditionHint, 262);
-  lv_label_set_long_mode(labelConditionHint, LV_LABEL_LONG_DOT);
-
-  labelConditionManualCaption = makeSmallLabel(setup, "", 20, 36, UI_TEXT_3);
-  lv_obj_set_width(labelConditionManualCaption, 262);
+  labelConditionManualCaption = makeSmallLabel(setup, "", 20, 12, UI_TEXT_3);
+  lv_obj_set_width(labelConditionManualCaption, 340);
   lv_label_set_long_mode(labelConditionManualCaption, LV_LABEL_LONG_DOT);
 
   // Only ever digits and an ASCII unit, so the heading face is safe.
-  labelConditionManual = makeHeading(setup, "", 20, 54, UI_TEXT);
+  labelConditionManual = makeHeading(setup, "", 20, 32, UI_TEXT);
 
-  const int stepX[4] = { 18, 84, 150, 216 };
-
-  for (int i = 0; i < 4; i++)
+  // -5 -1 -0.1 | +0.1 +1 +5
+  for (int i = 0; i < 6; i++)
   {
-    conditionStepBtn[i] = makeQuietButton(setup, "", stepX[i], 94, 62, 44, condition_step_event_cb);
+    conditionStepBtn[i] = makeQuietButton(setup, "", 12 + i * 62, 72, 56, 44, condition_step_event_cb);
     lv_obj_set_user_data(conditionStepBtn[i], (void *)(intptr_t)i);
   }
 
-  labelConditionSensorCaption = makeSmallLabel(setup, "", 20, 150, UI_TEXT_3);
+  labelConditionSensorCaption = makeSmallLabel(setup, "", 20, 128, UI_TEXT_3);
   lv_obj_set_width(labelConditionSensorCaption, 86);
   lv_label_set_long_mode(labelConditionSensorCaption, LV_LABEL_LONG_DOT);
 
-  labelConditionSensorNow = makeLabel(setup, "", 110, 146, UI_ACCENT);
-  lv_obj_set_width(labelConditionSensorNow, 170);
+  labelConditionSensorNow = makeLabel(setup, "", 110, 124, UI_ACCENT);
+  lv_obj_set_width(labelConditionSensorNow, 250);
   lv_label_set_long_mode(labelConditionSensorNow, LV_LABEL_LONG_CLIP);
 
   // Which node the number comes from: with two temperature sensors in the
   // room, this is how a student knows which one the graph is listening to.
-  labelConditionSensorNode = makeSmallLabel(setup, "", 20, 168, UI_TEXT_4);
-  lv_obj_set_width(labelConditionSensorNode, 262);
+  labelConditionSensorNode = makeSmallLabel(setup, "", 20, 148, UI_TEXT_4);
+  lv_obj_set_width(labelConditionSensorNode, 340);
   lv_label_set_long_mode(labelConditionSensorNode, LV_LABEL_LONG_DOT);
 
   // ---- the points -----------------------------------------------------------
-  conditionRecordBtn = makePrimaryButton(conditionScreen, "이 조건으로 기록", 28, 306, 300, 56, UI_ACCENT,
+  conditionRecordBtn = makePrimaryButton(conditionScreen, "이 조건으로 기록", 28, 282, 380, 56, UI_ACCENT,
                                          condition_record_event_cb);
-  makeQuietButton(conditionScreen, "되돌리기", 28, 370, 145, 44, condition_undo_event_cb);
-  makeQuietButton(conditionScreen, "지우기", 183, 370, 145, 44, condition_clear_event_cb);
 
+  // Wide enough that no heading wraps, tall enough for six rows; the rest
+  // scroll.
   tableCondition = lv_table_create(conditionScreen);
-  lv_obj_set_size(tableCondition, 300, 90);
-  lv_obj_align(tableCondition, LV_ALIGN_TOP_LEFT, 28, 422);
-  lv_obj_set_style_text_font(tableCondition, FONT_KR_SMALL, 0);
+  lv_obj_set_size(tableCondition, 380, 166);
+  lv_obj_align(tableCondition, LV_ALIGN_TOP_LEFT, 28, 346);
+  lv_obj_set_style_text_font(tableCondition, FONT_KR, 0);
   lv_obj_set_style_border_width(tableCondition, 0, 0);
   lv_obj_set_style_bg_color(tableCondition, lv_color_hex(UI_SURFACE), 0);
   lv_table_set_col_cnt(tableCondition, 4);
   lv_table_set_row_cnt(tableCondition, 1);
-  lv_table_set_col_width(tableCondition, 0, 42);
-  lv_table_set_col_width(tableCondition, 1, 78);
-  lv_table_set_col_width(tableCondition, 2, 90);
-  lv_table_set_col_width(tableCondition, 3, 88);
+  lv_table_set_col_width(tableCondition, 0, 48);
+  lv_table_set_col_width(tableCondition, 1, 104);
+  lv_table_set_col_width(tableCondition, 2, 118);
+  lv_table_set_col_width(tableCondition, 3, 110);
   lv_obj_set_scrollbar_mode(tableCondition, LV_SCROLLBAR_MODE_AUTO);
 
   // ---- one quantity against the other ----------------------------------------
@@ -10735,7 +10678,7 @@ void createConditionUi()
   lv_obj_set_width(labelConditionSummary, COND_CARD_W - 36);
   lv_label_set_long_mode(labelConditionSummary, LV_LABEL_LONG_DOT);
 
-  labelConditionNote = makeSmallLabel(conditionScreen, "조건을 정하고 기록 버튼을 누르세요.", 28, 518, UI_TEXT_3);
+  labelConditionNote = makeSmallLabel(conditionScreen, "", 28, 518, UI_TEXT_3);
   lv_obj_set_width(labelConditionNote, 968);
   lv_label_set_long_mode(labelConditionNote, LV_LABEL_LONG_DOT);
 
@@ -10755,6 +10698,7 @@ void createSettingsUi()
   lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(UI_BG), 0);
   lv_obj_set_style_bg_opa(settingsScreen, LV_OPA_COVER, 0);
   lv_obj_clear_flag(settingsScreen, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(settingsScreen, screen_tap_dismiss_event_cb, LV_EVENT_CLICKED, NULL);
 
   createStatusBar(
     settingsScreen,

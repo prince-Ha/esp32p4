@@ -16,13 +16,13 @@ to 지능형 과학실.
   driven through a GT911 capacitive touch panel.
 - **Two ways to measure**, chosen on the home screen:
 
-  | | 시간 측정 | 조건 측정 |
+  | | 연속 측정 | 단계 측정 |
   |---|---|---|
   | records | once a second, automatically | once per tap, when the student says so |
   | graph | value against time | one quantity against another |
   | for | cooling water, a CO2 room, anything that changes on its own | 보일의 법칙, 샤를의 법칙, any "set a condition, read the sensor" experiment |
 
-  조건 측정 is a table of presets ([`kCondPresets`](src/main.cpp)): each row
+  단계 측정 is a table of presets ([`kCondPresets`](src/main.cpp)): each row
   names the two variables, which one is set by hand with the stepper and which
   is read from a sensor (by unit, across every linked node), the fit to draw
   through the points (P = k/V, or a straight line), the derived column
